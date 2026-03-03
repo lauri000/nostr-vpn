@@ -685,6 +685,7 @@ impl NvpnBackend {
     }
 
     fn add_participant(&mut self, npub: &str) -> Result<()> {
+        let had_no_participants = self.config.participants.is_empty();
         let input = npub.trim();
         if input.is_empty() {
             return Err(anyhow!("participant npub is empty"));
@@ -707,6 +708,9 @@ impl NvpnBackend {
         self.config.participants.sort();
         self.config.participants.dedup();
         self.peer_status.entry(normalized).or_default();
+        if had_no_participants && self.config.lan_discovery_enabled {
+            self.config.lan_discovery_enabled = false;
+        }
         maybe_autoconfigure_node(&mut self.config);
 
         self.schedule_autosave();
@@ -1112,7 +1116,7 @@ impl NvpnBackend {
     }
 
     fn maybe_refresh_lan_discovery(&mut self) {
-        let should_run = self.config.lan_discovery_enabled && self.config.participants.is_empty();
+        let should_run = self.config.lan_discovery_enabled;
 
         if should_run && !self.lan_discovery_running {
             self.start_lan_discovery();

@@ -234,7 +234,7 @@
               lanDiscoveryEnabled: (event.currentTarget as HTMLInputElement).checked,
             })}
         />
-        LAN discovery (multicast, only when no participants are configured)
+        LAN discovery (multicast)
       </label>
 
       <div class="row form-row">
