@@ -19,6 +19,7 @@ const mockState: UiState = {
   networkId: 'nostr-vpn',
   effectiveNetworkId: 'nostr-vpn',
   autoDisconnectRelaysWhenMeshReady: true,
+  lanDiscoveryEnabled: true,
   connectedPeerCount: 0,
   expectedPeerCount: 0,
   meshReady: false,
@@ -157,5 +158,43 @@ export const updateSettings = (patch: SettingsPatch) =>
           mockState.autoDisconnectRelaysWhenMeshReady =
             patch.autoDisconnectRelaysWhenMeshReady
         }
+        if (patch.lanDiscoveryEnabled !== undefined) {
+          mockState.lanDiscoveryEnabled = patch.lanDiscoveryEnabled
+        }
         return asResult()
       })()
+
+let mockAutostartEnabled = false
+
+export const isAutostartEnabled = async () => {
+  if (!isTauriRuntime()) {
+    return mockAutostartEnabled
+  }
+
+  try {
+    const { isEnabled } = await import('@tauri-apps/plugin-autostart')
+    return await isEnabled()
+  } catch {
+    return false
+  }
+}
+
+export const setAutostartEnabled = async (enabled: boolean) => {
+  if (!isTauriRuntime()) {
+    mockAutostartEnabled = enabled
+    return true
+  }
+
+  try {
+    if (enabled) {
+      const { enable } = await import('@tauri-apps/plugin-autostart')
+      await enable()
+    } else {
+      const { disable } = await import('@tauri-apps/plugin-autostart')
+      await disable()
+    }
+    return true
+  } catch {
+    return false
+  }
+}

@@ -16,6 +16,7 @@
 - Tauri + Svelte desktop GUI (single-pane settings UX)
 - LAN multicast peer discovery helper (active when no participants are configured)
 - Docker e2e that validates signaling + data-plane ping across 2 containers
+- UDP NAT endpoint discovery + hole-punch helpers (reflector-based)
 
 ## Default relays
 
@@ -89,6 +90,15 @@ pnpm --dir crates/nostr-vpn-gui install
 pnpm --dir crates/nostr-vpn-gui tauri:dev
 ```
 
+### 8. Run Tauri-driver UI smoke test (Docker)
+
+```bash
+./scripts/e2e-tauri-driver-docker.sh
+```
+
+This runs a Linux tauri-driver session against `nostr-vpn-gui`, performs core UI actions,
+and writes a screenshot to `artifacts/screenshots/tauri-driver-smoke.png`.
+
 ## CLI commands
 
 `nvpn` includes these Tailscale-style commands:
@@ -101,6 +111,8 @@ pnpm --dir crates/nostr-vpn-gui tauri:dev
 - `netcheck`
 - `ip`
 - `whois`
+- `nat-discover`
+- `hole-punch`
 
 Legacy control-plane commands are still available:
 
@@ -138,6 +150,37 @@ What it validates:
 - Two nodes exchange announcements over Nostr
 - Both nodes bring up boringtun interfaces (`tunnel-up`)
 - Tunnel data plane works (`ping` over `10.44.0.1 <-> 10.44.0.2`)
+
+## NAT traversal helpers
+
+Discover the public UDP endpoint (through a reflector):
+
+```bash
+nvpn nat-discover --reflector 198.51.100.10:3478 --listen-port 51820
+```
+
+Send punch packets to a peer endpoint:
+
+```bash
+nvpn hole-punch --listen-port 51820 --peer-endpoint 198.51.100.20:51820
+```
+
+`tunnel-up` can pre-punch automatically:
+
+```bash
+nvpn tunnel-up ... \
+  --hole-punch-attempts 40 \
+  --hole-punch-interval-ms 120
+```
+
+Run NAT-focused docker e2e:
+
+```bash
+./scripts/e2e-nat-docker.sh
+```
+
+This e2e uses two NAT router containers with deterministic UDP/51820 mapping to verify:
+private Nostr signaling, endpoint discovery, pre-punch, and boringtun tunnel ping.
 
 ## GitHub release signing/notarization (optional)
 

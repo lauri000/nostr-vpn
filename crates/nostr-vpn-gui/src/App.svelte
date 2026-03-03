@@ -1,13 +1,16 @@
-<script lang="ts">
+  <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
+  import { Check, Copy, Trash2 } from 'lucide-svelte'
 
   import {
     addParticipant,
     addRelay,
     connectSession,
     disconnectSession,
+    isAutostartEnabled,
     removeParticipant,
     removeRelay,
+    setAutostartEnabled,
     tick,
     updateSettings,
   } from './lib/tauri'
@@ -17,6 +20,7 @@
   let participantInput = ''
   let relayInput = ''
   let error = ''
+  let copiedPubkey = false
 
   let networkIdDraft = ''
   let nodeNameDraft = ''
@@ -24,9 +28,13 @@
   let tunnelIpDraft = ''
   let listenPortDraft = ''
   let draftsInitialized = false
+  let autostartEnabled = false
+  let autostartReady = false
+  let autostartUpdating = false
 
   const debouncers = new Map<string, number>()
   let pollHandle: number | null = null
+  let copiedHandle: number | null = null
 
   const short = (value: string, head = 12, tail = 10) => {
     if (value.length <= head + tail + 3) {
@@ -107,6 +115,24 @@
     await runAction(() => updateSettings(patch))
   }
 
+  async function refreshAutostart() {
+    autostartEnabled = await isAutostartEnabled()
+    autostartReady = true
+  }
+
+  async function onToggleAutostart(enabled: boolean) {
+    autostartUpdating = true
+    const ok = await setAutostartEnabled(enabled)
+    autostartUpdating = false
+
+    if (ok) {
+      autostartEnabled = enabled
+    } else {
+      error = 'Failed to update autostart setting'
+      await refreshAutostart()
+    }
+  }
+
   async function copyPubkey() {
     if (!state) {
       return
@@ -114,6 +140,14 @@
 
     try {
       await navigator.clipboard.writeText(state.ownNpub)
+      copiedPubkey = true
+      if (copiedHandle) {
+        window.clearTimeout(copiedHandle)
+      }
+      copiedHandle = window.setTimeout(() => {
+        copiedPubkey = false
+        copiedHandle = null
+      }, 2000)
     } catch {
       error = 'Clipboard copy failed'
     }
@@ -121,12 +155,16 @@
 
   onMount(async () => {
     await refresh()
+    await refreshAutostart()
     pollHandle = window.setInterval(refresh, 1000)
   })
 
   onDestroy(() => {
     if (pollHandle) {
       window.clearInterval(pollHandle)
+    }
+    if (copiedHandle) {
+      window.clearTimeout(copiedHandle)
     }
     for (const timer of debouncers.values()) {
       window.clearTimeout(timer)
@@ -135,13 +173,29 @@
 </script>
 
 <main class="app-shell">
+  <div class="drag-padding drag-padding-top" data-tauri-drag-region aria-hidden="true"></div>
+  <div class="drag-padding drag-padding-left" data-tauri-drag-region aria-hidden="true"></div>
+  <div class="drag-padding drag-padding-right" data-tauri-drag-region aria-hidden="true"></div>
+  <div class="drag-padding drag-padding-bottom" data-tauri-drag-region aria-hidden="true"></div>
+
+  <header class="window-chrome" data-tauri-drag-region>
+    <div class="window-title" data-testid="window-title">Nostr VPN</div>
+  </header>
+
   <section class="identity-card panel">
-    <div class="row spread identity-row">
-      <div class="pubkey-wrap">
-        <div class="label">Pubkey</div>
-        <div class="pubkey">{state ? short(state.ownNpub, 18, 14) : 'Loading...'}</div>
-      </div>
-      <button class="btn" on:click={copyPubkey} disabled={!state}>Copy</button>
+    <div class="row identity-row">
+      <button class="btn copy-btn copy-npub-btn" data-testid="copy-pubkey" on:click={copyPubkey} disabled={!state}>
+        <span class="copy-icon" aria-hidden="true">
+          {#if copiedPubkey}
+            <Check size={16} strokeWidth={2.3} />
+          {:else}
+            <Copy size={16} strokeWidth={2.2} />
+          {/if}
+        </span>
+        <span class="copy-value" data-testid="pubkey">
+          {state ? short(state.ownNpub, 18, 14) : 'Loading...'}
+        </span>
+      </button>
     </div>
 
     {#if state}
@@ -170,19 +224,35 @@
         <div class="section-meta">Online: {state.connectedPeerCount}/{state.expectedPeerCount}</div>
       </div>
 
+      <label class="toggle-row lan-discovery-toggle">
+        <input
+          type="checkbox"
+          checked={state.lanDiscoveryEnabled}
+          data-testid="lan-discovery-toggle"
+          on:change={(event) =>
+            onUpdateSettings({
+              lanDiscoveryEnabled: (event.currentTarget as HTMLInputElement).checked,
+            })}
+        />
+        LAN discovery (multicast, only when no participants are configured)
+      </label>
+
       <div class="row form-row">
         <input
           class="text-input"
           placeholder="Add participant (npub)"
+          data-testid="participant-input"
           bind:value={participantInput}
           on:keydown={(event) => event.key === 'Enter' && onAddParticipant()}
         />
-        <button class="btn" on:click={onAddParticipant}>Add</button>
+        <button class="btn" data-testid="participant-add" on:click={onAddParticipant}>
+          Add
+        </button>
       </div>
 
       <div class="stack rows">
         {#each state.participants as participant}
-          <div class="item-row">
+          <div class="item-row" data-testid="participant-row">
             <div class="item-main">
               <div class="item-title">{short(participant.npub, 22, 12)}</div>
               <div class="item-sub">{participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}</div>
@@ -190,15 +260,21 @@
             <span class={`badge ${participant.state === 'online' ? 'ok' : participant.state === 'offline' ? 'bad' : participant.state === 'local' ? 'muted' : 'warn'}`}>
               {participant.state}
             </span>
-            <button class="btn ghost" on:click={() => runAction(() => removeParticipant(participant.npub))}>
-              Remove
+            <button
+              class="btn ghost icon-btn"
+              data-testid="participant-remove"
+              title="Delete participant"
+              aria-label="Delete participant"
+              on:click={() => runAction(() => removeParticipant(participant.npub))}
+            >
+              <Trash2 size={16} strokeWidth={2.2} />
             </button>
           </div>
         {/each}
       </div>
 
-      {#if state.lanPeers.length > 0}
-        <div class="lan-title">LAN discovery (auto, while no peers configured)</div>
+      {#if state.lanDiscoveryEnabled && state.lanPeers.length > 0}
+        <div class="lan-title">LAN peers found</div>
         <div class="stack rows">
           {#each state.lanPeers as peer}
             <div class="item-row">
@@ -221,10 +297,7 @@
       <div class="section-title-row">
         <h2>Relays</h2>
         <div class="section-meta relay-health">
-          <span class="ok-text">{state.relaySummary.up} up</span>
-          <span class="bad-text">{state.relaySummary.down} down</span>
-          <span class="warn-text">{state.relaySummary.checking} checking</span>
-          <span class="muted-text">{state.relaySummary.unknown} unknown</span>
+          <span class="ok-text">{state.relaySummary.up}/{state.relays.length} connected</span>
         </div>
       </div>
 
@@ -232,23 +305,34 @@
         <input
           class="text-input"
           placeholder="Add relay URL"
+          data-testid="relay-input"
           bind:value={relayInput}
           on:keydown={(event) => event.key === 'Enter' && onAddRelay()}
         />
-        <button class="btn" on:click={onAddRelay}>Add</button>
+        <button class="btn" data-testid="relay-add" on:click={onAddRelay}>Add</button>
       </div>
 
       <div class="stack rows">
         {#each state.relays as relay}
-          <div class="item-row">
+          <div class="item-row" data-testid="relay-row">
             <div class="item-main">
               <div class="item-title relay-url">{relay.url}</div>
-              <div class="item-sub">{relay.statusText}</div>
+              {#if relay.state !== 'unknown' && relay.statusText}
+                <div class="item-sub">{relay.statusText}</div>
+              {/if}
             </div>
             <span class={`badge ${relay.state === 'up' ? 'ok' : relay.state === 'down' ? 'bad' : relay.state === 'checking' ? 'warn' : 'muted'}`}>
               {relay.state}
             </span>
-            <button class="btn ghost" on:click={() => runAction(() => removeRelay(relay.url))}>Remove</button>
+            <button
+              class="btn ghost icon-btn"
+              data-testid="relay-remove"
+              title="Delete relay"
+              aria-label="Delete relay"
+              on:click={() => runAction(() => removeRelay(relay.url))}
+            >
+              <Trash2 size={16} strokeWidth={2.2} />
+            </button>
           </div>
         {/each}
       </div>
@@ -256,15 +340,23 @@
 
     <section class="panel">
       <div class="section-title-row">
-        <h2>Settings</h2>
+        <h2>Node & Session</h2>
       </div>
 
       <div class="row spread settings-action-row">
         <div class="config-path">Config: {state.configPath}</div>
         {#if state.sessionActive}
-          <button class="btn bad" on:click={() => runAction(disconnectSession)}>Disconnect</button>
+          <button
+            class="btn bad"
+            data-testid="disconnect-session"
+            on:click={() => runAction(disconnectSession)}
+          >
+            Disconnect
+          </button>
         {:else}
-          <button class="btn" on:click={() => runAction(connectSession)}>Connect</button>
+          <button class="btn" data-testid="connect-session" on:click={() => runAction(connectSession)}>
+            Connect
+          </button>
         {/if}
       </div>
 
@@ -280,11 +372,24 @@
         <span>Auto-disconnect relays when mesh is ready</span>
       </label>
 
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          data-testid="autostart-toggle"
+          checked={autostartEnabled}
+          disabled={!autostartReady || autostartUpdating}
+          on:change={(event) =>
+            onToggleAutostart((event.currentTarget as HTMLInputElement).checked)}
+        />
+        <span>Launch on system startup</span>
+      </label>
+
       <div class="field-grid">
         <label>
           <span>Fallback Network ID</span>
           <input
             class="text-input"
+            data-testid="network-id-input"
             bind:value={networkIdDraft}
             on:input={() => debounce('networkId', () => onUpdateSettings({ networkId: networkIdDraft }))}
           />
@@ -294,6 +399,7 @@
           <span>Node Name</span>
           <input
             class="text-input"
+            data-testid="node-name-input"
             bind:value={nodeNameDraft}
             on:input={() => debounce('nodeName', () => onUpdateSettings({ nodeName: nodeNameDraft }))}
           />

@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -14,10 +14,12 @@ use boringtun::device::{DeviceConfig, DeviceHandle};
 use clap::{Args, Parser, Subcommand};
 use hex::encode as encode_hex;
 use nostr_vpn_core::config::{
-    AppConfig, DEFAULT_RELAYS, derive_network_id_from_participants, normalize_nostr_pubkey,
+    AppConfig, DEFAULT_RELAYS, derive_network_id_from_participants, maybe_autoconfigure_node,
+    normalize_nostr_pubkey,
 };
 use nostr_vpn_core::control::PeerAnnouncement;
 use nostr_vpn_core::crypto::generate_keypair;
+use nostr_vpn_core::nat::{discover_public_udp_endpoint, hole_punch_udp};
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload};
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::Serialize;
@@ -104,6 +106,10 @@ enum Command {
         #[arg(long = "peer")]
         peers: Vec<String>,
     },
+    /// Discover your public UDP endpoint through a reflector.
+    NatDiscover(NatDiscoverArgs),
+    /// Send UDP punch packets to a peer endpoint to open NAT mappings.
+    HolePunch(HolePunchArgs),
     /// Bring up a boringtun interface (Linux) for e2e testing.
     TunnelUp(TunnelUpArgs),
 }
@@ -126,6 +132,12 @@ struct TunnelUpArgs {
     peer_allowed_ip: String,
     #[arg(long, default_value_t = 5)]
     keepalive_secs: u16,
+    #[arg(long, default_value_t = 0)]
+    hole_punch_attempts: u32,
+    #[arg(long, default_value_t = 120)]
+    hole_punch_interval_ms: u64,
+    #[arg(long, default_value_t = 120)]
+    hole_punch_recv_timeout_ms: u64,
 }
 
 #[derive(Debug, Args)]
@@ -205,6 +217,8 @@ struct SetArgs {
     #[arg(long = "participant")]
     participants: Vec<String>,
     #[arg(long)]
+    auto_disconnect_relays_when_mesh_ready: Option<bool>,
+    #[arg(long)]
     json: bool,
 }
 
@@ -274,6 +288,35 @@ struct WhoisArgs {
     relay: Vec<String>,
     #[arg(long, default_value_t = 2)]
     discover_secs: u64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct NatDiscoverArgs {
+    /// Reflector UDP endpoint (e.g. 198.51.100.1:3478).
+    #[arg(long)]
+    reflector: String,
+    #[arg(long, default_value_t = 51820)]
+    listen_port: u16,
+    #[arg(long, default_value_t = 2)]
+    timeout_secs: u64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct HolePunchArgs {
+    #[arg(long)]
+    peer_endpoint: String,
+    #[arg(long, default_value_t = 51820)]
+    listen_port: u16,
+    #[arg(long, default_value_t = 40)]
+    attempts: u32,
+    #[arg(long, default_value_t = 120)]
+    interval_ms: u64,
+    #[arg(long, default_value_t = 120)]
+    recv_timeout_ms: u64,
     #[arg(long)]
     json: bool,
 }
@@ -394,6 +437,8 @@ async fn main() -> Result<()> {
                 load_config_with_overrides(&config_path, args.network_id, args.participants)?;
             let relays = resolve_relays(&args.relay, &app);
             let peers = discover_peers(&app, &network_id, &relays, args.discover_secs).await?;
+            let expected_peers = expected_peer_count(&app);
+            let mesh_ready = expected_peers > 0 && peers.len() >= expected_peers;
 
             if args.json {
                 println!(
@@ -404,7 +449,10 @@ async fn main() -> Result<()> {
                         "tunnel_ip": app.node.tunnel_ip,
                         "endpoint": app.node.endpoint,
                         "relays": relays,
+                        "auto_disconnect_relays_when_mesh_ready": app.auto_disconnect_relays_when_mesh_ready,
+                        "expected_peer_count": expected_peers,
                         "peer_count": peers.len(),
+                        "mesh_ready": mesh_ready,
                         "peers": peers,
                     }))?
                 );
@@ -414,6 +462,18 @@ async fn main() -> Result<()> {
                 println!("tunnel_ip: {}", app.node.tunnel_ip);
                 println!("endpoint: {}", app.node.endpoint);
                 println!("relays: {}", relays.len());
+                println!(
+                    "relay_policy: {}",
+                    if app.auto_disconnect_relays_when_mesh_ready {
+                        "auto_disconnect_on_mesh_ready"
+                    } else {
+                        "keep_connected"
+                    }
+                );
+                if expected_peers > 0 {
+                    println!("mesh_progress: {}/{}", peers.len(), expected_peers);
+                    println!("mesh_ready: {mesh_ready}");
+                }
                 println!("peers: {}", peers.len());
                 for peer in peers {
                     println!("  {} {} {}", peer.node_id, peer.tunnel_ip, peer.endpoint);
@@ -442,11 +502,15 @@ async fn main() -> Result<()> {
             if let Some(value) = args.listen_port {
                 app.node.listen_port = value;
             }
+            if let Some(value) = args.auto_disconnect_relays_when_mesh_ready {
+                app.auto_disconnect_relays_when_mesh_ready = value;
+            }
             if !args.relays.is_empty() {
                 app.nostr.relays = args.relays;
             }
             apply_participants_override(&mut app, args.participants)?;
             app.ensure_defaults();
+            maybe_autoconfigure_node(&mut app);
             app.save(&config_path)?;
 
             if args.json {
@@ -626,6 +690,60 @@ async fn main() -> Result<()> {
 
             client.disconnect().await;
         }
+        Command::NatDiscover(args) => {
+            let reflector: SocketAddr = args
+                .reflector
+                .parse()
+                .with_context(|| format!("invalid --reflector {}", args.reflector))?;
+            let timeout = Duration::from_secs(args.timeout_secs.max(1));
+            let public_endpoint =
+                discover_public_udp_endpoint(reflector, args.listen_port, timeout)
+                    .context("nat endpoint discovery failed")?;
+
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "reflector": reflector.to_string(),
+                        "listen_port": args.listen_port,
+                        "public_endpoint": public_endpoint,
+                    }))?
+                );
+            } else {
+                println!("{public_endpoint}");
+            }
+        }
+        Command::HolePunch(args) => {
+            let peer_endpoint: SocketAddr = args
+                .peer_endpoint
+                .parse()
+                .with_context(|| format!("invalid --peer-endpoint {}", args.peer_endpoint))?;
+            let report = hole_punch_udp(
+                args.listen_port,
+                peer_endpoint,
+                args.attempts.max(1),
+                Duration::from_millis(args.interval_ms.max(1)),
+                Duration::from_millis(args.recv_timeout_ms.max(1)),
+            )
+            .context("udp hole-punch failed")?;
+
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "listen_addr": report.local_addr.to_string(),
+                        "peer_endpoint": peer_endpoint.to_string(),
+                        "packets_sent": report.packets_sent,
+                        "packet_received": report.packet_received,
+                    }))?
+                );
+            } else {
+                println!(
+                    "hole-punch: sent {} packets from {} to {}, received_response={}",
+                    report.packets_sent, report.local_addr, peer_endpoint, report.packet_received
+                );
+            }
+        }
         Command::RenderWg { config, peers } => {
             let config_path = config.unwrap_or_else(default_config_path);
             let app = load_or_default_config(&config_path)?;
@@ -706,6 +824,7 @@ fn load_config_with_overrides(
     if let Some(network_id) = network_id {
         app.network_id = network_id;
     }
+    maybe_autoconfigure_node(&mut app);
 
     let network_id = app.effective_network_id();
     Ok((app, network_id))
@@ -866,6 +985,24 @@ fn strip_cidr(value: &str) -> &str {
     value.split('/').next().unwrap_or(value)
 }
 
+fn expected_peer_count(config: &AppConfig) -> usize {
+    if config.participants.is_empty() {
+        return 0;
+    }
+
+    let mut expected = config.participants.len();
+    if let Ok(own_pubkey) = config.own_nostr_pubkey_hex()
+        && config
+            .participants
+            .iter()
+            .any(|participant| participant == &own_pubkey)
+    {
+        expected = expected.saturating_sub(1);
+    }
+
+    expected
+}
+
 async fn run_netcheck(
     app: &AppConfig,
     network_id: &str,
@@ -920,6 +1057,7 @@ fn init_config(path: &Path, force: bool, participants: Vec<String>) -> Result<()
 
     let mut config = AppConfig::generated();
     apply_participants_override(&mut config, participants)?;
+    maybe_autoconfigure_node(&mut config);
     config.save(path)?;
 
     println!("wrote {}", path.display());
@@ -1003,6 +1141,28 @@ fn tunnel_up(args: &TunnelUpArgs) -> Result<()> {
 
     let private_key_hex = key_b64_to_hex(&args.private_key)?;
     let peer_public_key_hex = key_b64_to_hex(&args.peer_public_key)?;
+
+    if args.hole_punch_attempts > 0 {
+        let peer_endpoint: SocketAddr = args.peer_endpoint.parse().with_context(|| {
+            format!(
+                "invalid --peer-endpoint '{}' (required as ip:port when hole-punching)",
+                args.peer_endpoint
+            )
+        })?;
+        let report = hole_punch_udp(
+            args.listen_port,
+            peer_endpoint,
+            args.hole_punch_attempts,
+            Duration::from_millis(args.hole_punch_interval_ms.max(1)),
+            Duration::from_millis(args.hole_punch_recv_timeout_ms.max(1)),
+        )
+        .context("pre-tunnel hole-punch failed")?;
+
+        println!(
+            "pre-punch: sent {} packets from {} to {}, received_response={}",
+            report.packets_sent, report.local_addr, peer_endpoint, report.packet_received
+        );
+    }
 
     // Keep handle alive for process lifetime; dropping tears down the device.
     let _handle = DeviceHandle::new(
@@ -1148,7 +1308,16 @@ mod tests {
     fn clap_includes_tailscale_style_commands() {
         let command = Cli::command();
         for name in [
-            "up", "down", "status", "set", "ping", "netcheck", "ip", "whois",
+            "up",
+            "down",
+            "status",
+            "set",
+            "ping",
+            "netcheck",
+            "ip",
+            "whois",
+            "nat-discover",
+            "hole-punch",
         ] {
             assert!(
                 command

@@ -28,6 +28,14 @@ struct NostrEvent {
     sig: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RelayEventSnapshot {
+    pub pubkey: String,
+    pub kind: u32,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct NostrFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +151,21 @@ impl WsRelay {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
+    }
+
+    pub async fn events_snapshot(&self) -> Vec<RelayEventSnapshot> {
+        self.state
+            .events
+            .read()
+            .await
+            .iter()
+            .map(|event| RelayEventSnapshot {
+                pubkey: event.pubkey.clone(),
+                kind: event.kind,
+                tags: event.tags.clone(),
+                content: event.content.clone(),
+            })
+            .collect()
     }
 }
 

@@ -5,3 +5,4 @@ crates/nostr-vpn-gui/src-tauri/target
 **/*.rs.bk
 .DS_Store
 *.log
+*.swp

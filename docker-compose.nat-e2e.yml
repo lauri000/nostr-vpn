@@ -1,0 +1,121 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    command: ["nostr-vpn-relay", "--bind", "0.0.0.0:8080"]
+    networks:
+      internet:
+        ipv4_address: 10.254.241.2
+
+  reflector:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    command: ["nvpn-reflector", "--bind", "0.0.0.0:3478"]
+    networks:
+      internet:
+        ipv4_address: 10.254.241.3
+
+  nat-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.forwarding=1
+      - net.ipv4.conf.default.forwarding=1
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        iptables -P FORWARD ACCEPT
+        iptables -t nat -A PREROUTING -i eth0 -p udp --dport 51820 -j DNAT --to-destination 198.19.241.3:51820
+        iptables -t nat -A POSTROUTING -s 198.19.241.0/24 -p udp --sport 51820 -j SNAT --to-source 10.254.241.10:51820
+        iptables -t nat -A POSTROUTING -s 198.19.241.0/24 -j MASQUERADE
+        sleep infinity
+    networks:
+      private-a:
+        ipv4_address: 198.19.241.2
+      internet:
+        ipv4_address: 10.254.241.10
+
+  nat-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.forwarding=1
+      - net.ipv4.conf.default.forwarding=1
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        iptables -P FORWARD ACCEPT
+        iptables -t nat -A PREROUTING -i eth0 -p udp --dport 51820 -j DNAT --to-destination 198.19.242.3:51820
+        iptables -t nat -A POSTROUTING -s 198.19.242.0/24 -p udp --sport 51820 -j SNAT --to-source 10.254.241.11:51820
+        iptables -t nat -A POSTROUTING -s 198.19.242.0/24 -j MASQUERADE
+        sleep infinity
+    networks:
+      private-b:
+        ipv4_address: 198.19.242.2
+      internet:
+        ipv4_address: 10.254.241.11
+
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    entrypoint: ["sleep", "infinity"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - relay
+      - reflector
+      - nat-a
+    networks:
+      private-a:
+        ipv4_address: 198.19.241.3
+
+  node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    entrypoint: ["sleep", "infinity"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - relay
+      - reflector
+      - nat-b
+    networks:
+      private-b:
+        ipv4_address: 198.19.242.3
+
+networks:
+  internet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.254.241.0/24
+  private-a:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 198.19.241.0/24
+  private-b:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 198.19.242.0/24

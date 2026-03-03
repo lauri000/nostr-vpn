@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::{IpAddr, UdpSocket};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -54,8 +55,10 @@ pub struct AppConfig {
     pub network_id: String,
     #[serde(default = "default_node_name")]
     pub node_name: String,
-    #[serde(default)]
+    #[serde(default = "default_auto_disconnect_relays_when_mesh_ready")]
     pub auto_disconnect_relays_when_mesh_ready: bool,
+    #[serde(default = "default_lan_discovery_enabled")]
+    pub lan_discovery_enabled: bool,
     #[serde(default)]
     pub participants: Vec<String>,
     #[serde(default)]
@@ -69,7 +72,9 @@ impl Default for AppConfig {
         let mut config = Self {
             network_id: default_network_id(),
             node_name: default_node_name(),
-            auto_disconnect_relays_when_mesh_ready: false,
+            auto_disconnect_relays_when_mesh_ready: default_auto_disconnect_relays_when_mesh_ready(
+            ),
+            lan_discovery_enabled: default_lan_discovery_enabled(),
             participants: Vec::new(),
             nostr: NostrConfig::default(),
             node: NodeConfig::default(),
@@ -249,6 +254,68 @@ pub fn normalize_nostr_pubkey(value: &str) -> Result<String> {
         .map_err(|error| anyhow::anyhow!("invalid participant pubkey '{value}': {error}"))
 }
 
+pub fn maybe_autoconfigure_node(config: &mut AppConfig) {
+    if needs_endpoint_autoconfig(&config.node.endpoint)
+        && let Some(ip) = detect_primary_ipv4()
+    {
+        config.node.endpoint = format!("{ip}:{}", config.node.listen_port);
+    }
+
+    if needs_tunnel_ip_autoconfig(&config.node.tunnel_ip)
+        && let Ok(own_pubkey) = config.own_nostr_pubkey_hex()
+        && let Some(tunnel_ip) = derive_mesh_tunnel_ip(&config.participants, &own_pubkey)
+    {
+        config.node.tunnel_ip = tunnel_ip;
+    }
+}
+
+pub fn derive_mesh_tunnel_ip(participants: &[String], own_pubkey_hex: &str) -> Option<String> {
+    if participants.is_empty() {
+        return None;
+    }
+
+    let mut normalized = participants.to_vec();
+    normalized.sort();
+    normalized.dedup();
+
+    let host_octet = if let Some(index) = normalized.iter().position(|key| key == own_pubkey_hex) {
+        ((index % 250) + 1) as u8
+    } else {
+        let digest = Sha256::digest(own_pubkey_hex.as_bytes());
+        (digest[0] % 241) + 10
+    };
+
+    Some(format!("10.44.0.{host_octet}/32"))
+}
+
+pub fn needs_endpoint_autoconfig(endpoint: &str) -> bool {
+    let value = endpoint.trim();
+    if value.is_empty() {
+        return true;
+    }
+
+    let host = value
+        .rsplit_once(':')
+        .map_or(value, |(host, _port)| host)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+
+    matches!(host, "127.0.0.1" | "0.0.0.0" | "localhost" | "::1")
+}
+
+pub fn needs_tunnel_ip_autoconfig(tunnel_ip: &str) -> bool {
+    let value = tunnel_ip.trim();
+    value.is_empty() || value == "10.44.0.1/32"
+}
+
+fn detect_primary_ipv4() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("1.1.1.1:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_ipv4() { Some(ip) } else { None }
+}
+
 fn generate_nostr_identity() -> (String, String) {
     let keys = Keys::generate();
 
@@ -271,6 +338,14 @@ fn default_network_id() -> String {
 
 fn default_node_name() -> String {
     "nostr-vpn-node".to_string()
+}
+
+const fn default_auto_disconnect_relays_when_mesh_ready() -> bool {
+    true
+}
+
+const fn default_lan_discovery_enabled() -> bool {
+    true
 }
 
 fn default_node_id() -> String {

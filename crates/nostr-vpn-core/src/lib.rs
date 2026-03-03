@@ -1,6 +1,7 @@
 pub mod config;
 pub mod control;
 pub mod crypto;
+pub mod nat;
 pub mod signaling;
 pub mod wireguard;
 

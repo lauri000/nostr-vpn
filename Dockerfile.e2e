@@ -8,10 +8,11 @@ RUN cargo build --release -p nostr-vpn-cli -p nostr-vpn-relay
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iproute2 iputils-ping \
+    && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/nvpn /usr/local/bin/nvpn
 COPY --from=builder /app/target/release/nostr-vpn-relay /usr/local/bin/nostr-vpn-relay
+COPY --from=builder /app/target/release/nvpn-reflector /usr/local/bin/nvpn-reflector
 
 ENV RUST_LOG=info

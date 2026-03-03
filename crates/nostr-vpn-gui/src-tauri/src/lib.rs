@@ -144,6 +144,7 @@ struct UiState {
     network_id: String,
     effective_network_id: String,
     auto_disconnect_relays_when_mesh_ready: bool,
+    lan_discovery_enabled: bool,
     connected_peer_count: usize,
     expected_peer_count: usize,
     mesh_ready: bool,
@@ -162,6 +163,7 @@ struct SettingsPatch {
     listen_port: Option<u16>,
     network_id: Option<String>,
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
+    lan_discovery_enabled: Option<bool>,
 }
 
 struct NvpnBackend {
@@ -814,6 +816,10 @@ impl NvpnBackend {
                 auto_disconnect_relays_when_mesh_ready;
         }
 
+        if let Some(lan_discovery_enabled) = patch.lan_discovery_enabled {
+            self.config.lan_discovery_enabled = lan_discovery_enabled;
+        }
+
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
 
@@ -1091,7 +1097,7 @@ impl NvpnBackend {
     }
 
     fn maybe_refresh_lan_discovery(&mut self) {
-        let should_run = self.config.participants.is_empty();
+        let should_run = self.config.lan_discovery_enabled && self.config.participants.is_empty();
 
         if should_run && !self.lan_discovery_running {
             self.start_lan_discovery();
@@ -1270,6 +1276,7 @@ impl NvpnBackend {
             auto_disconnect_relays_when_mesh_ready: self
                 .config
                 .auto_disconnect_relays_when_mesh_ready,
+            lan_discovery_enabled: self.config.lan_discovery_enabled,
             connected_peer_count,
             expected_peer_count,
             mesh_ready: is_mesh_complete(connected_peer_count, expected_peer_count),
@@ -1626,6 +1633,15 @@ pub fn run() {
     let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
 
     tauri::Builder::default()
+        .setup(|app| {
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+            app.handle().plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                None,
+            ))?;
+
+            Ok(())
+        })
         .manage(AppState {
             backend: Mutex::new(backend),
         })

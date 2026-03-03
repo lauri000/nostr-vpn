@@ -31,7 +31,7 @@ pub struct NostrSignalingClient {
     own_pubkey: String,
     keys: Keys,
     client: Client,
-    allowed_senders: Option<HashSet<String>>,
+    participant_pubkeys: HashSet<String>,
     connected: AtomicBool,
     recv_rx: Mutex<broadcast::Receiver<SignalEnvelope>>,
     recv_tx: broadcast::Sender<SignalEnvelope>,
@@ -67,7 +67,7 @@ impl NostrSignalingClient {
             .database(nostr_sdk::database::MemoryDatabase::new())
             .build();
 
-        let allowed_senders = normalize_participants(participants)?;
+        let participant_pubkeys = normalize_participants(participants)?;
 
         let (recv_tx, recv_rx) = broadcast::channel(2048);
 
@@ -76,7 +76,7 @@ impl NostrSignalingClient {
             own_pubkey,
             keys,
             client,
-            allowed_senders,
+            participant_pubkeys,
             connected: AtomicBool::new(false),
             recv_rx: Mutex::new(recv_rx),
             recv_tx,
@@ -95,6 +95,10 @@ impl NostrSignalingClient {
 
         let filter = Filter::new()
             .kind(Kind::Custom(NOSTR_KIND_NOSTR_VPN))
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::P),
+                vec![self.own_pubkey.clone()],
+            )
             .since(Timestamp::now() - Duration::from_secs(120));
 
         self.client
@@ -118,6 +122,18 @@ impl NostrSignalingClient {
             return Err(anyhow!("client not connected"));
         }
 
+        let recipients: Vec<String> = self
+            .participant_pubkeys
+            .iter()
+            .filter(|participant| participant.as_str() != self.own_pubkey)
+            .cloned()
+            .collect();
+        if recipients.is_empty() {
+            return Err(anyhow!(
+                "no configured participants to send private signaling message to"
+            ));
+        }
+
         let envelope = SignalEnvelope {
             network_id: self.network_id.clone(),
             sender_pubkey: self.own_pubkey.clone(),
@@ -125,24 +141,44 @@ impl NostrSignalingClient {
         };
 
         let content = serde_json::to_string(&envelope).context("failed to serialize envelope")?;
-        let tags = vec![Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::N)),
-            vec![self.network_id.clone()],
-        )];
 
-        let builder = EventBuilder::new(Kind::Custom(NOSTR_KIND_NOSTR_VPN), content, tags);
-        let event = builder
-            .to_event(&self.keys)
-            .context("failed to sign nostr event")?;
+        let mut accepted = 0usize;
+        let expiration = Timestamp::now() + Duration::from_secs(300);
+        for recipient in recipients {
+            let recipient_pubkey = PublicKey::from_hex(&recipient)
+                .with_context(|| format!("invalid recipient pubkey {recipient}"))?;
 
-        let output = self
-            .client
-            .send_event(event)
-            .await
-            .context("failed to publish nostr event")?;
+            let encrypted_content = nip44::encrypt(
+                self.keys.secret_key(),
+                &recipient_pubkey,
+                &content,
+                nip44::Version::V2,
+            )
+            .context("failed to encrypt signaling payload")?;
 
-        if output.success.is_empty() {
-            return Err(anyhow!("event rejected by all relays"));
+            let tags = vec![
+                Tag::public_key(recipient_pubkey),
+                Tag::expiration(expiration),
+            ];
+            let builder =
+                EventBuilder::new(Kind::Custom(NOSTR_KIND_NOSTR_VPN), encrypted_content, tags);
+            let event = builder
+                .to_event(&self.keys)
+                .context("failed to sign private nostr event")?;
+
+            let output = self
+                .client
+                .send_event(event)
+                .await
+                .context("failed to publish private nostr event")?;
+
+            if !output.success.is_empty() {
+                accepted += 1;
+            }
+        }
+
+        if accepted == 0 {
+            return Err(anyhow!("private signaling event rejected by all relays"));
         }
 
         Ok(())
@@ -163,7 +199,8 @@ impl NostrSignalingClient {
         let mut notifications = self.client.notifications();
         let own_pubkey = self.own_pubkey.clone();
         let network_id = self.network_id.clone();
-        let allowed_senders = self.allowed_senders.clone();
+        let participant_pubkeys = self.participant_pubkeys.clone();
+        let keys = self.keys.clone();
         let recv_tx = self.recv_tx.clone();
 
         tokio::spawn(async move {
@@ -183,42 +220,63 @@ impl NostrSignalingClient {
                         continue;
                     }
 
-                    if let Ok(envelope) = serde_json::from_str::<SignalEnvelope>(&event.content) {
-                        if envelope.network_id != network_id {
-                            continue;
-                        }
-
-                        if envelope.sender_pubkey == own_pubkey {
-                            continue;
-                        }
-
-                        if let Some(allowlist) = &allowed_senders
-                            && !allowlist.contains(&envelope.sender_pubkey)
-                        {
-                            continue;
-                        }
-
-                        let _ = recv_tx.send(envelope);
+                    let Some(recipient_pubkey) = first_tag_value(&event, "p") else {
+                        continue;
+                    };
+                    if recipient_pubkey != own_pubkey {
+                        continue;
                     }
+
+                    let plaintext =
+                        match nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content) {
+                            Ok(plaintext) => plaintext,
+                            Err(_) => continue,
+                        };
+
+                    let Ok(envelope) = serde_json::from_str::<SignalEnvelope>(&plaintext) else {
+                        continue;
+                    };
+
+                    if envelope.network_id != network_id {
+                        continue;
+                    }
+
+                    if envelope.sender_pubkey == own_pubkey {
+                        continue;
+                    }
+
+                    if envelope.sender_pubkey != event.pubkey.to_hex() {
+                        continue;
+                    }
+
+                    if !participant_pubkeys.is_empty()
+                        && !participant_pubkeys.contains(&envelope.sender_pubkey)
+                    {
+                        continue;
+                    }
+
+                    let _ = recv_tx.send(envelope);
                 }
             }
         });
     }
 }
 
-fn normalize_participants(participants: Vec<String>) -> Result<Option<HashSet<String>>> {
-    if participants.is_empty() {
-        return Ok(None);
-    }
-
+fn normalize_participants(participants: Vec<String>) -> Result<HashSet<String>> {
     let mut normalized = HashSet::with_capacity(participants.len());
     for participant in participants {
         normalized.insert(normalize_nostr_pubkey(&participant)?);
     }
+    Ok(normalized)
+}
 
-    if normalized.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(normalized))
-    }
+fn first_tag_value(event: &Event, name: &str) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        let values = tag.clone().to_vec();
+        if values.len() >= 2 && values[0] == name {
+            Some(values[1].clone())
+        } else {
+            None
+        }
+    })
 }

@@ -10,7 +10,7 @@ name = "nostr_vpn_gui"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.3" }
+tauri-build = { version = "2.3", features = [] }
 
 [dependencies]
 anyhow.workspace = true
@@ -24,3 +24,6 @@ nostr-sdk.workspace = true
 tauri = { version = "2.6", features = ["tray-icon"] }
 
 nostr-vpn-core = { path = "../../nostr-vpn-core" }
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-autostart = "2"
