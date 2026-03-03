@@ -1,4 +1,7 @@
 /target
+crates/nostr-vpn-gui/node_modules
+crates/nostr-vpn-gui/dist
+crates/nostr-vpn-gui/src-tauri/target
 **/*.rs.bk
 .DS_Store
 *.log

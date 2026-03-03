@@ -23,16 +23,28 @@ cleanup
 "${COMPOSE[@]}" up -d relay node-a node-b >/dev/null
 sleep 3
 
+ALICE_NPUB="$("${COMPOSE[@]}" exec -T node-a sh -lc \
+  "nvpn init --force >/dev/null && grep -m1 '^public_key' /root/.config/nvpn/config.toml | cut -d '\"' -f 2")"
+BOB_NPUB="$("${COMPOSE[@]}" exec -T node-b sh -lc \
+  "nvpn init --force >/dev/null && grep -m1 '^public_key' /root/.config/nvpn/config.toml | cut -d '\"' -f 2")"
+
+if [[ -z "$ALICE_NPUB" || -z "$BOB_NPUB" ]]; then
+  echo "docker e2e failed: unable to resolve node npubs from config" >&2
+  exit 1
+fi
+
 "${COMPOSE[@]}" exec -T node-a sh -lc \
-  "nvpn listen --network-id '$NETWORK_ID' --relay '$RELAY_URL' --limit 1 > /tmp/listen.log 2>&1 &"
+  "nvpn listen --network-id '$NETWORK_ID' --relay '$RELAY_URL' --participant '$ALICE_NPUB' --participant '$BOB_NPUB' --limit 1 > /tmp/listen.log 2>&1 &"
 "${COMPOSE[@]}" exec -T node-b sh -lc \
-  "nvpn listen --network-id '$NETWORK_ID' --relay '$RELAY_URL' --limit 1 > /tmp/listen.log 2>&1 &"
+  "nvpn listen --network-id '$NETWORK_ID' --relay '$RELAY_URL' --participant '$ALICE_NPUB' --participant '$BOB_NPUB' --limit 1 > /tmp/listen.log 2>&1 &"
 
 sleep 2
 
 "${COMPOSE[@]}" exec -T node-a nvpn announce \
   --network-id "$NETWORK_ID" \
   --relay "$RELAY_URL" \
+  --participant "$ALICE_NPUB" \
+  --participant "$BOB_NPUB" \
   --node-id alice-node \
   --endpoint 10.203.0.10:51820 \
   --tunnel-ip 10.44.0.1/32 \
@@ -41,6 +53,8 @@ sleep 2
 "${COMPOSE[@]}" exec -T node-b nvpn announce \
   --network-id "$NETWORK_ID" \
   --relay "$RELAY_URL" \
+  --participant "$BOB_NPUB" \
+  --participant "$ALICE_NPUB" \
   --node-id bob-node \
   --endpoint 10.203.0.11:51820 \
   --tunnel-ip 10.44.0.2/32 \

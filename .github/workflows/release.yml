@@ -66,6 +66,25 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup Node
+        if: matrix.gui
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/nostr-vpn-gui/pnpm-lock.yaml
+
+      - name: Enable corepack
+        if: matrix.gui
+        run: corepack enable
+
+      - name: Build GUI frontend assets
+        if: matrix.gui
+        shell: bash
+        run: |
+          pnpm --dir crates/nostr-vpn-gui install --frozen-lockfile
+          pnpm --dir crates/nostr-vpn-gui build
+
       - name: Build (cross)
         if: matrix.cross
         run: |

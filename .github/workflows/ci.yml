@@ -20,6 +20,21 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/nostr-vpn-gui/pnpm-lock.yaml
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Build frontend
+        run: |
+          pnpm --dir crates/nostr-vpn-gui install --frozen-lockfile
+          pnpm --dir crates/nostr-vpn-gui build
+
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
@@ -27,10 +42,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude nostr-vpn-gui --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude nostr-vpn-gui
 
   build:
     name: Build ${{ matrix.target }}
@@ -64,6 +79,24 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        if: matrix.gui
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/nostr-vpn-gui/pnpm-lock.yaml
+
+      - name: Enable corepack
+        if: matrix.gui
+        run: corepack enable
+
+      - name: Build GUI frontend assets
+        if: matrix.gui
+        run: |
+          pnpm --dir crates/nostr-vpn-gui install --frozen-lockfile
+          pnpm --dir crates/nostr-vpn-gui build
 
       - name: Build core CLI + relay
         run: |

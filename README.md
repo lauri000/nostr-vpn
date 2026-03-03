@@ -13,12 +13,11 @@
 - Network membership based on participant Nostr pubkeys (npub/hex allowlist)
 - Deterministic network IDs derived from participant pubkeys
 - Automatic key generation for both WireGuard and Nostr identities
-- GUI with topbar controls + settings dialog
+- Tauri + Svelte desktop GUI (single-pane settings UX)
+- LAN multicast peer discovery helper (active when no participants are configured)
 - Docker e2e that validates signaling + data-plane ping across 2 containers
 
 ## Default relays
-
-Defaults match `~/src/hashtree`:
 
 - `wss://temp.iris.to`
 - `wss://relay.damus.io`
@@ -31,11 +30,20 @@ Defaults match `~/src/hashtree`:
 ### 1. Build and test
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --exclude nostr-vpn-gui
+cargo clippy --workspace --exclude nostr-vpn-gui --all-targets -- -D warnings
+pnpm --dir crates/nostr-vpn-gui install
+pnpm --dir crates/nostr-vpn-gui build
+cargo check -p nostr-vpn-gui
 ```
 
-### 2. Create config (auto-keygen)
+### 2. Install CLI locally (one-time)
+
+```bash
+cargo install --path crates/nostr-vpn-cli
+```
+
+### 3. Create config (auto-keygen)
 
 ```bash
 nvpn init \
@@ -45,32 +53,41 @@ nvpn init \
 
 This writes config to `~/.config/nvpn/config.toml`.
 
-### 3. Bring node up
+### 4. Bring node up
 
 ```bash
-nvpn up --endpoint 203.0.113.10:51820 --tunnel-ip 10.44.0.2/32
+nvpn up
 ```
 
-### 4. Check status
+`nvpn up` auto-derives:
+
+- tunnel IP from participant pubkeys
+- endpoint from your local primary IP + listen port (when endpoint is still localhost)
+
+You can still override with `--endpoint` / `--tunnel-ip` for advanced/manual setups.
+
+### 5. Check status
 
 ```bash
 nvpn status --json
 ```
 
-### 5. Render WireGuard config
+`status` reports relay policy and mesh progress, including whether
+`auto_disconnect_relays_when_mesh_ready` is enabled (default: `true`).
+
+### 6. Render WireGuard config
 
 ```bash
 nvpn render-wg \
   --peer "<wg-pubkey>,10.44.0.3/32,198.51.100.20:51820"
 ```
 
-### 6. Start GUI
+### 7. Start GUI
 
 ```bash
-cargo run -p nostr-vpn-gui
+pnpm --dir crates/nostr-vpn-gui install
+pnpm --dir crates/nostr-vpn-gui tauri:dev
 ```
-
-Use the topbar controls (`Menu`, `Connect`, `Announce`, `Settings`).
 
 ## CLI commands
 
@@ -104,7 +121,12 @@ cd nvpn && ./install.sh
 
 ## Docker e2e
 
-Run a real cross-container signaling + tunnel check (relay + 2 nodes):
+Requirements:
+
+- Docker Engine with Compose plugin (`docker compose`)
+- Linux environment with `/dev/net/tun` available
+
+Run a real cross-container signaling + tunnel check (local relay + 2 nodes):
 
 ```bash
 ./scripts/e2e-docker.sh
