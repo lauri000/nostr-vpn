@@ -196,11 +196,26 @@ impl AppConfig {
             return self.network_id.clone();
         }
 
-        derive_network_id_from_participants(&self.participants)
+        let mesh_members = self.mesh_members_pubkeys();
+        if mesh_members.is_empty() {
+            return self.network_id.clone();
+        }
+
+        derive_network_id_from_participants(&mesh_members)
     }
 
     pub fn participant_pubkeys_hex(&self) -> Vec<String> {
         self.participants.clone()
+    }
+
+    pub fn mesh_members_pubkeys(&self) -> Vec<String> {
+        let mut members = self.participant_pubkeys_hex();
+        if let Ok(own_pubkey) = self.own_nostr_pubkey_hex() {
+            members.push(own_pubkey);
+        }
+        members.sort();
+        members.dedup();
+        members
     }
 
     pub fn nostr_keys(&self) -> Result<Keys> {
@@ -264,9 +279,10 @@ pub fn maybe_autoconfigure_node(config: &mut AppConfig) {
         config.node.endpoint = format!("{ip}:{}", config.node.listen_port);
     }
 
+    let mesh_members = config.mesh_members_pubkeys();
     if needs_tunnel_ip_autoconfig(&config.node.tunnel_ip)
         && let Ok(own_pubkey) = config.own_nostr_pubkey_hex()
-        && let Some(tunnel_ip) = derive_mesh_tunnel_ip(&config.participants, &own_pubkey)
+        && let Some(tunnel_ip) = derive_mesh_tunnel_ip(&mesh_members, &own_pubkey)
     {
         config.node.tunnel_ip = tunnel_ip;
     }

@@ -152,3 +152,39 @@ listen_port = 51820
     let config: AppConfig = toml::from_str(raw).expect("parse config");
     assert!(config.close_to_tray_on_close);
 }
+
+#[test]
+fn reciprocal_participant_configs_share_effective_network_id() {
+    let alice = Keys::generate();
+    let bob = Keys::generate();
+    let alice_hex = alice.public_key().to_hex();
+    let bob_hex = bob.public_key().to_hex();
+
+    let mut alice_config = AppConfig::generated();
+    alice_config.nostr.secret_key = alice.secret_key().to_secret_hex();
+    alice_config.nostr.public_key = alice_hex.clone();
+    alice_config.participants = vec![bob_hex.clone()];
+    maybe_autoconfigure_node(&mut alice_config);
+
+    let mut bob_config = AppConfig::generated();
+    bob_config.nostr.secret_key = bob.secret_key().to_secret_hex();
+    bob_config.nostr.public_key = bob_hex.clone();
+    bob_config.participants = vec![alice_hex.clone()];
+    maybe_autoconfigure_node(&mut bob_config);
+
+    assert_eq!(
+        alice_config.effective_network_id(),
+        bob_config.effective_network_id()
+    );
+
+    assert_ne!(alice_config.node.tunnel_ip, bob_config.node.tunnel_ip);
+    assert_eq!(
+        derive_mesh_tunnel_ip(&alice_config.mesh_members_pubkeys(), &alice_hex)
+            .expect("alice tunnel ip"),
+        alice_config.node.tunnel_ip
+    );
+    assert_eq!(
+        derive_mesh_tunnel_ip(&bob_config.mesh_members_pubkeys(), &bob_hex).expect("bob tunnel ip"),
+        bob_config.node.tunnel_ip
+    );
+}

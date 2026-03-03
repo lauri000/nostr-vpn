@@ -500,6 +500,7 @@ impl NvpnBackend {
 
         let own_pubkey = self.config.own_nostr_pubkey_hex().ok();
         let participants = self.config.participants.clone();
+        let mesh_members = self.config.mesh_members_pubkeys();
 
         for participant in &participants {
             if Some(participant.as_str()) == own_pubkey.as_deref() {
@@ -530,7 +531,7 @@ impl NvpnBackend {
                     continue;
                 }
 
-                let Some(tunnel_ip) = derive_mesh_tunnel_ip(&participants, participant) else {
+                let Some(tunnel_ip) = derive_mesh_tunnel_ip(&mesh_members, participant) else {
                     results.push(PeerCheckResult {
                         participant: participant.clone(),
                         reachable: false,
@@ -986,6 +987,7 @@ impl NvpnBackend {
 
     fn configured_peer_rows(&self) -> Vec<ParticipantView> {
         let own_pubkey_hex = self.config.own_nostr_pubkey_hex().ok();
+        let mesh_members = self.config.mesh_members_pubkeys();
         let mut participants = self.config.participants.clone();
         participants.sort();
         participants.dedup();
@@ -993,7 +995,7 @@ impl NvpnBackend {
         participants
             .into_iter()
             .map(|participant| {
-                let tunnel_ip = derive_mesh_tunnel_ip(&self.config.participants, &participant)
+                let tunnel_ip = derive_mesh_tunnel_ip(&mesh_members, &participant)
                     .unwrap_or_else(|| "-".to_string());
                 let state = self.peer_state_for(&participant, own_pubkey_hex.as_deref());
                 let status_text = self.peer_status_line(&participant, state);
