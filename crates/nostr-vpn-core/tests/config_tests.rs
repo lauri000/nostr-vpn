@@ -40,6 +40,7 @@ fn generated_config_auto_populates_keys() {
     assert!(!config.nostr.relays.is_empty());
     assert!(config.auto_disconnect_relays_when_mesh_ready);
     assert!(config.lan_discovery_enabled);
+    assert!(config.close_to_tray_on_close);
 }
 
 #[test]
@@ -123,4 +124,31 @@ listen_port = 51820
 
     let config: AppConfig = toml::from_str(raw).expect("parse config");
     assert!(config.lan_discovery_enabled);
+}
+
+#[test]
+fn close_to_tray_defaults_true_when_missing_from_toml() {
+    let raw = r#"
+network_id = "nostr-vpn"
+node_name = "node"
+auto_disconnect_relays_when_mesh_ready = true
+lan_discovery_enabled = true
+participants = []
+
+[nostr]
+relays = ["wss://temp.iris.to"]
+secret_key = ""
+public_key = ""
+
+[node]
+id = "node-id"
+private_key = ""
+public_key = ""
+endpoint = "127.0.0.1:51820"
+tunnel_ip = "10.44.0.1/32"
+listen_port = 51820
+"#;
+
+    let config: AppConfig = toml::from_str(raw).expect("parse config");
+    assert!(config.close_to_tray_on_close);
 }

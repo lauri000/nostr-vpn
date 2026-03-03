@@ -14,12 +14,16 @@ use nostr_vpn_core::config::{
 use nostr_vpn_core::control::PeerAnnouncement;
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, State, WindowEvent};
 use tokio::runtime::Runtime;
 
 const LAN_DISCOVERY_ADDR: [u8; 4] = [239, 255, 73, 73];
 const LAN_DISCOVERY_PORT: u16 = 38911;
 const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
+const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
+const TRAY_QUIT_MENU_ID: &str = "tray_quit";
 
 #[derive(Debug, Clone)]
 struct RelayCheckResult {
@@ -145,6 +149,7 @@ struct UiState {
     effective_network_id: String,
     auto_disconnect_relays_when_mesh_ready: bool,
     lan_discovery_enabled: bool,
+    close_to_tray_on_close: bool,
     connected_peer_count: usize,
     expected_peer_count: usize,
     mesh_ready: bool,
@@ -164,6 +169,7 @@ struct SettingsPatch {
     network_id: Option<String>,
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
     lan_discovery_enabled: Option<bool>,
+    close_to_tray_on_close: Option<bool>,
 }
 
 struct NvpnBackend {
@@ -823,6 +829,9 @@ impl NvpnBackend {
         if let Some(lan_discovery_enabled) = patch.lan_discovery_enabled {
             self.config.lan_discovery_enabled = lan_discovery_enabled;
         }
+        if let Some(close_to_tray_on_close) = patch.close_to_tray_on_close {
+            self.config.close_to_tray_on_close = close_to_tray_on_close;
+        }
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
@@ -1281,6 +1290,7 @@ impl NvpnBackend {
                 .config
                 .auto_disconnect_relays_when_mesh_ready,
             lan_discovery_enabled: self.config.lan_discovery_enabled,
+            close_to_tray_on_close: self.config.close_to_tray_on_close,
             connected_peer_count,
             expected_peer_count,
             mesh_ready: is_mesh_complete(connected_peer_count, expected_peer_count),
@@ -1559,6 +1569,27 @@ fn with_backend<T>(
     f(&mut backend).map_err(|error| error.to_string())
 }
 
+fn should_close_to_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return true;
+    };
+    let Ok(backend) = state.backend.lock() else {
+        return true;
+    };
+    backend.config.close_to_tray_on_close
+}
+
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+
+    let _ = window.unminimize();
+    window.show()?;
+    window.set_focus()?;
+    Ok(())
+}
+
 #[tauri::command]
 fn tick(state: State<'_, AppState>) -> Result<UiState, String> {
     with_backend(state, |backend| {
@@ -1635,8 +1666,7 @@ pub fn run() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
-
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             app.handle().plugin(tauri_plugin_autostart::init(
@@ -1644,7 +1674,63 @@ pub fn run() {
                 None,
             ))?;
 
+            let open_item =
+                MenuItemBuilder::with_id(TRAY_OPEN_MENU_ID, "Open Nostr VPN").build(app)?;
+            let quit_item =
+                MenuItemBuilder::with_id(TRAY_QUIT_MENU_ID, "Quit Nostr VPN").build(app)?;
+            let tray_menu = MenuBuilder::new(app)
+                .item(&open_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let tray_builder = TrayIconBuilder::with_id("nvpn-tray")
+                .tooltip("Nostr VPN")
+                .menu(&tray_menu)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    TRAY_OPEN_MENU_ID => {
+                        let _ = show_main_window(app);
+                    }
+                    TRAY_QUIT_MENU_ID => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let _ = show_main_window(&tray.app_handle());
+                    }
+                })
+                .show_menu_on_left_click(false);
+
+            let tray_builder = if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder.icon(icon)
+            } else {
+                tray_builder
+            };
+
+            let _ = tray_builder.build(app)?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if should_close_to_tray(&window.app_handle()) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
+                    window.app_handle().exit(0);
+                }
+            }
         })
         .manage(AppState {
             backend: Mutex::new(backend),
@@ -1659,8 +1745,18 @@ pub fn run() {
             remove_relay,
             update_settings
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    #[cfg(target_os = "macos")]
+    app.run(|app, event| {
+        if let tauri::RunEvent::Reopen { .. } = event {
+            let _ = show_main_window(app);
+        }
+    });
+
+    #[cfg(not(target_os = "macos"))]
+    app.run(|_app, _event| {});
 }
 
 #[cfg(test)]

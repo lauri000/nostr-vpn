@@ -20,6 +20,7 @@ const mockState: UiState = {
   effectiveNetworkId: 'nostr-vpn',
   autoDisconnectRelaysWhenMeshReady: true,
   lanDiscoveryEnabled: true,
+  closeToTrayOnClose: true,
   connectedPeerCount: 0,
   expectedPeerCount: 0,
   meshReady: false,
@@ -160,6 +161,9 @@ export const updateSettings = (patch: SettingsPatch) =>
         }
         if (patch.lanDiscoveryEnabled !== undefined) {
           mockState.lanDiscoveryEnabled = patch.lanDiscoveryEnabled
+        }
+        if (patch.closeToTrayOnClose !== undefined) {
+          mockState.closeToTrayOnClose = patch.closeToTrayOnClose
         }
         return asResult()
       })()

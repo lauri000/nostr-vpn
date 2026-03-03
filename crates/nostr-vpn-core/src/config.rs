@@ -59,6 +59,8 @@ pub struct AppConfig {
     pub auto_disconnect_relays_when_mesh_ready: bool,
     #[serde(default = "default_lan_discovery_enabled")]
     pub lan_discovery_enabled: bool,
+    #[serde(default = "default_close_to_tray_on_close")]
+    pub close_to_tray_on_close: bool,
     #[serde(default)]
     pub participants: Vec<String>,
     #[serde(default)]
@@ -75,6 +77,7 @@ impl Default for AppConfig {
             auto_disconnect_relays_when_mesh_ready: default_auto_disconnect_relays_when_mesh_ready(
             ),
             lan_discovery_enabled: default_lan_discovery_enabled(),
+            close_to_tray_on_close: default_close_to_tray_on_close(),
             participants: Vec::new(),
             nostr: NostrConfig::default(),
             node: NodeConfig::default(),
@@ -345,6 +348,10 @@ const fn default_auto_disconnect_relays_when_mesh_ready() -> bool {
 }
 
 const fn default_lan_discovery_enabled() -> bool {
+    true
+}
+
+const fn default_close_to_tray_on_close() -> bool {
     true
 }
 

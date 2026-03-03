@@ -384,6 +384,18 @@
         <span>Launch on system startup</span>
       </label>
 
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          checked={state.closeToTrayOnClose}
+          on:change={(event) =>
+            onUpdateSettings({
+              closeToTrayOnClose: (event.currentTarget as HTMLInputElement).checked,
+            })}
+        />
+        <span>Keep running in menu bar when window is closed</span>
+      </label>
+
       <div class="field-grid">
         <label>
           <span>Fallback Network ID</span>
