@@ -31,6 +31,10 @@ impl PeerDirectory {
         self.peers.get(node_id)
     }
 
+    pub fn remove(&mut self, node_id: &str) -> Option<PeerAnnouncement> {
+        self.peers.remove(node_id)
+    }
+
     pub fn all(&self) -> Vec<PeerAnnouncement> {
         let mut peers: Vec<PeerAnnouncement> = self.peers.values().cloned().collect();
         peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));

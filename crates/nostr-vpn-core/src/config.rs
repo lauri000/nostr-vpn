@@ -55,6 +55,8 @@ pub struct AppConfig {
     #[serde(default = "default_node_name")]
     pub node_name: String,
     #[serde(default)]
+    pub auto_disconnect_relays_when_mesh_ready: bool,
+    #[serde(default)]
     pub participants: Vec<String>,
     #[serde(default)]
     pub nostr: NostrConfig,
@@ -67,6 +69,7 @@ impl Default for AppConfig {
         let mut config = Self {
             network_id: default_network_id(),
             node_name: default_node_name(),
+            auto_disconnect_relays_when_mesh_ready: false,
             participants: Vec::new(),
             nostr: NostrConfig::default(),
             node: NodeConfig::default(),
