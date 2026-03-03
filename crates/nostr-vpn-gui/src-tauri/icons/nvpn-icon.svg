@@ -1,33 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="NVPN icon">
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="NVPN node graph N icon">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#090321" />
-      <stop offset="50%" stop-color="#12083c" />
-      <stop offset="100%" stop-color="#1b0b52" />
+      <stop offset="0%" stop-color="#07031d" />
+      <stop offset="55%" stop-color="#12083b" />
+      <stop offset="100%" stop-color="#221064" />
     </linearGradient>
-    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#ff4fd8" />
-      <stop offset="100%" stop-color="#8f5bff" />
+    <linearGradient id="edge" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff4bcf" />
+      <stop offset="100%" stop-color="#5aa7ff" />
     </linearGradient>
-    <linearGradient id="nfill" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#78f5ff" />
-      <stop offset="100%" stop-color="#39d2ff" />
-    </linearGradient>
+    <radialGradient id="node" cx="36%" cy="28%" r="80%">
+      <stop offset="0%" stop-color="#b9fbff" />
+      <stop offset="100%" stop-color="#2dd3ff" />
+    </radialGradient>
   </defs>
 
-  <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#bg)" />
+  <rect x="0" y="0" width="1024" height="1024" rx="226" fill="url(#bg)" />
 
-  <circle cx="512" cy="512" r="346" fill="none" stroke="url(#ring)" stroke-width="52" />
+  <rect x="146" y="146" width="732" height="732" rx="188" fill="none" stroke="#3d2b88" stroke-width="18" opacity="0.8" />
 
-  <g fill="url(#nfill)">
-    <rect x="336" y="296" width="82" height="432" rx="20" />
-    <rect x="606" y="296" width="82" height="432" rx="20" />
-    <polygon points="408,324 512,324 616,700 512,700" />
+  <g stroke="url(#edge)" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <polyline points="310,736 310,288 716,736 716,288" stroke-width="72" />
+
+    <line x1="310" y1="640" x2="430" y2="516" stroke-width="32" opacity="0.68" />
+    <line x1="430" y1="516" x2="534" y2="624" stroke-width="32" opacity="0.68" />
+    <line x1="534" y1="624" x2="636" y2="516" stroke-width="32" opacity="0.68" />
+    <line x1="430" y1="516" x2="560" y2="390" stroke-width="32" opacity="0.68" />
   </g>
 
-  <g opacity="0.55" stroke="#2ac7ff" stroke-width="10">
-    <line x1="262" y1="452" x2="762" y2="452" />
-    <line x1="240" y1="512" x2="784" y2="512" />
-    <line x1="262" y1="572" x2="762" y2="572" />
+  <g fill="url(#node)" stroke="#f26bf0" stroke-width="12">
+    <circle cx="310" cy="288" r="38" />
+    <circle cx="310" cy="736" r="38" />
+    <circle cx="716" cy="288" r="38" />
+    <circle cx="716" cy="736" r="38" />
+
+    <circle cx="430" cy="516" r="24" />
+    <circle cx="560" cy="390" r="24" />
+    <circle cx="534" cy="624" r="24" />
+    <circle cx="636" cy="516" r="24" />
   </g>
 </svg>

@@ -21,7 +21,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 nostr-sdk.workspace = true
-tauri = { version = "2.6", features = ["tray-icon"] }
+tauri = { version = "2.6", features = ["tray-icon", "image-png"] }
 
 nostr-vpn-core = { path = "../../nostr-vpn-core" }
 

@@ -1714,6 +1714,20 @@ pub fn run() {
                 })
                 .show_menu_on_left_click(false);
 
+            #[cfg(target_os = "macos")]
+            let tray_builder = {
+                if let Ok(template_icon) =
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))
+                {
+                    tray_builder.icon(template_icon).icon_as_template(true)
+                } else if let Some(icon) = app.default_window_icon().cloned() {
+                    tray_builder.icon(icon).icon_as_template(true)
+                } else {
+                    tray_builder.icon_as_template(true)
+                }
+            };
+
+            #[cfg(not(target_os = "macos"))]
             let tray_builder = if let Some(icon) = app.default_window_icon().cloned() {
                 tray_builder.icon(icon)
             } else {
