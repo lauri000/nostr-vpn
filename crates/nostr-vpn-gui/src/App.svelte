@@ -340,7 +340,7 @@
   {/if}
 
   {#if state}
-    <section class="panel">
+    <section class="panel network-controls-panel">
       <div class="section-title-row">
         <h2>Networks</h2>
         <div class="section-meta">
@@ -373,141 +373,139 @@
           Add network
         </button>
       </div>
+    </section>
 
-      <div class="stack rows network-stack">
-        {#each state.networks as network}
-          <section class={`network-card ${network.enabled ? '' : 'network-disabled'}`} data-testid="network-card">
-            <div class="row spread network-header">
-              <div class="row network-title-group">
-                <input
-                  class="text-input network-name-input"
-                  value={networkNameDrafts[network.id] ?? network.name}
-                  data-testid="network-name-input"
-                  on:input={(event) =>
-                    onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
-                />
-                <span class="badge muted" data-testid="network-mesh-badge">
-                  {network.onlineCount}/{network.expectedCount}
-                </span>
-              </div>
-              <div class="row network-actions">
-                <label class="toggle-row compact">
+    {#each state.networks as network}
+      <section class={`panel network-card ${network.enabled ? '' : 'network-disabled'}`} data-testid="network-card">
+        <div class="row spread network-header">
+          <div class="row network-title-group">
+            <input
+              class="text-input network-name-input"
+              value={networkNameDrafts[network.id] ?? network.name}
+              data-testid="network-name-input"
+              on:input={(event) =>
+                onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
+            />
+            <span class="badge muted" data-testid="network-mesh-badge">
+              {network.onlineCount}/{network.expectedCount}
+            </span>
+          </div>
+          <div class="row network-actions">
+            <label class="toggle-row compact">
+              <input
+                type="checkbox"
+                checked={network.enabled}
+                data-testid="network-enabled-toggle"
+                on:change={(event) =>
+                  runAction(() =>
+                    setNetworkEnabled(network.id, (event.currentTarget as HTMLInputElement).checked),
+                  )}
+              />
+              <span>{network.enabled ? 'On' : 'Off'}</span>
+            </label>
+            <button
+              class="btn ghost icon-btn"
+              data-testid="network-remove"
+              title="Delete network"
+              aria-label="Delete network"
+              disabled={state.networks.length <= 1}
+              on:click={() => runAction(() => removeNetwork(network.id))}
+            >
+              <Trash2 size={16} strokeWidth={2.2} />
+            </button>
+          </div>
+        </div>
+
+        <div class="row form-row participant-add-row">
+          <input
+            class="text-input"
+            placeholder="Add participant (npub)"
+            data-testid="participant-input"
+            value={participantInputDrafts[network.id] ?? ''}
+            on:input={(event) =>
+              (participantInputDrafts = {
+                ...participantInputDrafts,
+                [network.id]: (event.currentTarget as HTMLInputElement).value,
+              })}
+            on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+          />
+          <input
+            class="text-input participant-add-alias"
+            placeholder="Alias (optional)"
+            data-testid="participant-add-alias-input"
+            value={participantAddAliasDrafts[network.id] ?? ''}
+            on:input={(event) =>
+              (participantAddAliasDrafts = {
+                ...participantAddAliasDrafts,
+                [network.id]: (event.currentTarget as HTMLInputElement).value,
+              })}
+            on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+          />
+          <button class="btn" data-testid="participant-add" on:click={() => onAddParticipant(network.id)}>
+            Add
+          </button>
+        </div>
+
+        <div class="stack rows">
+          {#each network.participants as participant}
+            <div class="item-row" data-testid="participant-row">
+              <div class="item-main">
+                <div class="item-title">{short(participant.npub, 22, 12)}</div>
+                <div class="row alias-row">
                   <input
-                    type="checkbox"
-                    checked={network.enabled}
-                    data-testid="network-enabled-toggle"
-                    on:change={(event) =>
-                      runAction(() =>
-                        setNetworkEnabled(network.id, (event.currentTarget as HTMLInputElement).checked),
+                    class="text-input alias-input"
+                    value={participantAliasDrafts[participant.pubkeyHex] ?? participant.magicDnsAlias}
+                    data-testid="participant-alias-input"
+                    on:input={(event) =>
+                      onParticipantAliasInput(
+                        participant.npub,
+                        participant.pubkeyHex,
+                        (event.currentTarget as HTMLInputElement).value,
                       )}
                   />
-                  <span>{network.enabled ? 'On' : 'Off'}</span>
-                </label>
-                <button
-                  class="btn ghost icon-btn"
-                  data-testid="network-remove"
-                  title="Delete network"
-                  aria-label="Delete network"
-                  disabled={state.networks.length <= 1}
-                  on:click={() => runAction(() => removeNetwork(network.id))}
-                >
-                  <Trash2 size={16} strokeWidth={2.2} />
-                </button>
+                  {#if state.magicDnsSuffix}
+                    <span class="alias-suffix">.{state.magicDnsSuffix}</span>
+                  {/if}
+                </div>
+                <div class="item-sub" data-testid="participant-status-text">
+                  {participant.magicDnsName} | {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
+                </div>
               </div>
-            </div>
-
-            <div class="row form-row participant-add-row">
-              <input
-                class="text-input"
-                placeholder="Add participant (npub)"
-                data-testid="participant-input"
-                value={participantInputDrafts[network.id] ?? ''}
-                on:input={(event) =>
-                  (participantInputDrafts = {
-                    ...participantInputDrafts,
-                    [network.id]: (event.currentTarget as HTMLInputElement).value,
-                  })}
-                on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-              />
-              <input
-                class="text-input participant-add-alias"
-                placeholder="Alias (optional)"
-                data-testid="participant-add-alias-input"
-                value={participantAddAliasDrafts[network.id] ?? ''}
-                on:input={(event) =>
-                  (participantAddAliasDrafts = {
-                    ...participantAddAliasDrafts,
-                    [network.id]: (event.currentTarget as HTMLInputElement).value,
-                  })}
-                on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-              />
-              <button class="btn" data-testid="participant-add" on:click={() => onAddParticipant(network.id)}>
-                Add
+              <span class={`badge ${participant.state === 'online' ? 'ok' : participant.state === 'offline' ? 'bad' : participant.state === 'local' ? 'muted' : 'warn'}`}>
+                <span data-testid="participant-state">{participant.state}</span>
+              </span>
+              <button
+                class="btn ghost icon-btn"
+                data-testid="participant-remove"
+                title="Delete participant"
+                aria-label="Delete participant"
+                on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
+              >
+                <Trash2 size={16} strokeWidth={2.2} />
               </button>
             </div>
+          {/each}
+        </div>
 
+        {#if state.lanDiscoveryEnabled}
+          {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(network, peer.npub))}
+          {#if unconfiguredLan.length > 0}
+            <div class="lan-title">LAN peers</div>
             <div class="stack rows">
-              {#each network.participants as participant}
-                <div class="item-row" data-testid="participant-row">
+              {#each unconfiguredLan as peer}
+                <div class="item-row" data-testid="lan-peer-row">
                   <div class="item-main">
-                    <div class="item-title">{short(participant.npub, 22, 12)}</div>
-                    <div class="row alias-row">
-                      <input
-                        class="text-input alias-input"
-                        value={participantAliasDrafts[participant.pubkeyHex] ?? participant.magicDnsAlias}
-                        data-testid="participant-alias-input"
-                        on:input={(event) =>
-                          onParticipantAliasInput(
-                            participant.npub,
-                            participant.pubkeyHex,
-                            (event.currentTarget as HTMLInputElement).value,
-                          )}
-                      />
-                      {#if state.magicDnsSuffix}
-                        <span class="alias-suffix">.{state.magicDnsSuffix}</span>
-                      {/if}
-                    </div>
-                    <div class="item-sub" data-testid="participant-status-text">
-                      {participant.magicDnsName} | {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
-                    </div>
+                    <div class="item-title">{short(peer.npub, 22, 12)}</div>
+                    <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
                   </div>
-                  <span class={`badge ${participant.state === 'online' ? 'ok' : participant.state === 'offline' ? 'bad' : participant.state === 'local' ? 'muted' : 'warn'}`}>
-                    <span data-testid="participant-state">{participant.state}</span>
-                  </span>
-                  <button
-                    class="btn ghost icon-btn"
-                    data-testid="participant-remove"
-                    title="Delete participant"
-                    aria-label="Delete participant"
-                    on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
-                  >
-                    <Trash2 size={16} strokeWidth={2.2} />
-                  </button>
+                  <button class="btn" on:click={() => onAddLanPeer(network.id, peer.npub)}>Add</button>
                 </div>
               {/each}
             </div>
-
-            {#if state.lanDiscoveryEnabled}
-              {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(network, peer.npub))}
-              {#if unconfiguredLan.length > 0}
-                <div class="lan-title">LAN peers</div>
-                <div class="stack rows">
-                  {#each unconfiguredLan as peer}
-                    <div class="item-row" data-testid="lan-peer-row">
-                      <div class="item-main">
-                        <div class="item-title">{short(peer.npub, 22, 12)}</div>
-                        <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
-                      </div>
-                      <button class="btn" on:click={() => onAddLanPeer(network.id, peer.npub)}>Add</button>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-            {/if}
-          </section>
-        {/each}
-      </div>
-    </section>
+          {/if}
+        {/if}
+      </section>
+    {/each}
 
     <section class="panel">
       <div class="section-title-row">

@@ -194,6 +194,15 @@ function npubFromConfig(configPath) {
   return match[1]
 }
 
+function extractJsonDocument(raw) {
+  const start = raw.indexOf('{')
+  const end = raw.lastIndexOf('}')
+  if (start < 0 || end < start) {
+    throw new Error(`command output did not include JSON document: ${raw}`)
+  }
+  return raw.slice(start, end + 1)
+}
+
 async function http(method, endpoint, body) {
   const response = await fetch(`${DRIVER_BASE}${endpoint}`, {
     method,
@@ -460,6 +469,27 @@ async function main() {
     )
 
     await waitForProcessOutput(peer, /mesh: 1\/1 peers with presence/i, 'peer connect mesh 1/1', 70_000)
+
+    const guiStatusOutput = await runChecked(
+      NVPN_BIN,
+      ['status', '--json', '--discover-secs', '0', '--config', guiConfigPath],
+      { timeoutMs: 30_000 },
+    )
+    const guiStatus = JSON.parse(extractJsonDocument(guiStatusOutput.stdout))
+    const daemonState = guiStatus?.daemon?.state
+    if (!daemonState || daemonState.connected_peer_count < 1) {
+      throw new Error(
+        `expected gui daemon connected_peer_count >= 1, got: ${JSON.stringify(daemonState)}`,
+      )
+    }
+    const reachablePeer = (daemonState.peers || []).find((entry) => entry.reachable)
+    if (!reachablePeer) {
+      throw new Error(
+        `expected at least one reachable tunnel peer in daemon state: ${JSON.stringify(
+          daemonState,
+        )}`,
+      )
+    }
 
     // Drop the peer process and verify GUI transitions to offline/mesh degraded.
     await stopManaged(peer, 'SIGINT')
