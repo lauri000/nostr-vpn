@@ -51,9 +51,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Bring the node up (announce and optionally discover peers).
+    /// Bring the node up (publish presence and optionally discover peers).
     Up(UpArgs),
-    /// Run a full data-plane session from config (announce + boringtun tunnel).
+    /// Run a full data-plane session from config (presence + boringtun tunnel).
     Connect(ConnectArgs),
     /// Bring the node down (publish disconnect signal).
     Down(DownArgs),
@@ -69,7 +69,7 @@ enum Command {
     Ip(IpArgs),
     /// Resolve a node/tunnel IP to peer metadata.
     Whois(WhoisArgs),
-    /// Broadcast this node's announcement over Nostr.
+    /// Broadcast this node's presence signal over Nostr.
     Announce {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -88,7 +88,7 @@ enum Command {
         #[arg(long)]
         relay: Vec<String>,
     },
-    /// Listen for peer announcements.
+    /// Listen for peer presence signals.
     Listen {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -403,7 +403,7 @@ async fn main() -> Result<()> {
                 );
             } else {
                 println!(
-                    "up: announced on {} relays for network {}",
+                    "up: published presence on {} relays for network {}",
                     announce.relays.len(),
                     announce.network_id
                 );
@@ -665,7 +665,7 @@ async fn main() -> Result<()> {
             })
             .await?;
             println!(
-                "announced on {} relays for network {network_id}",
+                "published presence on {} relays for network {network_id}",
                 announce.relays.len(),
                 network_id = announce.network_id
             );
@@ -887,7 +887,7 @@ async fn publish_announcement(request: AnnounceRequest) -> Result<PublishedAnnou
     client
         .publish(SignalPayload::Announce(announcement.clone()))
         .await
-        .context("failed to publish announcement")?;
+        .context("failed to publish presence signal")?;
 
     client.disconnect().await;
 
@@ -1157,7 +1157,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     client
         .publish(SignalPayload::Announce(local_announcement.clone()))
         .await
-        .context("failed to publish local announcement")?;
+        .context("failed to publish local presence signal")?;
     tunnel_runtime
         .apply(&app, own_pubkey.as_deref(), &peer_announcements)
         .context("failed to initialize tunnel runtime")?;
@@ -1215,7 +1215,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     .filter(|participant| peer_announcements.contains_key(*participant))
                     .count();
                 if connected != last_mesh_count {
-                    println!("mesh: {connected}/{expected_peers} peers signaled");
+                    println!("mesh: {connected}/{expected_peers} peers with presence");
                     last_mesh_count = connected;
                 }
             }

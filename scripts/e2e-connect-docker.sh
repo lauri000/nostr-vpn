@@ -48,8 +48,8 @@ for _ in $(seq 1 20); do
   ALICE_CONNECT_LOGS="$("${COMPOSE[@]}" exec -T node-a sh -lc 'cat /tmp/connect.log 2>/dev/null || true')"
   BOB_CONNECT_LOGS="$("${COMPOSE[@]}" exec -T node-b sh -lc 'cat /tmp/connect.log 2>/dev/null || true')"
 
-  if grep -q "mesh: 1/1 peers signaled" <<<"$ALICE_CONNECT_LOGS" \
-    && grep -q "mesh: 1/1 peers signaled" <<<"$BOB_CONNECT_LOGS"; then
+  if grep -q "mesh: 1/1 peers with presence" <<<"$ALICE_CONNECT_LOGS" \
+    && grep -q "mesh: 1/1 peers with presence" <<<"$BOB_CONNECT_LOGS"; then
     break
   fi
 
@@ -59,13 +59,13 @@ done
 ALICE_CONNECT_LOGS="$("${COMPOSE[@]}" exec -T node-a sh -lc 'cat /tmp/connect.log 2>/dev/null || true')"
 BOB_CONNECT_LOGS="$("${COMPOSE[@]}" exec -T node-b sh -lc 'cat /tmp/connect.log 2>/dev/null || true')"
 
-if ! grep -q "mesh: 1/1 peers signaled" <<<"$ALICE_CONNECT_LOGS"; then
+if ! grep -q "mesh: 1/1 peers with presence" <<<"$ALICE_CONNECT_LOGS"; then
   echo "connect e2e failed: alice mesh did not reach 1/1" >&2
   echo "$ALICE_CONNECT_LOGS"
   exit 1
 fi
 
-if ! grep -q "mesh: 1/1 peers signaled" <<<"$BOB_CONNECT_LOGS"; then
+if ! grep -q "mesh: 1/1 peers with presence" <<<"$BOB_CONNECT_LOGS"; then
   echo "connect e2e failed: bob mesh did not reach 1/1" >&2
   echo "$BOB_CONNECT_LOGS"
   exit 1

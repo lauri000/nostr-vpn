@@ -15,7 +15,7 @@
 - Automatic key generation for both WireGuard and Nostr identities
 - Tauri + Svelte desktop GUI (single-pane settings UX)
 - LAN multicast peer discovery helper (active when no participants are configured)
-- GUI-managed boringtun tunnel orchestration on unix targets (applies peers from private Nostr announcements)
+- GUI-managed boringtun tunnel orchestration on unix targets (applies peers from private Nostr presence signals)
 - Docker e2e that validates signaling + data-plane ping across 2 containers
 - UDP NAT endpoint discovery + hole-punch helpers (reflector-based)
 
@@ -74,7 +74,7 @@ You can still override with `--endpoint` / `--tunnel-ip` for advanced/manual set
 nvpn connect
 ```
 
-`nvpn connect` keeps running, consumes private peer announcements from your configured
+`nvpn connect` keeps running, consumes private peer presence signals from your configured
 participants, and applies boringtun interface/peer config automatically.
 
 ### 6. Check status
@@ -130,7 +130,7 @@ and writes a screenshot to `artifacts/screenshots/tauri-driver-smoke.png`.
 
 Legacy control-plane commands are still available:
 
-- `announce`
+- `announce` (legacy low-level name for publishing presence)
 - `listen`
 - `render-wg`
 - `keygen`
@@ -166,7 +166,7 @@ Run config-driven CLI connect e2e (same `config.toml` flow GUI uses):
 What it validates:
 
 - Relay container accepts Nostr websocket connections
-- Two nodes exchange announcements over Nostr
+- Two nodes exchange private presence signals over Nostr
 - Both nodes bring up boringtun interfaces (`tunnel-up`)
 - Tunnel data plane works (`ping` over `10.44.0.1 <-> 10.44.0.2`)
 

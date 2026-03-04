@@ -463,7 +463,7 @@ impl NvpnBackend {
         if let Err(error) = self.publish_announcement()
             && !is_no_participants_error(&error)
         {
-            self.session_status = format!("Connected, announce failed: {error}");
+            self.session_status = format!("Connected, presence publish failed: {error}");
         }
 
         Ok(())
@@ -1237,14 +1237,14 @@ impl NvpnBackend {
         }
 
         let Some(seen_at) = self.peer_signal_seen_at.get(participant) else {
-            return "no signal yet".to_string();
+            return "no presence yet".to_string();
         };
 
         let age_secs = seen_at
             .elapsed()
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
-        format!("signal {age_secs}s ago")
+        format!("presence {age_secs}s ago")
     }
 
     fn peer_state_for(
