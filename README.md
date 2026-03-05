@@ -38,10 +38,16 @@ pnpm --dir crates/nostr-vpn-gui build
 cargo check -p nostr-vpn-gui
 ```
 
-### 2. Install CLI locally (one-time)
+### 2. Install CLI into PATH (one-time)
 
 ```bash
-cargo install --path crates/nostr-vpn-cli
+sudo cargo run --bin nvpn -- install-cli
+```
+
+Uninstall later if needed:
+
+```bash
+sudo cargo run --bin nvpn -- uninstall-cli
 ```
 
 ### 3. Create config (auto-keygen)
@@ -82,10 +88,37 @@ To run in background:
 nvpn start --daemon --connect
 ```
 
+Pause/resume networking without stopping daemon:
+
+```bash
+nvpn pause
+nvpn resume
+```
+
 Stop daemon:
 
 ```bash
 nvpn stop
+```
+
+### 5b. macOS one-time system service (recommended)
+
+To avoid repeated password prompts on every daemon start, install the launchd service once:
+
+```bash
+sudo nvpn service install --config ~/.config/nvpn/config.toml
+```
+
+Check status:
+
+```bash
+nvpn service status
+```
+
+Remove later:
+
+```bash
+sudo nvpn service uninstall --config ~/.config/nvpn/config.toml
 ```
 
 ### 6. Check status
@@ -120,8 +153,11 @@ pnpm --dir crates/nostr-vpn-gui tauri:build
 `tauri:build` prepares and bundles the `nvpn` CLI as an app sidecar, so GUI daemon
 control works without requiring `nvpn` in `PATH`.
 
-GUI session control calls the `nvpn` CLI daemon (`start/stop/status`) and does not run
+GUI session control calls the `nvpn` CLI daemon (`start/pause/resume/status`) and does not run
 WireGuard/Nostr runtime in the frontend process.
+
+GUI now exposes one-time service install/uninstall controls. With service installed, normal
+VPN On/Off toggles use daemon pause/resume and do not require repeated elevation prompts.
 
 Note: bringing the tunnel interface up requires OS network privileges in the daemon process.
 On Linux/macOS, run `nvpn`/the app with permissions that allow interface/routing updates.
@@ -142,6 +178,9 @@ and writes a screenshot to `artifacts/screenshots/tauri-driver-smoke.png`.
 - `up`
 - `start`
 - `stop`
+- `reload`
+- `pause`
+- `resume`
 - `connect`
 - `down`
 - `status`
@@ -152,6 +191,9 @@ and writes a screenshot to `artifacts/screenshots/tauri-driver-smoke.png`.
 - `whois`
 - `nat-discover`
 - `hole-punch`
+- `install-cli`
+- `uninstall-cli`
+- `service`
 
 Legacy control-plane commands are still available:
 

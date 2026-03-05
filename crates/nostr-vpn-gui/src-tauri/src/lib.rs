@@ -17,6 +17,8 @@ use nostr_vpn_core::config::{
     AppConfig, derive_mesh_tunnel_ip, maybe_autoconfigure_node, normalize_nostr_pubkey,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State, WindowEvent};
@@ -26,9 +28,12 @@ const LAN_DISCOVERY_ADDR: [u8; 4] = [239, 255, 73, 73];
 const LAN_DISCOVERY_PORT: u16 = 38911;
 const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
 const PEER_ONLINE_GRACE_SECS: u64 = 20;
+const TRAY_ICON_ID: &str = "nvpn-tray";
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
-const TRAY_QUIT_MENU_ID: &str = "tray_quit";
+const TRAY_VPN_TOGGLE_MENU_ID: &str = "tray_vpn_toggle";
+const TRAY_QUIT_UI_MENU_ID: &str = "tray_quit_ui";
 const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
+const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 
 #[derive(Debug, Clone, Default)]
 struct RelayStatus {
@@ -91,6 +96,19 @@ struct LanAnnouncement {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct CliStatusResponse {
     daemon: CliDaemonStatus,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CliServiceStatusResponse {
+    supported: bool,
+    installed: bool,
+    loaded: bool,
+    running: bool,
+    pid: Option<u32>,
+    label: String,
+    plist_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -175,6 +193,9 @@ struct UiState {
     daemon_running: bool,
     session_active: bool,
     relay_connected: bool,
+    service_supported: bool,
+    service_installed: bool,
+    service_running: bool,
     session_status: String,
     config_path: String,
     own_npub: String,
@@ -225,6 +246,9 @@ struct NvpnBackend {
     daemon_running: bool,
     session_active: bool,
     relay_connected: bool,
+    service_supported: bool,
+    service_installed: bool,
+    service_running: bool,
     daemon_state: Option<DaemonRuntimeState>,
 
     relay_status: HashMap<String, RelayStatus>,
@@ -288,6 +312,9 @@ impl NvpnBackend {
             daemon_running: false,
             session_active: false,
             relay_connected: false,
+            service_supported: cfg!(target_os = "macos"),
+            service_installed: false,
+            service_running: false,
             daemon_state: None,
             relay_status,
             peer_status,
@@ -304,10 +331,8 @@ impl NvpnBackend {
 
         let wants_autoconnect =
             backend.config.autoconnect && !backend.config.participant_pubkeys_hex().is_empty();
-        if wants_autoconnect {
-            if let Err(error) = backend.start_daemon_process() {
-                backend.session_status = format!("Daemon start failed: {error}");
-            }
+        if wants_autoconnect && let Err(error) = backend.start_daemon_process() {
+            backend.session_status = format!("Daemon start failed: {error}");
         }
 
         backend.sync_daemon_state();
@@ -317,17 +342,21 @@ impl NvpnBackend {
 
     fn connect_session(&mut self) -> Result<()> {
         self.persist_config()?;
-        self.start_daemon_process()?;
+        if self.daemon_running {
+            self.resume_daemon_process()?;
+        } else {
+            self.start_daemon_process()?;
+        }
         self.sync_daemon_state();
         Ok(())
     }
 
-    fn disconnect_session(&mut self) {
-        if let Err(error) = self.stop_daemon_process() {
-            self.session_status = format!("Disconnect failed: {error}");
-            return;
+    fn disconnect_session(&mut self) -> Result<()> {
+        if self.daemon_running {
+            self.pause_daemon_process()?;
         }
         self.sync_daemon_state();
+        Ok(())
     }
 
     fn add_network(&mut self, name: &str) -> Result<()> {
@@ -337,7 +366,7 @@ impl NvpnBackend {
         self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.restart_daemon_if_running()?;
+        self.reload_daemon_if_running()?;
         self.sync_daemon_state();
 
         Ok(())
@@ -357,7 +386,7 @@ impl NvpnBackend {
         self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.restart_daemon_if_running()?;
+        self.reload_daemon_if_running()?;
         self.sync_daemon_state();
 
         Ok(())
@@ -369,7 +398,7 @@ impl NvpnBackend {
         maybe_autoconfigure_node(&mut self.config);
         self.persist_config()?;
 
-        self.restart_daemon_if_running()?;
+        self.reload_daemon_if_running()?;
         self.sync_daemon_state();
         Ok(())
     }
@@ -397,9 +426,12 @@ impl NvpnBackend {
         self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.restart_daemon_if_running()?;
-        self.maybe_refresh_lan_discovery();
+        if self.daemon_running {
+            self.reload_daemon_process()?;
+            self.session_status = "Participant saved and applied.".to_string();
+        }
         self.sync_daemon_state();
+        self.maybe_refresh_lan_discovery();
 
         Ok(())
     }
@@ -415,9 +447,12 @@ impl NvpnBackend {
         self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.restart_daemon_if_running()?;
-        self.maybe_refresh_lan_discovery();
+        if self.daemon_running {
+            self.reload_daemon_process()?;
+            self.session_status = "Participant removed and applied.".to_string();
+        }
         self.sync_daemon_state();
+        self.maybe_refresh_lan_discovery();
 
         Ok(())
     }
@@ -448,7 +483,7 @@ impl NvpnBackend {
         self.persist_config()?;
 
         self.ensure_relay_status_entries();
-        self.restart_daemon_if_running()?;
+        self.reload_daemon_if_running()?;
         self.sync_daemon_state();
 
         Ok(())
@@ -471,7 +506,7 @@ impl NvpnBackend {
         self.persist_config()?;
 
         self.ensure_relay_status_entries();
-        self.restart_daemon_if_running()?;
+        self.reload_daemon_if_running()?;
         self.sync_daemon_state();
 
         Ok(())
@@ -539,7 +574,7 @@ impl NvpnBackend {
         self.maybe_refresh_lan_discovery();
 
         if restart_required {
-            self.restart_daemon_if_running()?;
+            self.reload_daemon_if_running()?;
         }
 
         self.sync_daemon_state();
@@ -549,7 +584,7 @@ impl NvpnBackend {
     fn set_participant_alias(&mut self, npub: &str, alias: &str) -> Result<()> {
         self.config.set_peer_alias(npub, alias)?;
         self.persist_config()?;
-        self.restart_daemon_if_running()?;
+        self.reload_daemon_if_running()?;
         self.sync_daemon_state();
         Ok(())
     }
@@ -596,7 +631,7 @@ impl NvpnBackend {
         }
     }
 
-    fn daemon_start_args<'a>(&'a self) -> Result<[&'a str; 5]> {
+    fn daemon_start_args(&self) -> Result<[&str; 5]> {
         Ok([
             "start",
             "--daemon",
@@ -659,15 +694,13 @@ impl NvpnBackend {
         Err(anyhow!(message))
     }
 
-    fn stop_daemon_process(&self) -> Result<()> {
+    fn reload_daemon_process(&self) -> Result<()> {
         let args = [
-            "stop",
+            "reload",
             "--config",
             self.config_path
                 .to_str()
                 .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
-            "--timeout-secs",
-            "5",
         ];
         let output = self.run_nvpn_command(args)?;
 
@@ -678,7 +711,7 @@ impl NvpnBackend {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let message = format!(
-            "nvpn stop failed\nstdout: {}\nstderr: {}",
+            "nvpn reload failed\nstdout: {}\nstderr: {}",
             stdout.trim(),
             stderr.trim()
         );
@@ -687,28 +720,185 @@ impl NvpnBackend {
             return Ok(());
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if requires_admin_privileges(&message) {
-            match self.run_nvpn_command_with_admin_privileges(args) {
-                Ok(()) => {}
-                Err(error) if is_not_running_message(&error.to_string()) => {}
-                Err(error) => return Err(error),
-            }
+        Err(anyhow!(message))
+    }
+
+    fn pause_daemon_process(&self) -> Result<()> {
+        let args = [
+            "pause",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn pause failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+        if is_not_running_message(&message) {
             return Ok(());
         }
 
         Err(anyhow!(message))
     }
 
-    fn restart_daemon_if_running(&mut self) -> Result<()> {
-        let status = self.fetch_cli_status()?;
-        if !status.daemon.running {
+    fn resume_daemon_process(&self) -> Result<()> {
+        let args = [
+            "resume",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
             return Ok(());
         }
 
-        self.stop_daemon_process()?;
-        self.start_daemon_process()?;
-        Ok(())
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn resume failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+        if is_not_running_message(&message) {
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn install_cli_binary(&self) -> Result<()> {
+        let args = ["install-cli", "--force"];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn install-cli failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if requires_admin_privileges(&message) {
+            self.run_nvpn_command_with_admin_privileges(args)?;
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn uninstall_cli_binary(&self) -> Result<()> {
+        let args = ["uninstall-cli"];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn uninstall-cli failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if requires_admin_privileges(&message) {
+            self.run_nvpn_command_with_admin_privileges(args)?;
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn install_system_service(&self) -> Result<()> {
+        let args = [
+            "service",
+            "install",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn service install failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if requires_admin_privileges(&message) {
+            self.run_nvpn_command_with_admin_privileges(args)?;
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn uninstall_system_service(&self) -> Result<()> {
+        let args = [
+            "service",
+            "uninstall",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn service uninstall failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if requires_admin_privileges(&message) {
+            self.run_nvpn_command_with_admin_privileges(args)?;
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn reload_daemon_if_running(&self) -> Result<()> {
+        if !self.daemon_running {
+            return Ok(());
+        }
+
+        self.reload_daemon_process()
     }
 
     fn fetch_cli_status(&self) -> Result<CliStatusResponse> {
@@ -737,6 +927,34 @@ impl NvpnBackend {
         let json_text = extract_json_document(&stdout)?;
         let parsed = serde_json::from_str::<CliStatusResponse>(json_text)
             .context("failed to parse `nvpn status --json` output")?;
+        Ok(parsed)
+    }
+
+    fn fetch_cli_service_status(&self) -> Result<CliServiceStatusResponse> {
+        let output = self.run_nvpn_command([
+            "service",
+            "status",
+            "--json",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ])?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(anyhow!(
+                "nvpn service status failed\nstdout: {}\nstderr: {}",
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_text = extract_json_document(&stdout)?;
+        let parsed = serde_json::from_str::<CliServiceStatusResponse>(json_text)
+            .context("failed to parse `nvpn service status --json` output")?;
         Ok(parsed)
     }
 
@@ -777,32 +995,19 @@ impl NvpnBackend {
 
         #[cfg(target_os = "macos")]
         {
-            let mut shell_parts = Vec::with_capacity(N + 1);
-            shell_parts.push(shell_quote_single(nvpn_bin));
-            shell_parts.extend(args.iter().map(|arg| shell_quote_single(arg)));
-            let shell_command = shell_parts.join(" ");
+            let mut command = runas::Command::new(nvpn_bin);
+            command.gui(true);
+            command.args(&args);
 
-            let script = format!(
-                "do shell script \"{}\" with administrator privileges",
-                applescript_escape(&shell_command)
-            );
+            let status = command.status().context(
+                "failed to execute elevated nvpn command via native macOS authorization prompt",
+            )?;
 
-            let output = ProcessCommand::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .output()
-                .context("failed to execute elevated command prompt on macOS")?;
-
-            if output.status.success() {
+            if status.success() {
                 return Ok(());
             }
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
             return Err(anyhow!(
-                "elevated nvpn command failed\nstdout: {}\nstderr: {}",
-                stdout.trim(),
-                stderr.trim()
+                "elevated nvpn command failed via macOS authorization: {status}"
             ));
         }
 
@@ -860,6 +1065,7 @@ impl NvpnBackend {
     fn sync_daemon_state(&mut self) {
         self.ensure_relay_status_entries();
         self.ensure_peer_status_entries();
+        self.sync_service_state();
 
         let status = match self.fetch_cli_status() {
             Ok(status) => status,
@@ -937,6 +1143,21 @@ impl NvpnBackend {
         } else {
             "DNS disabled (VPN off)".to_string()
         };
+    }
+
+    fn sync_service_state(&mut self) {
+        match self.fetch_cli_service_status() {
+            Ok(status) => {
+                self.service_supported = status.supported;
+                self.service_installed = status.installed;
+                self.service_running = status.running || status.loaded;
+            }
+            Err(_) => {
+                self.service_supported = cfg!(target_os = "macos");
+                self.service_installed = false;
+                self.service_running = false;
+            }
+        }
     }
 
     fn refresh_relay_runtime_status(&mut self) {
@@ -1025,7 +1246,7 @@ impl NvpnBackend {
             let daemon_handshake_at = peer
                 .last_handshake_at
                 .and_then(epoch_secs_to_system_time)
-                .or_else(|| if peer.reachable { Some(now) } else { None });
+                .or(if peer.reachable { Some(now) } else { None });
             status.last_handshake_at = if daemon_handshake_at.is_some() {
                 daemon_handshake_at
             } else if sticky_online {
@@ -1453,6 +1674,9 @@ impl NvpnBackend {
             daemon_running: self.daemon_running,
             session_active: self.session_active,
             relay_connected: self.relay_connected,
+            service_supported: self.service_supported,
+            service_installed: self.service_installed,
+            service_running: self.service_running,
             session_status: self.session_status.clone(),
             config_path: self.config_path.display().to_string(),
             own_npub,
@@ -1656,16 +1880,6 @@ fn is_already_running_message(message: &str) -> bool {
 
 fn is_not_running_message(message: &str) -> bool {
     message.to_ascii_lowercase().contains("not running")
-}
-
-#[cfg(target_os = "macos")]
-fn shell_quote_single(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-#[cfg(target_os = "macos")]
-fn applescript_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\"', "\\\"")
 }
 
 fn epoch_secs_to_system_time(value: u64) -> Option<SystemTime> {
@@ -1873,6 +2087,28 @@ fn should_close_to_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     backend.config.close_to_tray_on_close
 }
 
+fn started_from_autostart_args<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .any(|arg| arg.as_ref() == AUTOSTART_LAUNCH_ARG)
+}
+
+fn started_from_autostart() -> bool {
+    started_from_autostart_args(env::args())
+}
+
+fn hide_main_window_to_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    let _ = window.minimize();
+    let _ = window.hide();
+}
+
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let Some(window) = app.get_webview_window("main") else {
         return Ok(());
@@ -1884,27 +2120,140 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Resu
     Ok(())
 }
 
-#[tauri::command]
-fn tick(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
-        backend.tick();
-        Ok(backend.ui_state())
-    })
+fn tray_vpn_toggle_label(session_active: bool) -> &'static str {
+    if session_active {
+        "Turn VPN Off"
+    } else {
+        "Turn VPN On"
+    }
+}
+
+fn current_session_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    let Ok(backend) = state.backend.lock() else {
+        return false;
+    };
+    backend.session_active
+}
+
+fn build_tray_menu<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    session_active: bool,
+) -> tauri::Result<tauri::menu::Menu<R>> {
+    let open_item = MenuItemBuilder::with_id(TRAY_OPEN_MENU_ID, "Open Nostr VPN").build(app)?;
+    let vpn_toggle_item = MenuItemBuilder::with_id(
+        TRAY_VPN_TOGGLE_MENU_ID,
+        tray_vpn_toggle_label(session_active),
+    )
+    .build(app)?;
+    let quit_ui_item =
+        MenuItemBuilder::with_id(TRAY_QUIT_UI_MENU_ID, "Quit Nostr VPN").build(app)?;
+
+    MenuBuilder::new(app)
+        .item(&open_item)
+        .separator()
+        .item(&vpn_toggle_item)
+        .separator()
+        .item(&quit_ui_item)
+        .build()
+}
+
+fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let Some(tray) = app.tray_by_id(TRAY_ICON_ID) else {
+        return;
+    };
+
+    let session_active = current_session_active(app);
+    if let Ok(menu) = build_tray_menu(app, session_active) {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+fn run_tray_backend_action<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    action: impl FnOnce(&mut NvpnBackend) -> Result<()>,
+) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Ok(mut backend) = state.backend.lock() else {
+        return;
+    };
+
+    if let Err(error) = action(&mut backend) {
+        backend.session_status = format!("Tray action failed: {error}");
+    }
+    backend.tick();
 }
 
 #[tauri::command]
-fn connect_session(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn tick(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
+        backend.tick();
+        Ok(backend.ui_state())
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+fn connect_session(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.connect_session()?;
         backend.tick();
         Ok(backend.ui_state())
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+fn disconnect_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
+        backend.disconnect_session()?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+fn install_cli(state: State<'_, AppState>) -> Result<UiState, String> {
+    with_backend(state, |backend| {
+        backend.install_cli_binary()?;
+        backend.tick();
+        Ok(backend.ui_state())
     })
 }
 
 #[tauri::command]
-fn disconnect_session(state: State<'_, AppState>) -> Result<UiState, String> {
+fn uninstall_cli(state: State<'_, AppState>) -> Result<UiState, String> {
     with_backend(state, |backend| {
-        backend.disconnect_session();
+        backend.uninstall_cli_binary()?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+}
+
+#[tauri::command]
+fn install_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
+    with_backend(state, |backend| {
+        backend.install_system_service()?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+}
+
+#[tauri::command]
+fn uninstall_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
+    with_backend(state, |backend| {
+        backend.uninstall_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
     })
@@ -1963,7 +2312,6 @@ fn add_participant(
 ) -> Result<UiState, String> {
     with_backend(state, |backend| {
         backend.add_participant(&network_id, &npub, alias.as_deref())?;
-        backend.tick();
         Ok(backend.ui_state())
     })
 }
@@ -1976,7 +2324,6 @@ fn remove_participant(
 ) -> Result<UiState, String> {
     with_backend(state, |backend| {
         backend.remove_participant(&network_id, &npub)?;
-        backend.tick();
         Ok(backend.ui_state())
     })
 }
@@ -2031,12 +2378,14 @@ pub fn run() {
 
     let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
     let launch_on_startup_default = backend.config.launch_on_startup;
+    let initial_session_active = backend.session_active;
+    let launched_from_autostart = started_from_autostart();
     let app = tauri::Builder::default()
         .setup(move |app| {
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             app.handle().plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-                None,
+                Some(vec![AUTOSTART_LAUNCH_ARG]),
             ))?;
 
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -2045,31 +2394,42 @@ pub fn run() {
 
                 let auto = app.handle().autolaunch();
                 let currently_enabled = auto.is_enabled().unwrap_or(false);
-                if launch_on_startup_default && !currently_enabled {
+                if launch_on_startup_default {
+                    if currently_enabled {
+                        let _ = auto.disable();
+                    }
                     let _ = auto.enable();
                 } else if !launch_on_startup_default && currently_enabled {
                     let _ = auto.disable();
                 }
             }
 
-            let open_item =
-                MenuItemBuilder::with_id(TRAY_OPEN_MENU_ID, "Open Nostr VPN").build(app)?;
-            let quit_item =
-                MenuItemBuilder::with_id(TRAY_QUIT_MENU_ID, "Quit Nostr VPN").build(app)?;
-            let tray_menu = MenuBuilder::new(app)
-                .item(&open_item)
-                .separator()
-                .item(&quit_item)
-                .build()?;
+            let tray_menu = build_tray_menu(app.handle(), initial_session_active)?;
 
-            let tray_builder = TrayIconBuilder::with_id("nvpn-tray")
+            let mut tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
                 .tooltip("Nostr VPN")
                 .menu(&tray_menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     TRAY_OPEN_MENU_ID => {
                         let _ = show_main_window(app);
                     }
-                    TRAY_QUIT_MENU_ID => {
+                    TRAY_VPN_TOGGLE_MENU_ID => {
+                        let session_active = current_session_active(app);
+                        run_tray_backend_action(app, |backend| {
+                            if session_active {
+                                backend
+                                    .disconnect_session()
+                                    .context("failed to pause VPN session")?;
+                            } else {
+                                backend
+                                    .connect_session()
+                                    .context("failed to resume VPN session")?;
+                            }
+                            Ok(())
+                        });
+                        refresh_tray_menu(app);
+                    }
+                    TRAY_QUIT_UI_MENU_ID => {
                         app.exit(0);
                     }
                     _ => {}
@@ -2087,7 +2447,21 @@ pub fn run() {
                     }
                 });
 
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(icon) = Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
+                    tray_builder = tray_builder.icon(icon).icon_as_template(true);
+                } else {
+                    eprintln!("tray: failed to load bundled template icon");
+                }
+            }
+
             tray_builder.build(app)?;
+
+            if launched_from_autostart {
+                hide_main_window_to_tray(app.handle());
+            }
+
             Ok(())
         })
         .manage(AppState {
@@ -2097,6 +2471,10 @@ pub fn run() {
             tick,
             connect_session,
             disconnect_session,
+            install_cli,
+            uninstall_cli,
+            install_system_service,
+            uninstall_system_service,
             add_network,
             rename_network,
             remove_network,
@@ -2126,7 +2504,8 @@ pub fn run() {
 mod tests {
     use super::{
         expected_peer_count, extract_json_document, is_already_running_message, is_mesh_complete,
-        is_not_running_message, to_npub, validate_nvpn_binary, within_peer_online_grace,
+        is_not_running_message, started_from_autostart_args, to_npub, validate_nvpn_binary,
+        within_peer_online_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -2190,6 +2569,18 @@ mod tests {
     fn validate_nvpn_binary_rejects_missing_path() {
         let result = validate_nvpn_binary("/path/that/does/not/exist".into());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn autostart_launch_detection_matches_explicit_flag() {
+        assert!(started_from_autostart_args([
+            "/Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn",
+            "--autostart",
+        ]));
+        assert!(!started_from_autostart_args([
+            "/Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn",
+            "--autostarted",
+        ]));
     }
 
     #[cfg(unix)]

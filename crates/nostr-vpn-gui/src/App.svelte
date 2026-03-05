@@ -8,6 +8,8 @@
     addRelay,
     connectSession,
     disconnectSession,
+    installCli,
+    installSystemService,
     isAutostartEnabled,
     removeNetwork,
     removeParticipant,
@@ -17,6 +19,8 @@
     setParticipantAlias,
     setAutostartEnabled,
     tick,
+    uninstallCli,
+    uninstallSystemService,
     updateSettings,
   } from './lib/tauri'
   import type { NetworkView, SettingsPatch, UiState } from './lib/types'
@@ -24,6 +28,8 @@
   let state: UiState | null = null
   let relayInput = ''
   let error = ''
+  let cliActionStatus = ''
+  let serviceActionStatus = ''
   let copiedPubkey = false
 
   let newNetworkName = ''
@@ -45,6 +51,8 @@
   const debouncers = new Map<string, number>()
   let pollHandle: number | null = null
   let copiedHandle: number | null = null
+  let refreshInFlight = false
+  let actionInFlight = false
 
   const short = (value: string, head = 12, tail = 10) => {
     if (value.length <= head + tail + 3) {
@@ -58,13 +66,18 @@
     network.participants.some((participant) => participant.npub === npub)
 
   async function refresh() {
+    if (refreshInFlight || actionInFlight) {
+      return
+    }
+    refreshInFlight = true
     try {
       state = await tick()
-      error = ''
       initializeDraftsOnce()
       syncDraftsFromState()
     } catch (err) {
       error = String(err)
+    } finally {
+      refreshInFlight = false
     }
   }
 
@@ -136,6 +149,10 @@
   }
 
   async function runAction(action: () => Promise<UiState>) {
+    if (actionInFlight) {
+      return
+    }
+    actionInFlight = true
     try {
       state = await action()
       error = ''
@@ -143,6 +160,46 @@
       syncDraftsFromState()
     } catch (err) {
       error = String(err)
+      cliActionStatus = ''
+      serviceActionStatus = ''
+    } finally {
+      actionInFlight = false
+    }
+  }
+
+  async function onToggleSession() {
+    if (!state) {
+      return
+    }
+
+    await runAction(state.sessionActive ? disconnectSession : connectSession)
+  }
+
+  async function onInstallCli() {
+    await runAction(installCli)
+    if (!error) {
+      cliActionStatus = 'CLI installed in PATH (/usr/local/bin/nvpn)'
+    }
+  }
+
+  async function onUninstallCli() {
+    await runAction(uninstallCli)
+    if (!error) {
+      cliActionStatus = 'CLI removed from PATH (/usr/local/bin/nvpn)'
+    }
+  }
+
+  async function onInstallSystemService() {
+    await runAction(installSystemService)
+    if (!error) {
+      serviceActionStatus = 'System service installed and started'
+    }
+  }
+
+  async function onUninstallSystemService() {
+    await runAction(uninstallSystemService)
+    if (!error) {
+      serviceActionStatus = 'System service removed'
     }
   }
 
@@ -278,7 +335,7 @@
   onMount(async () => {
     await refresh()
     await refreshAutostart()
-    pollHandle = window.setInterval(refresh, 1000)
+    pollHandle = window.setInterval(refresh, 1500)
   })
 
   onDestroy(() => {
@@ -318,10 +375,30 @@
           {state ? short(state.ownNpub, 18, 14) : 'Loading...'}
         </span>
       </button>
+      {#if state}
+        <button
+          class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
+          role="switch"
+          aria-checked={state.sessionActive}
+          aria-label="Toggle VPN session"
+          data-testid="session-toggle"
+          on:click={onToggleSession}
+        >
+          <span class="session-switch-track" aria-hidden="true">
+            <span class="session-switch-thumb"></span>
+          </span>
+          <span class="session-switch-label">VPN {state.sessionActive ? 'On' : 'Off'}</span>
+        </button>
+      {/if}
     </div>
 
     {#if state}
       <div class="row status-row">
+        {#if state.serviceSupported}
+          <span class={`badge ${state.serviceInstalled ? 'ok' : 'muted'}`}>
+            Service {state.serviceInstalled ? 'Installed' : 'Not installed'}
+          </span>
+        {/if}
         <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
           Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
         </span>
@@ -561,25 +638,50 @@
 
     <section class="panel">
       <div class="section-title-row">
-        <h2>Session & Node</h2>
+        <h2>Node & Runtime</h2>
       </div>
 
-      <div class="row spread settings-action-row">
+      <div class="row settings-action-row">
         <div class="config-path">Config: {state.configPath}</div>
-        {#if state.sessionActive}
-          <button
-            class="btn bad"
-            data-testid="disconnect-session"
-            on:click={() => runAction(disconnectSession)}
-          >
-            Disconnect
-          </button>
-        {:else}
-          <button class="btn" data-testid="connect-session" on:click={() => runAction(connectSession)}>
-            Connect
-          </button>
-        {/if}
       </div>
+      {#if state.serviceSupported}
+        <div class="row spread settings-action-row">
+          <div class="config-path">
+            Background Service:
+            {state.serviceInstalled
+              ? state.serviceRunning
+                ? 'Installed (running)'
+                : 'Installed'
+              : 'Not installed'}
+          </div>
+          <div class="row cli-actions-row">
+            <button class="btn" data-testid="install-service-btn" on:click={onInstallSystemService}>
+              Install service
+            </button>
+            <button
+              class="btn ghost"
+              data-testid="uninstall-service-btn"
+              on:click={onUninstallSystemService}
+              disabled={!state.serviceInstalled}
+            >
+              Uninstall
+            </button>
+          </div>
+        </div>
+        {#if serviceActionStatus}
+          <div class="config-path">{serviceActionStatus}</div>
+        {/if}
+      {/if}
+      <div class="row spread settings-action-row">
+        <div class="config-path">Terminal CLI</div>
+        <div class="row cli-actions-row">
+          <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>Install CLI</button>
+          <button class="btn ghost" data-testid="uninstall-cli-btn" on:click={onUninstallCli}>Uninstall CLI</button>
+        </div>
+      </div>
+      {#if cliActionStatus}
+        <div class="config-path">{cliActionStatus}</div>
+      {/if}
       <div class="config-path" data-testid="magic-dns-status">DNS: {state.magicDnsStatus}</div>
 
       <label class="toggle-row">

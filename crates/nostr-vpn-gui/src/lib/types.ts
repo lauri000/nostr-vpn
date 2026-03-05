@@ -46,6 +46,9 @@ export interface UiState {
   daemonRunning: boolean
   sessionActive: boolean
   relayConnected: boolean
+  serviceSupported: boolean
+  serviceInstalled: boolean
+  serviceRunning: boolean
   sessionStatus: string
   configPath: string
   ownNpub: string

@@ -33,6 +33,42 @@ use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_co
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+const DAEMON_CONTROL_STOP_REQUEST: &str = "stop";
+const DAEMON_CONTROL_RELOAD_REQUEST: &str = "reload";
+const DAEMON_CONTROL_PAUSE_REQUEST: &str = "pause";
+const DAEMON_CONTROL_RESUME_REQUEST: &str = "resume";
+const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonControlRequest {
+    Stop,
+    Reload,
+    Pause,
+    Resume,
+}
+
+impl DaemonControlRequest {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => DAEMON_CONTROL_STOP_REQUEST,
+            Self::Reload => DAEMON_CONTROL_RELOAD_REQUEST,
+            Self::Pause => DAEMON_CONTROL_PAUSE_REQUEST,
+            Self::Resume => DAEMON_CONTROL_RESUME_REQUEST,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            DAEMON_CONTROL_STOP_REQUEST => Some(Self::Stop),
+            DAEMON_CONTROL_RELOAD_REQUEST => Some(Self::Reload),
+            DAEMON_CONTROL_PAUSE_REQUEST => Some(Self::Pause),
+            DAEMON_CONTROL_RESUME_REQUEST => Some(Self::Resume),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "nvpn")]
 #[command(about = "Nostr-signaled WireGuard control plane built on boringtun")]
@@ -58,12 +94,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Install `nvpn` into PATH (default: /usr/local/bin/nvpn).
+    InstallCli(InstallCliArgs),
+    /// Remove an `nvpn` binary previously installed into PATH.
+    UninstallCli(UninstallCliArgs),
+    /// Manage the persistent system daemon service.
+    Service(ServiceArgs),
     /// Bring the node up (publish presence and optionally discover peers).
     Up(UpArgs),
     /// Start a session (foreground by default, or daemonized with --daemon).
     Start(StartArgs),
     /// Stop a background daemon started by `nvpn start --daemon`.
     Stop(StopArgs),
+    /// Ask the running daemon to reload config and peer set.
+    Reload(ReloadArgs),
+    /// Pause VPN networking while keeping daemon running.
+    Pause(ControlArgs),
+    /// Resume VPN networking on a running daemon.
+    Resume(ControlArgs),
     /// Run a full data-plane session from config (presence + boringtun tunnel).
     Connect(ConnectArgs),
     /// Bring the node down (publish disconnect signal).
@@ -130,6 +178,65 @@ enum Command {
     /// Internal low-level tunnel helper for e2e scripts.
     #[command(hide = true)]
     TunnelUp(TunnelUpArgs),
+}
+
+#[derive(Debug, Args)]
+struct InstallCliArgs {
+    /// Destination path for the installed executable.
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Overwrite destination if it already exists.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct UninstallCliArgs {
+    /// Path to remove (defaults to /usr/local/bin/nvpn).
+    #[arg(long)]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Install and start the macOS launchd daemon.
+    Install(ServiceInstallArgs),
+    /// Remove the macOS launchd daemon.
+    Uninstall(ServiceUninstallArgs),
+    /// Show service install/runtime status.
+    Status(ServiceStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServiceInstallArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value = "utun100")]
+    iface: String,
+    #[arg(long, default_value_t = 20)]
+    announce_interval_secs: u64,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServiceUninstallArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServiceStatusArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -244,6 +351,18 @@ struct StopArgs {
     timeout_secs: u64,
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReloadArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ControlArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -433,6 +552,15 @@ async fn main() -> Result<()> {
                 println!("public_key={}", pair.public_key);
             }
         }
+        Command::InstallCli(args) => {
+            install_cli(args)?;
+        }
+        Command::UninstallCli(args) => {
+            uninstall_cli(args)?;
+        }
+        Command::Service(args) => {
+            run_service_command(args)?;
+        }
         Command::Up(args) => {
             let announce = publish_announcement(AnnounceRequest {
                 config: args.config,
@@ -485,6 +613,15 @@ async fn main() -> Result<()> {
         }
         Command::Stop(args) => {
             stop_daemon(args)?;
+        }
+        Command::Reload(args) => {
+            reload_daemon(args)?;
+        }
+        Command::Pause(args) => {
+            control_daemon(args, DaemonControlRequest::Pause)?;
+        }
+        Command::Resume(args) => {
+            control_daemon(args, DaemonControlRequest::Resume)?;
         }
         Command::Connect(args) => {
             connect_session(args).await?;
@@ -981,6 +1118,17 @@ struct DaemonStatus {
     log_file: PathBuf,
     state_file: PathBuf,
     state: Option<DaemonRuntimeState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServiceStatusView {
+    supported: bool,
+    installed: bool,
+    loaded: bool,
+    running: bool,
+    pid: Option<u32>,
+    label: String,
+    plist_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1750,19 +1898,25 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     }
 
     let config_path = args.config.clone().unwrap_or_else(default_config_path);
-    let (app, network_id) =
-        load_config_with_overrides(&config_path, args.network_id, args.participants)?;
-    let configured_participants = app.participant_pubkeys_hex();
+    let network_override = args.network_id.clone();
+    let participants_override = args.participants.clone();
+    let (mut app, network_id) = load_config_with_overrides(
+        &config_path,
+        network_override.clone(),
+        participants_override.clone(),
+    )?;
+    let mut configured_participants = app.participant_pubkeys_hex();
     if configured_participants.is_empty() {
         return Err(anyhow!(
             "at least one participant must be configured before running daemon"
         ));
     }
 
-    let relays = resolve_relays(&args.relay, &app);
-    let own_pubkey = app.own_nostr_pubkey_hex().ok();
-    let expected_peers = expected_peer_count(&app);
+    let mut relays = resolve_relays(&args.relay, &app);
+    let mut own_pubkey = app.own_nostr_pubkey_hex().ok();
+    let mut expected_peers = expected_peer_count(&app);
     let state_file = daemon_state_file_path(&config_path);
+    let _ = fs::remove_file(daemon_control_file_path(&config_path));
     let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
     let mut peer_signal_seen_at = HashMap::<String, u64>::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
@@ -1800,6 +1954,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let terminate_wait = std::future::pending::<()>();
     tokio::pin!(terminate_wait);
 
+    let mut session_enabled = true;
     let mut session_status = "Connecting to relays".to_string();
     let mut relay_connected = false;
     let mut reconnect_attempt = 0u32;
@@ -1809,6 +1964,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         &state_file,
         &build_daemon_runtime_state(
             &app,
+            session_enabled,
             expected_peers,
             &peer_announcements,
             &peer_signal_seen_at,
@@ -1827,7 +1983,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 break;
             }
             _ = reconnect_interval.tick() => {
-                if relay_connected || Instant::now() < reconnect_due {
+                if !session_enabled || relay_connected || Instant::now() < reconnect_due {
                     continue;
                 }
 
@@ -1875,7 +2031,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
             }
             _ = announce_interval.tick() => {
-                if !relay_connected {
+                if !session_enabled || !relay_connected {
                     continue;
                 }
 
@@ -1907,10 +2063,154 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
             }
             _ = state_interval.tick() => {
+                if let Some(request) = take_daemon_control_request(&config_path) {
+                    match request {
+                        DaemonControlRequest::Stop => break,
+                        DaemonControlRequest::Pause => {
+                            if relay_connected {
+                                let _ = client
+                                    .publish(SignalPayload::Disconnect {
+                                        node_id: app.node.id.clone(),
+                                    })
+                                    .await;
+                            }
+                            client.disconnect().await;
+                            relay_connected = false;
+                            session_enabled = false;
+                            reconnect_attempt = 0;
+                            reconnect_due = Instant::now();
+                            peer_announcements.clear();
+                            peer_signal_seen_at.clear();
+                            if let Err(error) =
+                                tunnel_runtime.apply(&app, own_pubkey.as_deref(), &peer_announcements)
+                            {
+                                session_status = format!("Pause failed ({error})");
+                            } else {
+                                if let Some(runtime) = magic_dns_runtime.as_ref() {
+                                    runtime.refresh_records(&app, &peer_announcements);
+                                }
+                                session_status = "Paused".to_string();
+                            }
+                        }
+                        DaemonControlRequest::Resume => {
+                            if !session_enabled {
+                                session_enabled = true;
+                                relay_connected = false;
+                                reconnect_attempt = 0;
+                                reconnect_due = Instant::now();
+                                session_status = "Resuming".to_string();
+                            }
+                        }
+                        DaemonControlRequest::Reload => {
+                            match load_config_with_overrides(
+                                &config_path,
+                                network_override.clone(),
+                                participants_override.clone(),
+                            ) {
+                                Ok((reloaded_app, _)) => {
+                                    let reloaded_participants = reloaded_app.participant_pubkeys_hex();
+                                    if reloaded_participants.is_empty() {
+                                        session_status = "Config reload rejected: no participants configured".to_string();
+                                    } else {
+                                        app = reloaded_app;
+                                        configured_participants = reloaded_participants;
+                                        expected_peers = expected_peer_count(&app);
+                                        own_pubkey = app.own_nostr_pubkey_hex().ok();
+                                        relays = resolve_relays(&args.relay, &app);
+
+                                        let configured_set = configured_participants
+                                            .iter()
+                                            .cloned()
+                                            .collect::<HashSet<_>>();
+                                        peer_announcements
+                                            .retain(|participant, _| configured_set.contains(participant));
+                                        peer_signal_seen_at
+                                            .retain(|participant, _| configured_set.contains(participant));
+
+                                        client.disconnect().await;
+                                        match NostrSignalingClient::from_secret_key(
+                                            network_id.clone(),
+                                            &app.nostr.secret_key,
+                                            configured_participants.clone(),
+                                        ) {
+                                            Ok(new_client) => {
+                                                client = new_client;
+                                                if session_enabled {
+                                                    match client.connect(&relays).await {
+                                                        Ok(()) => {
+                                                            relay_connected = true;
+                                                            reconnect_attempt = 0;
+                                                            reconnect_due = Instant::now();
+                                                            session_status = "Config reloaded".to_string();
+
+                                                            let refreshed = PeerAnnouncement {
+                                                                node_id: app.node.id.clone(),
+                                                                public_key: app.node.public_key.clone(),
+                                                                endpoint: endpoint_with_listen_port(
+                                                                    &app.node.endpoint,
+                                                                    tunnel_runtime.listen_port(app.node.listen_port),
+                                                                ),
+                                                                tunnel_ip: app.node.tunnel_ip.clone(),
+                                                                timestamp: unix_timestamp(),
+                                                            };
+                                                            if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
+                                                                session_status = format!(
+                                                                    "Config reloaded; presence publish failed ({})",
+                                                                    error
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(error) => {
+                                                            relay_connected = false;
+                                                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                                            let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
+                                                            reconnect_due = Instant::now() + delay;
+                                                            session_status = format!(
+                                                                "Config reloaded; relay reconnect failed (retry in {}s: {})",
+                                                                delay.as_secs(),
+                                                                error
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    relay_connected = false;
+                                                    reconnect_attempt = 0;
+                                                    reconnect_due = Instant::now();
+                                                    session_status = "Config reloaded (paused)".to_string();
+                                                }
+                                            }
+                                            Err(error) => {
+                                                session_status = format!(
+                                                    "Config reload failed (signal client init): {}",
+                                                    error
+                                                );
+                                            }
+                                        }
+
+                                        if let Err(error) = tunnel_runtime
+                                            .apply(&app, own_pubkey.as_deref(), &peer_announcements)
+                                        {
+                                            session_status = format!(
+                                                "Config reloaded; tunnel update failed ({})",
+                                                error
+                                            );
+                                        } else if let Some(runtime) = magic_dns_runtime.as_ref() {
+                                            runtime.refresh_records(&app, &peer_announcements);
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    session_status = format!("Config reload failed ({})", error);
+                                }
+                            }
+                        }
+                    }
+                }
                 let _ = write_daemon_state(
                     &state_file,
                     &build_daemon_runtime_state(
                         &app,
+                        session_enabled,
                         expected_peers,
                         &peer_announcements,
                         &peer_signal_seen_at,
@@ -1921,7 +2221,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 );
             }
             message = async {
-                if relay_connected {
+                if session_enabled && relay_connected {
                     client.recv().await
                 } else {
                     std::future::pending::<Option<SignalEnvelope>>().await
@@ -1959,7 +2259,11 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     if let Some(runtime) = magic_dns_runtime.as_ref() {
                         runtime.refresh_records(&app, &peer_announcements);
                     }
-                    session_status = "Connected".to_string();
+                    session_status = if session_enabled {
+                        "Connected".to_string()
+                    } else {
+                        "Paused".to_string()
+                    };
                 }
 
                 let connected = app
@@ -2025,6 +2329,7 @@ fn publish_error_requires_reconnect(message: &str) -> bool {
 
 fn build_daemon_runtime_state(
     app: &AppConfig,
+    session_active: bool,
     expected_peers: usize,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     peer_signal_seen_at: &HashMap<String, u64>,
@@ -2097,7 +2402,7 @@ fn build_daemon_runtime_state(
     let mesh_ready = expected_peers > 0 && connected_peer_count >= expected_peers;
     DaemonRuntimeState {
         updated_at: unix_timestamp(),
-        session_active: true,
+        session_active,
         relay_connected,
         session_status: session_status.to_string(),
         expected_peer_count: expected_peers,
@@ -2161,43 +2466,129 @@ async fn start_session(args: StartArgs) -> Result<()> {
 fn stop_daemon(args: StopArgs) -> Result<()> {
     let config_path = args.config.unwrap_or_else(default_config_path);
     let status = daemon_status(&config_path)?;
-    let Some(pid) = status.pid else {
-        println!("daemon: not running");
-        return Ok(());
-    };
+    let mut daemon_pids = find_daemon_pids_by_config(&config_path);
+    if daemon_pids.is_empty()
+        && let Some(pid) = status.pid
+        && daemon_process_matches(pid, &config_path)
+    {
+        daemon_pids.push(pid);
+    }
+    daemon_pids.sort_unstable();
+    daemon_pids.dedup();
 
-    if !status.running {
+    if daemon_pids.is_empty() {
         let _ = fs::remove_file(&status.pid_file);
-        println!("daemon: stale pid file removed");
+        let _ = fs::remove_file(daemon_control_file_path(&config_path));
+        println!("daemon: not running");
         return Ok(());
     }
 
-    send_signal(pid, "-TERM")?;
+    let mut requested_control_stop = false;
+    for pid in &daemon_pids {
+        match send_signal(*pid, "-TERM") {
+            Ok(()) => {}
+            Err(error) if kill_error_requires_control_fallback(&error.to_string()) => {
+                if !requested_control_stop {
+                    request_daemon_stop(&config_path)?;
+                    requested_control_stop = true;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 
     let timeout = Duration::from_secs(args.timeout_secs.max(1));
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
-        if !is_process_running(pid) {
+        if find_daemon_pids_by_config(&config_path).is_empty() {
             let _ = fs::remove_file(&status.pid_file);
-            println!("daemon stopped: pid {pid}");
+            let _ = fs::remove_file(daemon_control_file_path(&config_path));
+            println!("daemon stopped");
             return Ok(());
         }
         thread::sleep(Duration::from_millis(120));
     }
 
     if args.force {
-        send_signal(pid, "-KILL")?;
+        for pid in find_daemon_pids_by_config(&config_path) {
+            if let Err(error) = send_signal(pid, "-KILL")
+                && !kill_error_requires_control_fallback(&error.to_string())
+            {
+                return Err(error);
+            }
+        }
         thread::sleep(Duration::from_millis(120));
     }
 
-    if is_process_running(pid) && daemon_process_matches(pid, &config_path) {
+    if requested_control_stop {
+        request_daemon_stop(&config_path)?;
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            if find_daemon_pids_by_config(&config_path).is_empty() {
+                let _ = fs::remove_file(&status.pid_file);
+                let _ = fs::remove_file(daemon_control_file_path(&config_path));
+                println!("daemon stopped");
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(120));
+        }
+    }
+
+    let remaining = find_daemon_pids_by_config(&config_path);
+    if !remaining.is_empty() {
+        let hint = if requested_control_stop {
+            "daemon ignored local stop request; likely an older daemon binary is still running. perform one elevated stop (e.g. sudo nvpn stop --force --config <config>) to migrate"
+        } else {
+            "try --force"
+        };
         return Err(anyhow!(
-            "failed to stop daemon pid {pid}; retry with --force"
+            "failed to stop daemon(s) for {}; remaining pid(s): {}; {hint}",
+            config_path.display(),
+            remaining
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
     let _ = fs::remove_file(&status.pid_file);
-    println!("daemon stopped: pid {pid}");
+    let _ = fs::remove_file(daemon_control_file_path(&config_path));
+    println!("daemon stopped");
+    Ok(())
+}
+
+fn reload_daemon(args: ReloadArgs) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let status = daemon_status(&config_path)?;
+    if !status.running {
+        println!("daemon: not running");
+        return Ok(());
+    }
+
+    request_daemon_reload(&config_path)?;
+    wait_for_daemon_control_ack(&config_path, Duration::from_secs(3))?;
+    println!("daemon reload requested");
+    Ok(())
+}
+
+fn control_daemon(args: ControlArgs, request: DaemonControlRequest) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let status = daemon_status(&config_path)?;
+    if !status.running {
+        println!("daemon: not running");
+        return Ok(());
+    }
+
+    write_daemon_control_request(&config_path, request)?;
+    wait_for_daemon_control_ack(&config_path, Duration::from_secs(3))?;
+
+    match request {
+        DaemonControlRequest::Pause => println!("daemon pause requested"),
+        DaemonControlRequest::Resume => println!("daemon resume requested"),
+        DaemonControlRequest::Reload => println!("daemon reload requested"),
+        DaemonControlRequest::Stop => println!("daemon stop requested"),
+    }
     Ok(())
 }
 
@@ -2267,6 +2658,73 @@ fn daemon_state_file_path(config_path: &Path) -> PathBuf {
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
     parent.join("daemon.state.json")
+}
+
+fn daemon_control_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("daemon.control")
+}
+
+fn write_daemon_control_request(config_path: &Path, request: DaemonControlRequest) -> Result<()> {
+    let control_file = daemon_control_file_path(config_path);
+    if let Some(parent) = control_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&control_file, format!("{}\n", request.as_str())).with_context(|| {
+        format!(
+            "failed to write daemon control request {}",
+            control_file.display()
+        )
+    })?;
+    set_daemon_runtime_file_permissions(&control_file)?;
+    Ok(())
+}
+
+fn request_daemon_stop(config_path: &Path) -> Result<()> {
+    write_daemon_control_request(config_path, DaemonControlRequest::Stop)
+}
+
+fn request_daemon_reload(config_path: &Path) -> Result<()> {
+    write_daemon_control_request(config_path, DaemonControlRequest::Reload)
+}
+
+fn wait_for_daemon_control_ack(config_path: &Path, timeout: Duration) -> Result<()> {
+    let control_file = daemon_control_file_path(config_path);
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if !control_file.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(anyhow!(
+        "daemon did not acknowledge control request within {}s; restart the daemon with a newer nvpn binary",
+        timeout.as_secs()
+    ))
+}
+
+fn take_daemon_control_request(config_path: &Path) -> Option<DaemonControlRequest> {
+    let control_file = daemon_control_file_path(config_path);
+    let raw = match fs::read_to_string(&control_file) {
+        Ok(raw) => raw,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "daemon: failed to read control request {}: {}",
+                    control_file.display(),
+                    error
+                );
+            }
+            return None;
+        }
+    };
+
+    let _ = fs::remove_file(&control_file);
+    DaemonControlRequest::parse(&raw)
 }
 
 fn read_daemon_pid_record(path: &Path) -> Result<Option<DaemonPidRecord>> {
@@ -2562,6 +3020,11 @@ fn send_signal(pid: u32, signal: &str) -> Result<()> {
     ))
 }
 
+fn kill_error_requires_control_fallback(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("operation not permitted") || lower.contains("permission denied")
+}
+
 fn run_ping(target: &str, count: u32, timeout_secs: u64) -> Result<()> {
     let mut command = ProcessCommand::new("ping");
     if cfg!(target_os = "windows") {
@@ -2675,6 +3138,514 @@ async fn run_netcheck(
     checks
 }
 
+fn run_service_command(args: ServiceArgs) -> Result<()> {
+    match args.command {
+        ServiceCommand::Install(args) => service_install(args),
+        ServiceCommand::Uninstall(args) => service_uninstall(args),
+        ServiceCommand::Status(args) => service_status(args),
+    }
+}
+
+fn service_install(args: ServiceInstallArgs) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        return Err(anyhow!(
+            "system service install is currently supported on macOS only"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let config_path = args.config.unwrap_or_else(default_config_path);
+        let mut config = load_or_default_config(&config_path)?;
+        config.ensure_defaults();
+        maybe_autoconfigure_node(&mut config);
+        config.save(&config_path)?;
+
+        if config.all_participant_pubkeys_hex().is_empty() {
+            return Err(anyhow!(
+                "configure at least one participant before installing the system service"
+            ));
+        }
+
+        let executable = std::env::current_exe().context("failed to resolve current executable")?;
+        let executable = fs::canonicalize(&executable)
+            .with_context(|| format!("failed to canonicalize {}", executable.display()))?;
+        let config_path = fs::canonicalize(&config_path)
+            .with_context(|| format!("failed to canonicalize {}", config_path.display()))?;
+        let log_path = daemon_log_file_path(&config_path);
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let plist_path = macos_service_plist_path();
+        if plist_path.exists() && !args.force {
+            println!(
+                "service already installed at {} (pass --force to reinstall)",
+                plist_path.display()
+            );
+            return Ok(());
+        }
+
+        macos_service_bootout(true)?;
+
+        let plist = macos_service_plist_content(
+            &executable,
+            &config_path,
+            &args.iface,
+            args.announce_interval_secs.max(1),
+            &log_path,
+        );
+
+        if let Some(parent) = plist_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let temp = plist_path.with_extension(format!("tmp-{}", std::process::id()));
+        fs::write(&temp, plist).with_context(|| format!("failed to write {}", temp.display()))?;
+        #[cfg(unix)]
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("failed to chmod {}", temp.display()))?;
+        fs::rename(&temp, &plist_path).with_context(|| {
+            format!(
+                "failed to move {} into {}",
+                temp.display(),
+                plist_path.display()
+            )
+        })?;
+
+        macos_service_bootstrap(&plist_path)?;
+        macos_service_enable()?;
+        macos_service_kickstart()?;
+
+        println!("installed system service: {}", plist_path.display());
+        println!("label: {}", MACOS_SERVICE_LABEL);
+        Ok(())
+    }
+}
+
+fn service_uninstall(args: ServiceUninstallArgs) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        return Err(anyhow!(
+            "system service uninstall is currently supported on macOS only"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = args.config;
+        macos_service_bootout(true)?;
+        macos_service_disable(true)?;
+
+        let plist_path = macos_service_plist_path();
+        if plist_path.exists() {
+            fs::remove_file(&plist_path)
+                .with_context(|| format!("failed to remove {}", plist_path.display()))?;
+            println!("removed system service plist: {}", plist_path.display());
+        } else {
+            println!("system service plist not found: {}", plist_path.display());
+        }
+
+        Ok(())
+    }
+}
+
+fn service_status(args: ServiceStatusArgs) -> Result<()> {
+    let _ = args.config.unwrap_or_else(default_config_path);
+    let status = query_service_status()?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+
+    if !status.supported {
+        println!("service: unsupported on this platform");
+        return Ok(());
+    }
+
+    println!("service_label: {}", status.label);
+    println!("service_plist: {}", status.plist_path);
+    println!("service_installed: {}", status.installed);
+    println!("service_loaded: {}", status.loaded);
+    println!("service_running: {}", status.running);
+    if let Some(pid) = status.pid {
+        println!("service_pid: {pid}");
+    }
+
+    Ok(())
+}
+
+fn query_service_status() -> Result<ServiceStatusView> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Ok(ServiceStatusView {
+            supported: false,
+            installed: false,
+            loaded: false,
+            running: false,
+            pid: None,
+            label: MACOS_SERVICE_LABEL.to_string(),
+            plist_path: String::new(),
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = macos_service_plist_path();
+        let installed = plist_path.exists();
+        if !installed {
+            return Ok(ServiceStatusView {
+                supported: true,
+                installed: false,
+                loaded: false,
+                running: false,
+                pid: None,
+                label: MACOS_SERVICE_LABEL.to_string(),
+                plist_path: plist_path.display().to_string(),
+            });
+        }
+
+        let print = macos_service_print();
+        let (loaded, running, pid) = match print {
+            Ok(output) => (
+                true,
+                macos_service_print_is_running(&output),
+                macos_service_print_pid(&output),
+            ),
+            Err(_) => (false, false, None),
+        };
+
+        Ok(ServiceStatusView {
+            supported: true,
+            installed: true,
+            loaded,
+            running,
+            pid,
+            label: MACOS_SERVICE_LABEL.to_string(),
+            plist_path: plist_path.display().to_string(),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_plist_path() -> PathBuf {
+    PathBuf::from(format!(
+        "/Library/LaunchDaemons/{MACOS_SERVICE_LABEL}.plist"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_target() -> String {
+    format!("system/{MACOS_SERVICE_LABEL}")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_plist_content(
+    executable: &Path,
+    config_path: &Path,
+    iface: &str,
+    announce_interval_secs: u64,
+    log_path: &Path,
+) -> String {
+    let exec = xml_escape(&executable.display().to_string());
+    let config = xml_escape(&config_path.display().to_string());
+    let iface = xml_escape(iface);
+    let interval = announce_interval_secs.to_string();
+    let log = xml_escape(&log_path.display().to_string());
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{MACOS_SERVICE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exec}</string>
+    <string>daemon</string>
+    <string>--config</string>
+    <string>{config}</string>
+    <string>--iface</string>
+    <string>{iface}</string>
+    <string>--announce-interval-secs</string>
+    <string>{interval}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>{log}</string>
+  <key>StandardErrorPath</key>
+  <string>{log}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_bootstrap(plist_path: &Path) -> Result<()> {
+    let plist = plist_path
+        .to_str()
+        .ok_or_else(|| anyhow!("plist path is not valid UTF-8"))?;
+    run_launchctl_checked(&["bootstrap", "system", plist], "bootstrap service")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_enable() -> Result<()> {
+    let target = macos_service_target();
+    run_launchctl_checked(&["enable", target.as_str()], "enable service")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_disable(ignore_missing: bool) -> Result<()> {
+    let target = macos_service_target();
+    run_launchctl_allow_missing(
+        &["disable", target.as_str()],
+        "disable service",
+        ignore_missing,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_kickstart() -> Result<()> {
+    let target = macos_service_target();
+    run_launchctl_checked(&["kickstart", "-k", target.as_str()], "kickstart service")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_bootout(ignore_missing: bool) -> Result<()> {
+    let target = macos_service_target();
+    run_launchctl_allow_missing(
+        &["bootout", target.as_str()],
+        "bootout service",
+        ignore_missing,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_print() -> Result<String> {
+    let target = macos_service_target();
+    let output = run_launchctl_raw(&["print", target.as_str()], "print service")?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_print_is_running(print_output: &str) -> bool {
+    print_output
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "state = running")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_print_pid(print_output: &str) -> Option<u32> {
+    for line in print_output.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("pid = ")
+            && let Ok(pid) = value.trim().parse::<u32>()
+        {
+            return Some(pid);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl_checked(args: &[&str], context: &str) -> Result<()> {
+    let output = run_launchctl_raw(args, context)?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(anyhow!(
+        "launchctl {context} failed\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl_allow_missing(args: &[&str], context: &str, ignore_missing: bool) -> Result<()> {
+    let output = run_launchctl_raw(args, context)?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = format!("{}\n{}", stdout.trim(), stderr.trim());
+    if ignore_missing && launchctl_missing_service_message(&details) {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "launchctl {context} failed\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl_raw(args: &[&str], context: &str) -> Result<std::process::Output> {
+    ProcessCommand::new("launchctl")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to launchctl {context}"))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_missing_service_message(details: &str) -> bool {
+    let lowered = details.to_ascii_lowercase();
+    lowered.contains("could not find service")
+        || lowered.contains("service is disabled")
+        || lowered.contains("no such process")
+        || lowered.contains("no such file")
+        || lowered.contains("domain does not support specified action")
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn install_cli(args: InstallCliArgs) -> Result<()> {
+    let destination = args.path.unwrap_or_else(default_cli_install_path);
+    install_cli_to_path(&destination, args.force)
+}
+
+fn uninstall_cli(args: UninstallCliArgs) -> Result<()> {
+    let destination = args.path.unwrap_or_else(default_cli_install_path);
+    uninstall_cli_path(&destination)
+}
+
+fn install_cli_to_path(destination: &Path, force: bool) -> Result<()> {
+    let source = std::env::current_exe().context("failed to resolve current executable")?;
+    let source = fs::canonicalize(&source)
+        .with_context(|| format!("failed to canonicalize {}", source.display()))?;
+
+    if destination.as_os_str().is_empty() {
+        return Err(anyhow!("install path must not be empty"));
+    }
+    if destination.is_dir() {
+        return Err(anyhow!(
+            "install path points to a directory: {}",
+            destination.display()
+        ));
+    }
+
+    if let Ok(existing) = fs::canonicalize(destination)
+        && existing == source
+    {
+        println!("nvpn already installed at {}", destination.display());
+        return Ok(());
+    }
+
+    if destination.exists() && !force {
+        return Err(anyhow!(
+            "{} already exists (pass --force to overwrite)",
+            destination.display()
+        ));
+    }
+
+    if destination.exists() && force {
+        let metadata = fs::symlink_metadata(destination)
+            .with_context(|| format!("failed to inspect {}", destination.display()))?;
+        if metadata.file_type().is_dir() {
+            return Err(anyhow!(
+                "refusing to overwrite directory {}",
+                destination.display()
+            ));
+        }
+        fs::remove_file(destination)
+            .with_context(|| format!("failed to remove {}", destination.display()))?;
+    }
+
+    let parent = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "install path must include parent directory: {}",
+            destination.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+
+    let install_nonce = unix_timestamp();
+    let temp_path = parent.join(format!(
+        ".nvpn-install-{}-{install_nonce}",
+        std::process::id()
+    ));
+    if temp_path.exists() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    fs::copy(&source, &temp_path).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source.display(),
+            temp_path.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755)).with_context(|| {
+            format!(
+                "failed to set executable permissions on {}",
+                temp_path.display()
+            )
+        })?;
+    }
+
+    fs::rename(&temp_path, destination).with_context(|| {
+        format!(
+            "failed to move {} into {}",
+            temp_path.display(),
+            destination.display()
+        )
+    })?;
+
+    println!("installed nvpn CLI at {}", destination.display());
+    Ok(())
+}
+
+fn uninstall_cli_path(destination: &Path) -> Result<()> {
+    if !destination.exists() {
+        println!("nvpn CLI not installed at {}", destination.display());
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(destination)
+        .with_context(|| format!("failed to inspect {}", destination.display()))?;
+    if metadata.file_type().is_dir() {
+        return Err(anyhow!(
+            "refusing to remove directory {}",
+            destination.display()
+        ));
+    }
+
+    fs::remove_file(destination)
+        .with_context(|| format!("failed to remove {}", destination.display()))?;
+    println!("removed nvpn CLI from {}", destination.display());
+    Ok(())
+}
+
 fn init_config(path: &Path, force: bool, participants: Vec<String>) -> Result<()> {
     if path.exists() && !force {
         return Err(anyhow!(
@@ -2692,6 +3663,10 @@ fn init_config(path: &Path, force: bool, participants: Vec<String>) -> Result<()
     println!("network_id={}", config.effective_network_id());
     println!("nostr_pubkey={}", config.nostr.public_key);
     Ok(())
+}
+
+fn default_cli_install_path() -> PathBuf {
+    PathBuf::from("/usr/local/bin/nvpn")
 }
 
 fn default_config_path() -> PathBuf {
@@ -3098,12 +4073,17 @@ mod tests {
     use clap::CommandFactory;
 
     use super::{
-        AppConfig, Cli, PeerAnnouncement, build_runtime_magic_dns_records,
-        daemon_pids_from_ps_output, daemon_reconnect_backoff_delay, endpoint_with_listen_port,
-        is_uapi_addr_in_use_error, publish_error_requires_reconnect, utun_interface_candidates,
+        AppConfig, Cli, InstallCliArgs, PeerAnnouncement, UninstallCliArgs,
+        build_runtime_magic_dns_records, daemon_control_file_path, daemon_pids_from_ps_output,
+        daemon_reconnect_backoff_delay, default_cli_install_path, endpoint_with_listen_port,
+        install_cli, is_uapi_addr_in_use_error, kill_error_requires_control_fallback,
+        publish_error_requires_reconnect, request_daemon_reload, request_daemon_stop,
+        take_daemon_control_request, uninstall_cli, utun_interface_candidates,
     };
     use std::collections::HashMap;
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn clap_binary_name_is_nvpn() {
@@ -3117,6 +4097,9 @@ mod tests {
         for name in [
             "start",
             "stop",
+            "reload",
+            "pause",
+            "resume",
             "up",
             "connect",
             "down",
@@ -3128,6 +4111,9 @@ mod tests {
             "whois",
             "nat-discover",
             "hole-punch",
+            "install-cli",
+            "uninstall-cli",
+            "service",
         ] {
             assert!(
                 command
@@ -3150,6 +4136,23 @@ mod tests {
                 .any(|argument| argument.get_long() == Some("autoconnect")),
             "missing --autoconnect on set command"
         );
+    }
+
+    #[test]
+    fn clap_service_supports_install_uninstall_status() {
+        let command = Cli::command();
+        let service = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "service")
+            .expect("service subcommand exists");
+        for name in ["install", "uninstall", "status"] {
+            assert!(
+                service
+                    .get_subcommands()
+                    .any(|subcommand| subcommand.get_name() == name),
+                "missing service subcommand {name}"
+            );
+        }
     }
 
     #[test]
@@ -3318,5 +4321,109 @@ mod tests {
                   55555 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /tmp/other.toml --iface utun100\n";
         let pids = daemon_pids_from_ps_output(ps, config_path);
         assert_eq!(pids, vec![42063, 97597]);
+    }
+
+    #[test]
+    fn default_cli_install_path_uses_nvpn_filename() {
+        let path = default_cli_install_path();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("nvpn")
+        );
+    }
+
+    #[test]
+    fn install_cli_and_uninstall_cli_roundtrip_for_custom_path() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-install-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let target = dir.join("nvpn");
+
+        install_cli(InstallCliArgs {
+            path: Some(target.clone()),
+            force: false,
+        })
+        .expect("install custom cli target");
+        assert!(target.exists(), "installed target should exist");
+
+        let duplicate = install_cli(InstallCliArgs {
+            path: Some(target.clone()),
+            force: false,
+        });
+        assert!(duplicate.is_err(), "install without --force should fail");
+
+        install_cli(InstallCliArgs {
+            path: Some(target.clone()),
+            force: true,
+        })
+        .expect("force reinstall custom cli target");
+
+        uninstall_cli(UninstallCliArgs {
+            path: Some(target.clone()),
+        })
+        .expect("uninstall custom cli target");
+        assert!(!target.exists(), "uninstall should remove target");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_error_fallback_matcher_detects_permission_denied() {
+        assert!(kill_error_requires_control_fallback(
+            "kill -TERM 123 failed\nstderr: Operation not permitted"
+        ));
+        assert!(kill_error_requires_control_fallback(
+            "kill -TERM 123 failed\nstderr: permission denied"
+        ));
+        assert!(!kill_error_requires_control_fallback(
+            "kill -TERM 123 failed\nstderr: no such process"
+        ));
+    }
+
+    #[test]
+    fn daemon_control_stop_request_roundtrip() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-control-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config = dir.join("config.toml");
+        fs::write(&config, "node_name = \"test\"").expect("write config");
+
+        request_daemon_stop(&config).expect("write stop request");
+        assert!(
+            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Stop),
+            "daemon should read stop request"
+        );
+        request_daemon_reload(&config).expect("write reload request");
+        assert!(
+            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Reload),
+            "daemon should read reload request"
+        );
+        control_daemon_request_for_test(&config, super::DaemonControlRequest::Pause);
+        assert!(
+            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Pause),
+            "daemon should read pause request"
+        );
+        control_daemon_request_for_test(&config, super::DaemonControlRequest::Resume);
+        assert!(
+            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Resume),
+            "daemon should read resume request"
+        );
+        let _ = fs::remove_file(daemon_control_file_path(&config));
+        assert!(
+            take_daemon_control_request(&config).is_none(),
+            "without control file there should be no stop request"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn control_daemon_request_for_test(config: &Path, request: super::DaemonControlRequest) {
+        super::write_daemon_control_request(config, request).expect("write control request");
     }
 }

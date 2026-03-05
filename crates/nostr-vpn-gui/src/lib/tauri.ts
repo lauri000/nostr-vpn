@@ -36,6 +36,9 @@ const mockState: UiState = {
   daemonRunning: false,
   sessionActive: false,
   relayConnected: false,
+  serviceSupported: true,
+  serviceInstalled: false,
+  serviceRunning: false,
   sessionStatus: 'Daemon not running',
   configPath: '~/.config/nvpn/config.toml',
   ownNpub: 'npub1akgu9lxldpt32lnjf97k005a4kgasewmvsrmkpzqeff39ssev0ssd6t3u',
@@ -141,6 +144,7 @@ export const connectSession = () =>
     : (() => {
         mockState.sessionActive = true
         mockState.daemonRunning = true
+        mockState.serviceRunning = mockState.serviceInstalled
         mockState.relayConnected = true
         mockState.sessionStatus = 'Daemon running'
         mockState.relays = mockState.relays.map((relay) => ({
@@ -170,9 +174,10 @@ export const disconnectSession = () =>
     ? invoke<UiState>('disconnect_session')
     : (() => {
         mockState.sessionActive = false
-        mockState.daemonRunning = false
+        mockState.daemonRunning = true
+        mockState.serviceRunning = mockState.serviceInstalled
         mockState.relayConnected = false
-        mockState.sessionStatus = 'Daemon not running'
+        mockState.sessionStatus = 'Paused'
         mockState.relays = mockState.relays.map((relay) => ({
           ...relay,
           state: 'unknown',
@@ -189,6 +194,35 @@ export const disconnectSession = () =>
           })),
         }))
         updateMockRelaySummary()
+        return asResult()
+      })()
+
+export const installCli = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('install_cli')
+    : asResult()
+
+export const uninstallCli = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('uninstall_cli')
+    : asResult()
+
+export const installSystemService = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('install_system_service')
+    : (() => {
+        mockState.serviceInstalled = true
+        mockState.serviceRunning = true
+        mockState.daemonRunning = true
+        return asResult()
+      })()
+
+export const uninstallSystemService = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('uninstall_system_service')
+    : (() => {
+        mockState.serviceInstalled = false
+        mockState.serviceRunning = false
         return asResult()
       })()
 
