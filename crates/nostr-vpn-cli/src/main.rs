@@ -1254,6 +1254,15 @@ impl ConnectMagicDnsRuntime {
             }
         }
     }
+
+    fn refresh_records(
+        &self,
+        app: &AppConfig,
+        peer_announcements: &HashMap<String, PeerAnnouncement>,
+    ) {
+        self.server
+            .update_records(build_runtime_magic_dns_records(app, peer_announcements));
+    }
 }
 
 impl Drop for ConnectMagicDnsRuntime {
@@ -1552,6 +1561,38 @@ fn tunnel_peer_from_announcement(announcement: &PeerAnnouncement) -> Result<Tunn
     })
 }
 
+fn build_runtime_magic_dns_records(
+    app: &AppConfig,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+) -> HashMap<String, Ipv4Addr> {
+    let mut records = build_magic_dns_records(app);
+    let suffix = app
+        .magic_dns_suffix
+        .trim()
+        .trim_matches('.')
+        .to_ascii_lowercase();
+
+    for participant in &app.participant_pubkeys_hex() {
+        let Some(alias) = app.peer_alias(participant) else {
+            continue;
+        };
+        let Some(announcement) = peer_announcements.get(participant) else {
+            continue;
+        };
+        let Ok(ipv4) = strip_cidr(&announcement.tunnel_ip).parse::<Ipv4Addr>() else {
+            continue;
+        };
+
+        let alias = alias.to_ascii_lowercase();
+        records.insert(alias.clone(), ipv4);
+        if !suffix.is_empty() {
+            records.insert(format!("{alias}.{suffix}"), ipv4);
+        }
+    }
+
+    records
+}
+
 fn local_interface_address_for_tunnel(tunnel_ip: &str) -> String {
     format!("{}/24", strip_cidr(tunnel_ip))
 }
@@ -1594,7 +1635,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     let expected_peers = expected_peer_count(&app);
     let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
-    let _magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
+    let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
 
     let client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
@@ -1606,6 +1647,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     tunnel_runtime
         .apply(&app, own_pubkey.as_deref(), &peer_announcements)
         .context("failed to initialize tunnel runtime")?;
+    if let Some(runtime) = magic_dns_runtime.as_ref() {
+        runtime.refresh_records(&app, &peer_announcements);
+    }
     let _ = client
         .publish(SignalPayload::Announce(PeerAnnouncement {
             node_id: app.node.id.clone(),
@@ -1670,6 +1714,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 tunnel_runtime
                     .apply(&app, own_pubkey.as_deref(), &peer_announcements)
                     .context("failed to apply tunnel update")?;
+                if let Some(runtime) = magic_dns_runtime.as_ref() {
+                    runtime.refresh_records(&app, &peer_announcements);
+                }
 
                 let connected = app
                     .participant_pubkeys_hex()
@@ -1719,7 +1766,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
     let mut peer_signal_seen_at = HashMap::<String, u64>::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
-    let _magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
+    let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
 
     let mut client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
@@ -1730,6 +1777,9 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     tunnel_runtime
         .apply(&app, own_pubkey.as_deref(), &peer_announcements)
         .context("failed to initialize tunnel runtime")?;
+    if let Some(runtime) = magic_dns_runtime.as_ref() {
+        runtime.refresh_records(&app, &peer_announcements);
+    }
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
     announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1906,6 +1956,9 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     let error_text = error.to_string();
                     session_status = format!("Tunnel update failed ({error_text})");
                 } else {
+                    if let Some(runtime) = magic_dns_runtime.as_ref() {
+                        runtime.refresh_records(&app, &peer_announcements);
+                    }
                     session_status = "Connected".to_string();
                 }
 
@@ -2153,9 +2206,25 @@ fn daemon_status(config_path: &Path) -> Result<DaemonStatus> {
     let log_file = daemon_log_file_path(config_path);
     let state_file = daemon_state_file_path(config_path);
     let pid_record = read_daemon_pid_record(&pid_file)?;
-    let pid = pid_record.as_ref().map(|record| record.pid);
-    let running = pid.is_some_and(|pid| daemon_process_matches(pid, config_path));
+    let pid_from_record = pid_record.as_ref().map(|record| record.pid);
+    let pid_from_scan = find_daemon_pid_by_config(config_path);
+    let pid_from_record_running =
+        pid_from_record.filter(|pid| daemon_process_matches(*pid, config_path));
+    let running_pid = pid_from_scan.or(pid_from_record_running);
+    let running = running_pid.is_some();
+    let pid = running_pid.or(pid_from_record);
     let state = read_daemon_state(&state_file)?;
+
+    if let Some(pid) = running_pid
+        && pid_from_record != Some(pid)
+    {
+        let refreshed = DaemonPidRecord {
+            pid,
+            config_path: config_path.display().to_string(),
+            started_at: unix_timestamp(),
+        };
+        let _ = write_daemon_pid_record(&pid_file, &refreshed);
+    }
 
     Ok(DaemonStatus {
         running,
@@ -2249,6 +2318,10 @@ fn write_daemon_state(path: &Path, state: &DaemonRuntimeState) -> Result<()> {
 }
 
 fn spawn_daemon_process(args: &ConnectArgs, config_path: &Path) -> Result<u32> {
+    if let Some(existing_pid) = find_daemon_pid_by_config(config_path) {
+        return Err(anyhow!("daemon already running with pid {}", existing_pid));
+    }
+
     let pid_file = daemon_pid_file_path(config_path);
     if let Some(record) = read_daemon_pid_record(&pid_file)?
         && daemon_process_matches(record.pid, config_path)
@@ -2388,6 +2461,64 @@ fn daemon_process_matches(pid: u32, config_path: &Path) -> bool {
     command.contains(" daemon ")
         && command.contains("--config")
         && command.contains(config_text.as_str())
+}
+
+fn find_daemon_pid_by_config(config_path: &Path) -> Option<u32> {
+    find_daemon_pids_by_config(config_path).into_iter().next()
+}
+
+fn find_daemon_pids_by_config(config_path: &Path) -> Vec<u32> {
+    if cfg!(not(unix)) {
+        return Vec::new();
+    }
+
+    let output = ProcessCommand::new("ps")
+        .arg("ax")
+        .arg("-o")
+        .arg("pid=,command=")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    daemon_pids_from_ps_output(&String::from_utf8_lossy(&output.stdout), config_path)
+}
+
+fn daemon_pids_from_ps_output(ps_output: &str, config_path: &Path) -> Vec<u32> {
+    let config_text = config_path.display().to_string();
+    let mut pids = Vec::new();
+
+    for line in ps_output.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let Some(pid_text) = parts.next() else {
+            continue;
+        };
+        let Some(command) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+
+        if command.contains(" daemon ")
+            && command.contains("--config")
+            && command.contains(config_text.as_str())
+        {
+            pids.push(pid);
+        }
+    }
+
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 fn set_daemon_runtime_file_permissions(path: &Path) -> Result<()> {
@@ -2967,9 +3098,12 @@ mod tests {
     use clap::CommandFactory;
 
     use super::{
-        Cli, daemon_reconnect_backoff_delay, endpoint_with_listen_port, is_uapi_addr_in_use_error,
-        publish_error_requires_reconnect, utun_interface_candidates,
+        AppConfig, Cli, PeerAnnouncement, build_runtime_magic_dns_records,
+        daemon_pids_from_ps_output, daemon_reconnect_backoff_delay, endpoint_with_listen_port,
+        is_uapi_addr_in_use_error, publish_error_requires_reconnect, utun_interface_candidates,
     };
+    use std::collections::HashMap;
+    use std::path::Path;
 
     #[test]
     fn clap_binary_name_is_nvpn() {
@@ -3089,5 +3223,100 @@ mod tests {
             endpoint_with_listen_port("not-a-socket", 52000),
             "not-a-socket"
         );
+    }
+
+    #[test]
+    fn runtime_magic_dns_records_prefer_live_announcement_tunnel_ip() {
+        let mut config = AppConfig::generated();
+        config.magic_dns_suffix = "nvpn".to_string();
+        config.networks[0].participants =
+            vec!["3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string()];
+        config.ensure_defaults();
+        config
+            .set_peer_alias(
+                "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645",
+                "pig",
+            )
+            .expect("set alias");
+
+        let mut announcements = HashMap::new();
+        announcements.insert(
+            "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string(),
+            PeerAnnouncement {
+                node_id: "peer-node".to_string(),
+                public_key: "pubkey".to_string(),
+                endpoint: "192.168.1.55:51820".to_string(),
+                tunnel_ip: "10.44.0.113/32".to_string(),
+                timestamp: 1,
+            },
+        );
+
+        let records = build_runtime_magic_dns_records(&config, &announcements);
+        assert_eq!(
+            records.get("pig.nvpn").map(|ip| ip.to_string()),
+            Some("10.44.0.113".to_string())
+        );
+        assert_eq!(
+            records.get("pig").map(|ip| ip.to_string()),
+            Some("10.44.0.113".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_magic_dns_records_follow_latest_announcement_ip() {
+        let mut config = AppConfig::generated();
+        config.magic_dns_suffix = "nvpn".to_string();
+        config.networks[0].participants =
+            vec!["3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string()];
+        config.ensure_defaults();
+        config
+            .set_peer_alias(
+                "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645",
+                "pig",
+            )
+            .expect("set alias");
+
+        let mut announcements = HashMap::new();
+        announcements.insert(
+            "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string(),
+            PeerAnnouncement {
+                node_id: "peer-node".to_string(),
+                public_key: "pubkey".to_string(),
+                endpoint: "192.168.1.55:51820".to_string(),
+                tunnel_ip: "10.44.0.113/32".to_string(),
+                timestamp: 1,
+            },
+        );
+        let first = build_runtime_magic_dns_records(&config, &announcements);
+        assert_eq!(
+            first.get("pig.nvpn").map(|ip| ip.to_string()),
+            Some("10.44.0.113".to_string())
+        );
+
+        announcements.insert(
+            "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string(),
+            PeerAnnouncement {
+                node_id: "peer-node".to_string(),
+                public_key: "pubkey".to_string(),
+                endpoint: "192.168.1.55:51820".to_string(),
+                tunnel_ip: "10.44.0.114/32".to_string(),
+                timestamp: 2,
+            },
+        );
+        let second = build_runtime_magic_dns_records(&config, &announcements);
+        assert_eq!(
+            second.get("pig.nvpn").map(|ip| ip.to_string()),
+            Some("10.44.0.114".to_string())
+        );
+    }
+
+    #[test]
+    fn daemon_pid_scan_matches_processes_for_config() {
+        let config_path = Path::new("/Users/sirius/Library/Application Support/nvpn/config.toml");
+        let ps = "  42063 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n\
+                  97597 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n\
+                  55555 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /tmp/other.toml --iface utun100\n";
+        let pids = daemon_pids_from_ps_output(ps, config_path);
+        assert_eq!(pids, vec![42063, 97597]);
     }
 }

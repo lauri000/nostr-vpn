@@ -25,6 +25,7 @@ use tokio::runtime::Runtime;
 const LAN_DISCOVERY_ADDR: [u8; 4] = [239, 255, 73, 73];
 const LAN_DISCOVERY_PORT: u16 = 38911;
 const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
+const PEER_ONLINE_GRACE_SECS: u64 = 20;
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
 const TRAY_QUIT_MENU_ID: &str = "tray_quit";
 const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
@@ -1009,22 +1010,29 @@ impl NvpnBackend {
                 continue;
             };
 
-            status.reachable = Some(peer.reachable);
+            let previous_reachable = status.reachable;
+            let previous_handshake_at = status.last_handshake_at;
+            let sticky_online = !peer.reachable
+                && previous_reachable == Some(true)
+                && within_peer_online_grace(previous_handshake_at, now);
+            let effective_reachable = peer.reachable || sticky_online;
+            status.reachable = Some(effective_reachable);
             status.endpoint = if peer.endpoint.is_empty() {
                 None
             } else {
                 Some(peer.endpoint.clone())
             };
-            status.last_handshake_at = peer
+            let daemon_handshake_at = peer
                 .last_handshake_at
                 .and_then(epoch_secs_to_system_time)
-                .or_else(|| {
-                    if peer.reachable {
-                        Some(SystemTime::now())
-                    } else {
-                        None
-                    }
-                });
+                .or_else(|| if peer.reachable { Some(now) } else { None });
+            status.last_handshake_at = if daemon_handshake_at.is_some() {
+                daemon_handshake_at
+            } else if sticky_online {
+                previous_handshake_at
+            } else {
+                None
+            };
             status.last_signal_seen_at = peer
                 .last_signal_seen_at
                 .and_then(epoch_secs_to_system_time)
@@ -1035,7 +1043,7 @@ impl NvpnBackend {
                         None
                     }
                 });
-            status.error = if peer.reachable {
+            status.error = if effective_reachable {
                 None
             } else {
                 Some(
@@ -1472,6 +1480,15 @@ impl NvpnBackend {
             lan_peers: self.lan_peer_rows(),
         }
     }
+}
+
+fn within_peer_online_grace(last_handshake_at: Option<SystemTime>, now: SystemTime) -> bool {
+    let Some(last_handshake_at) = last_handshake_at else {
+        return false;
+    };
+    now.duration_since(last_handshake_at)
+        .map(|elapsed| elapsed.as_secs() <= PEER_ONLINE_GRACE_SECS)
+        .unwrap_or(false)
 }
 
 impl Drop for NvpnBackend {
@@ -2109,9 +2126,10 @@ pub fn run() {
 mod tests {
     use super::{
         expected_peer_count, extract_json_document, is_already_running_message, is_mesh_complete,
-        is_not_running_message, to_npub, validate_nvpn_binary,
+        is_not_running_message, to_npub, validate_nvpn_binary, within_peer_online_grace,
     };
     use nostr_vpn_core::config::AppConfig;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn expected_peer_count_excludes_own_participant_when_present() {
@@ -2152,6 +2170,20 @@ mod tests {
         ));
         assert!(!is_already_running_message("permission denied"));
         assert!(!is_not_running_message("permission denied"));
+    }
+
+    #[test]
+    fn peer_online_grace_keeps_recent_handshake_online() {
+        let now = SystemTime::now();
+        assert!(within_peer_online_grace(
+            Some(now - Duration::from_secs(5)),
+            now
+        ));
+        assert!(!within_peer_online_grace(
+            Some(now - Duration::from_secs(25)),
+            now
+        ));
+        assert!(!within_peer_online_grace(None, now));
     }
 
     #[test]

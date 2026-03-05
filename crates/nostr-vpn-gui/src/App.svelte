@@ -420,34 +420,37 @@
           </div>
         </div>
 
-        <div class="row form-row participant-add-row">
-          <input
-            class="text-input"
-            placeholder="Add participant (npub)"
-            data-testid="participant-input"
-            value={participantInputDrafts[network.id] ?? ''}
-            on:input={(event) =>
-              (participantInputDrafts = {
-                ...participantInputDrafts,
-                [network.id]: (event.currentTarget as HTMLInputElement).value,
-              })}
-            on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-          />
-          <input
-            class="text-input participant-add-alias"
-            placeholder="Alias (optional)"
-            data-testid="participant-add-alias-input"
-            value={participantAddAliasDrafts[network.id] ?? ''}
-            on:input={(event) =>
-              (participantAddAliasDrafts = {
-                ...participantAddAliasDrafts,
-                [network.id]: (event.currentTarget as HTMLInputElement).value,
-              })}
-            on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-          />
-          <button class="btn" data-testid="participant-add" on:click={() => onAddParticipant(network.id)}>
-            Add
-          </button>
+        <div class="participant-add-panel">
+          <div class="participant-add-label">Add participant</div>
+          <div class="participant-add-fields">
+            <input
+              class="text-input participant-add-npub"
+              placeholder="Participant npub"
+              data-testid="participant-input"
+              value={participantInputDrafts[network.id] ?? ''}
+              on:input={(event) =>
+                (participantInputDrafts = {
+                  ...participantInputDrafts,
+                  [network.id]: (event.currentTarget as HTMLInputElement).value,
+                })}
+              on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+            />
+            <input
+              class="text-input participant-add-alias"
+              placeholder="Alias (optional)"
+              data-testid="participant-add-alias-input"
+              value={participantAddAliasDrafts[network.id] ?? ''}
+              on:input={(event) =>
+                (participantAddAliasDrafts = {
+                  ...participantAddAliasDrafts,
+                  [network.id]: (event.currentTarget as HTMLInputElement).value,
+                })}
+              on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+            />
+            <button class="btn participant-add-btn" data-testid="participant-add" on:click={() => onAddParticipant(network.id)}>
+              Add
+            </button>
+          </div>
         </div>
 
         <div class="stack rows">
