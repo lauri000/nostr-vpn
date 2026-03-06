@@ -196,6 +196,7 @@ struct UiState {
     daemon_running: bool,
     session_active: bool,
     relay_connected: bool,
+    cli_installed: bool,
     service_supported: bool,
     service_installed: bool,
     service_running: bool,
@@ -1746,6 +1747,7 @@ impl NvpnBackend {
             daemon_running: self.daemon_running,
             session_active: self.session_active,
             relay_connected: self.relay_connected,
+            cli_installed: cli_binary_installed(),
             service_supported: self.service_supported,
             service_installed: self.service_installed,
             service_running: self.service_running,
@@ -1906,6 +1908,20 @@ fn validate_nvpn_binary(path: PathBuf) -> Result<PathBuf> {
     }
 
     Ok(canonical)
+}
+
+fn default_cli_install_path() -> PathBuf {
+    PathBuf::from("/usr/local/bin/nvpn")
+}
+
+fn cli_binary_installed() -> bool {
+    cli_binary_installed_at(&default_cli_install_path())
+}
+
+fn cli_binary_installed_at(path: &std::path::Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
 }
 
 fn nvpn_bundled_binary_candidates() -> Vec<String> {
@@ -2641,10 +2657,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        expected_peer_count, extract_json_document, gui_requires_service_install,
-        is_already_running_message, is_mesh_complete, is_not_running_message,
-        should_start_gui_daemon_on_launch, started_from_autostart_args, to_npub,
-        validate_nvpn_binary, within_peer_online_grace,
+        cli_binary_installed_at, expected_peer_count, extract_json_document,
+        gui_requires_service_install, is_already_running_message, is_mesh_complete,
+        is_not_running_message, should_start_gui_daemon_on_launch, started_from_autostart_args,
+        to_npub, validate_nvpn_binary, within_peer_online_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -2782,5 +2798,28 @@ mod tests {
         let result = validate_nvpn_binary(path.clone());
         assert!(result.is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_install_detection_accepts_files_but_not_directories() {
+        let base = std::env::temp_dir().join(format!(
+            "nvpn-gui-cli-install-test-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        let file_path = base.join("nvpn");
+        let dir_path = base.join("bin");
+
+        assert!(!cli_binary_installed_at(&file_path));
+
+        std::fs::create_dir_all(&base).expect("create base dir");
+        std::fs::write(&file_path, b"#!/bin/sh\n").expect("write cli file");
+        assert!(cli_binary_installed_at(&file_path));
+
+        std::fs::create_dir_all(&dir_path).expect("create dir path");
+        assert!(!cli_binary_installed_at(&dir_path));
+
+        let _ = std::fs::remove_file(file_path);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

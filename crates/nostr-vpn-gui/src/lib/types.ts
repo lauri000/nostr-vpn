@@ -46,6 +46,7 @@ export interface UiState {
   daemonRunning: boolean
   sessionActive: boolean
   relayConnected: boolean
+  cliInstalled: boolean
   serviceSupported: boolean
   serviceInstalled: boolean
   serviceRunning: boolean

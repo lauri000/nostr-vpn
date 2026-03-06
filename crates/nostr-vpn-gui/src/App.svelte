@@ -728,8 +728,17 @@
       <div class="row spread settings-action-row">
         <div class="config-path">Terminal CLI</div>
         <div class="row cli-actions-row">
-          <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>Install CLI</button>
-          <button class="btn ghost" data-testid="uninstall-cli-btn" on:click={onUninstallCli}>Uninstall CLI</button>
+          <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>
+            {state.cliInstalled ? 'Reinstall CLI' : 'Install CLI'}
+          </button>
+          <button
+            class="btn ghost"
+            data-testid="uninstall-cli-btn"
+            on:click={onUninstallCli}
+            disabled={!state.cliInstalled}
+          >
+            Uninstall CLI
+          </button>
         </div>
       </div>
       {#if cliActionStatus}

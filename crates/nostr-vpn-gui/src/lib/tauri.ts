@@ -36,6 +36,7 @@ const mockState: UiState = {
   daemonRunning: false,
   sessionActive: false,
   relayConnected: false,
+  cliInstalled: false,
   serviceSupported: true,
   serviceInstalled: false,
   serviceRunning: false,
