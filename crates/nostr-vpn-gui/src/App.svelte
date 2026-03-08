@@ -7,7 +7,9 @@
     addParticipant,
     addRelay,
     connectSession,
+    disableSystemService,
     disconnectSession,
+    enableSystemService,
     installCli,
     installSystemService,
     isAutostartEnabled,
@@ -23,7 +25,7 @@
     uninstallSystemService,
     updateSettings,
   } from './lib/tauri'
-  import type { NetworkView, SettingsPatch, UiState } from './lib/types'
+  import type { NetworkView, ParticipantView, PeerState, PresenceState, SettingsPatch, UiState } from './lib/types'
 
   let state: UiState | null = null
   let relayInput = ''
@@ -54,9 +56,12 @@
   let refreshInFlight = false
   let actionInFlight = false
   let serviceInstallRecommended = false
+  let serviceEnableRecommended = false
   let serviceSetupRequired = false
 
   $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
+  $: serviceEnableRecommended =
+    !!state?.serviceEnablementSupported && !!state?.serviceInstalled && !!state?.serviceDisabled
   $: serviceSetupRequired = serviceInstallRecommended && !state?.daemonRunning
 
   const serviceMetaText = (state: UiState) => {
@@ -84,6 +89,47 @@
       return 'warn'
     }
     return state.serviceRunning ? 'ok' : 'muted'
+  }
+
+  const participantBadgeClass = (state: PeerState | PresenceState) => {
+    if (state === 'online' || state === 'present') {
+      return 'ok'
+    }
+    if (state === 'pending') {
+      return 'warn'
+    }
+    if (state === 'offline' || state === 'absent') {
+      return 'bad'
+    }
+    return 'muted'
+  }
+
+  const participantTransportBadgeText = (participant: ParticipantView) => {
+    switch (participant.state) {
+      case 'local':
+        return 'WG self'
+      case 'online':
+        return 'WG online'
+      case 'pending':
+        return 'WG waiting'
+      case 'offline':
+        return 'WG offline'
+      default:
+        return 'WG unknown'
+    }
+  }
+
+  const participantPresenceBadgeText = (participant: ParticipantView) => {
+    switch (participant.presenceState) {
+      case 'local':
+        return 'Nostr self'
+      case 'present':
+        return 'Nostr present'
+      case 'absent':
+        return 'Nostr absent'
+      default:
+        return 'Nostr unknown'
+    }
   }
 
   const short = (value: string, head = 12, tail = 10) => {
@@ -212,7 +258,12 @@
     }
 
     if (serviceSetupRequired && !state.sessionActive) {
-      await onInstallSystemService()
+      await onInstallSystemService(true)
+      return
+    }
+
+    if (serviceEnableRecommended && !state.sessionActive) {
+      await onEnableSystemService(true)
       return
     }
 
@@ -233,7 +284,7 @@
     }
   }
 
-  async function onInstallSystemService() {
+  async function onInstallSystemService(connectAfter = false) {
     const wasInstalled = !!state?.serviceInstalled
     await runAction(installSystemService)
     if (!error) {
@@ -243,6 +294,36 @@
       serviceActionStatus = state.serviceRunning
         ? 'System service installed and started'
         : 'System service installed'
+    }
+    if (connectAfter && !error && state && !state.sessionActive) {
+      await runAction(connectSession)
+    }
+  }
+
+  async function onEnableSystemService(connectAfter = false) {
+    const wasDisabled = !!state?.serviceDisabled
+    await runAction(enableSystemService)
+    if (!error) {
+      serviceActionStatus = 'System service enabled and started'
+    } else if (wasDisabled && state && !state.serviceDisabled) {
+      error = ''
+      serviceActionStatus = state.serviceRunning
+        ? 'System service enabled and started'
+        : 'System service enabled'
+    }
+    if (connectAfter && !error && state && !state.sessionActive) {
+      await runAction(connectSession)
+    }
+  }
+
+  async function onDisableSystemService() {
+    const wasEnabled = !!state?.serviceInstalled && !state?.serviceDisabled
+    await runAction(disableSystemService)
+    if (!error) {
+      serviceActionStatus = 'System service disabled'
+    } else if (wasEnabled && state?.serviceDisabled) {
+      error = ''
+      serviceActionStatus = 'System service disabled'
     }
   }
 
@@ -606,9 +687,20 @@
                   {participant.magicDnsName} | {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
                 </div>
               </div>
-              <span class={`badge ${participant.state === 'online' ? 'ok' : participant.state === 'offline' ? 'bad' : participant.state === 'local' ? 'muted' : 'warn'}`}>
-                <span data-testid="participant-state">{participant.state}</span>
-              </span>
+              <div class="participant-badges">
+                <span
+                  class={`badge participant-badge ${participantBadgeClass(participant.state)}`}
+                  data-testid="participant-state"
+                >
+                  {participantTransportBadgeText(participant)}
+                </span>
+                <span
+                  class={`badge participant-badge ${participantBadgeClass(participant.presenceState)}`}
+                  data-testid="participant-presence-state"
+                >
+                  {participantPresenceBadgeText(participant)}
+                </span>
+              </div>
               <button
                 class="btn ghost icon-btn"
                 data-testid="participant-remove"
@@ -685,10 +777,26 @@
           <button
             class={`btn ${serviceSetupRequired ? 'service-primary-btn' : ''}`}
             data-testid="install-service-btn"
-            on:click={() => onInstallSystemService(serviceSetupRequired)}
+            on:click={() =>
+              serviceEnableRecommended
+                ? onEnableSystemService()
+                : onInstallSystemService(serviceSetupRequired)}
           >
-            {state.serviceInstalled ? 'Reinstall service' : 'Install service'}
+            {serviceEnableRecommended
+              ? 'Enable service'
+              : state.serviceInstalled
+                ? 'Reinstall service'
+                : 'Install service'}
           </button>
+          {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
+            <button
+              class="btn ghost"
+              data-testid="disable-service-btn"
+              on:click={onDisableSystemService}
+            >
+              Disable service
+            </button>
+          {/if}
           <button
             class="btn ghost"
             data-testid="uninstall-service-btn"
@@ -733,9 +841,23 @@
         </div>
 
         <div class="row service-actions-row">
-          <button class="btn" data-testid="install-service-btn" on:click={onInstallSystemService}>
-            Reinstall service
+          <button
+            class="btn"
+            data-testid="install-service-btn"
+            on:click={() =>
+              serviceEnableRecommended ? onEnableSystemService() : onInstallSystemService()}
+          >
+            {serviceEnableRecommended ? 'Enable service' : 'Reinstall service'}
           </button>
+          {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
+            <button
+              class="btn ghost"
+              data-testid="disable-service-btn"
+              on:click={onDisableSystemService}
+            >
+              Disable service
+            </button>
+          {/if}
           <button
             class="btn ghost"
             data-testid="uninstall-service-btn"

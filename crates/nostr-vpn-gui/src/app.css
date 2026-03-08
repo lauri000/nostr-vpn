@@ -572,6 +572,19 @@ body {
   flex: 1;
 }
 
+.participant-badges {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.participant-badge {
+  min-width: 118px;
+  text-align: center;
+}
+
 .item-title {
   font-family: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, monospace;
   font-size: 16px;

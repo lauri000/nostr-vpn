@@ -1,5 +1,6 @@
 export type RelayState = 'up' | 'down' | 'checking' | 'unknown'
-export type PeerState = 'local' | 'online' | 'offline' | 'checking' | 'unknown'
+export type PeerState = 'local' | 'online' | 'pending' | 'offline' | 'checking' | 'unknown'
+export type PresenceState = 'local' | 'present' | 'absent' | 'unknown'
 
 export interface RelaySummary {
   up: number
@@ -21,6 +22,7 @@ export interface ParticipantView {
   magicDnsAlias: string
   magicDnsName: string
   state: PeerState
+  presenceState: PresenceState
   statusText: string
   lastSignalText: string
 }
@@ -48,6 +50,7 @@ export interface UiState {
   relayConnected: boolean
   cliInstalled: boolean
   serviceSupported: boolean
+  serviceEnablementSupported: boolean
   serviceInstalled: boolean
   serviceDisabled: boolean
   serviceRunning: boolean

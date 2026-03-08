@@ -38,6 +38,7 @@ const mockState: UiState = {
   relayConnected: false,
   cliInstalled: false,
   serviceSupported: true,
+  serviceEnablementSupported: true,
   serviceInstalled: false,
   serviceDisabled: false,
   serviceRunning: false,
@@ -167,12 +168,13 @@ export const connectSession = () =>
           participants: network.participants.map((participant) => ({
             ...participant,
             state: participant.state === 'local' ? 'local' : 'online',
+            presenceState: participant.state === 'local' ? 'local' : 'present',
             statusText:
               participant.state === 'local'
                 ? 'local'
                 : 'online (handshake 0s ago)',
             lastSignalText:
-              participant.state === 'local' ? 'self' : 'presence 0s ago',
+              participant.state === 'local' ? 'self' : 'nostr seen 0s ago',
           })),
         }))
         updateMockRelaySummary()
@@ -199,9 +201,9 @@ export const disconnectSession = () =>
           participants: network.participants.map((participant) => ({
             ...participant,
             state: participant.state === 'local' ? 'local' : 'unknown',
+            presenceState: participant.state === 'local' ? 'local' : 'unknown',
             statusText: participant.state === 'local' ? 'local' : 'unknown',
-            lastSignalText:
-              participant.state === 'local' ? 'self' : 'no presence yet',
+            lastSignalText: participant.state === 'local' ? 'self' : 'nostr unseen',
           })),
         }))
         updateMockRelaySummary()
@@ -228,6 +230,34 @@ export const installSystemService = () =>
         mockState.daemonRunning = true
         mockState.serviceStatusDetail = 'Background service running (mock)'
         mockState.sessionStatus = 'Daemon running'
+        return asResult()
+      })()
+
+export const enableSystemService = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('enable_system_service')
+    : (() => {
+        mockState.serviceInstalled = true
+        mockState.serviceDisabled = false
+        mockState.serviceRunning = true
+        mockState.daemonRunning = true
+        mockState.serviceStatusDetail = 'Background service running (mock)'
+        mockState.sessionStatus = 'Daemon running'
+        return asResult()
+      })()
+
+export const disableSystemService = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('disable_system_service')
+    : (() => {
+        mockState.serviceInstalled = true
+        mockState.serviceDisabled = true
+        mockState.serviceRunning = false
+        mockState.sessionActive = false
+        mockState.daemonRunning = false
+        mockState.relayConnected = false
+        mockState.serviceStatusDetail = 'Background service is installed but disabled in launchd'
+        mockState.sessionStatus = 'Background service is disabled in launchd'
         return asResult()
       })()
 
@@ -328,8 +358,9 @@ export const addParticipant = (networkId: string, npub: string, alias = '') =>
           magicDnsAlias,
           magicDnsName: composeMagicDnsName(magicDnsAlias, mockState.magicDnsSuffix),
           state: 'unknown',
+          presenceState: 'absent',
           statusText: 'no signal yet',
-          lastSignalText: 'no presence yet',
+          lastSignalText: 'nostr unseen',
         })
 
         return asResult()

@@ -217,6 +217,10 @@ struct ServiceArgs {
 enum ServiceCommand {
     /// Install and start the macOS launchd daemon.
     Install(ServiceInstallArgs),
+    /// Enable and start an installed system service.
+    Enable(ServiceControlArgs),
+    /// Stop and disable an installed system service.
+    Disable(ServiceControlArgs),
     /// Remove the macOS launchd daemon.
     Uninstall(ServiceUninstallArgs),
     /// Show service install/runtime status.
@@ -247,6 +251,12 @@ struct ServiceStatusArgs {
     config: Option<PathBuf>,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServiceControlArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -3604,6 +3614,8 @@ async fn run_netcheck(
 fn run_service_command(args: ServiceArgs) -> Result<()> {
     match args.command {
         ServiceCommand::Install(args) => service_install(args),
+        ServiceCommand::Enable(args) => service_enable(args),
+        ServiceCommand::Disable(args) => service_disable(args),
         ServiceCommand::Uninstall(args) => service_uninstall(args),
         ServiceCommand::Status(args) => service_status(args),
     }
@@ -3706,6 +3718,38 @@ fn service_uninstall(args: ServiceUninstallArgs) -> Result<()> {
     {
         Err(anyhow!(
             "system service uninstall is not implemented on this platform"
+        ))
+    }
+}
+
+fn service_enable(args: ServiceControlArgs) -> Result<()> {
+    let _ = args.config.unwrap_or_else(default_config_path);
+
+    #[cfg(target_os = "macos")]
+    {
+        return macos_enable_service();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(anyhow!(
+            "system service enable is not implemented on this platform"
+        ))
+    }
+}
+
+fn service_disable(args: ServiceControlArgs) -> Result<()> {
+    let _ = args.config.unwrap_or_else(default_config_path);
+
+    #[cfg(target_os = "macos")]
+    {
+        return macos_disable_service();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(anyhow!(
+            "system service disable is not implemented on this platform"
         ))
     }
 }
@@ -3884,6 +3928,42 @@ fn macos_uninstall_service() -> Result<()> {
     } else {
         println!("system service plist not found: {}", plist_path.display());
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_enable_service() -> Result<()> {
+    let plist_path = macos_service_plist_path();
+    if !plist_path.exists() {
+        return Err(anyhow!(
+            "system service plist not found: {}",
+            plist_path.display()
+        ));
+    }
+
+    macos_service_enable()?;
+    macos_service_bootout(true)?;
+    macos_service_bootstrap(&plist_path)?;
+    macos_service_kickstart()?;
+    println!("enabled system service: {}", plist_path.display());
+    println!("label: {}", MACOS_SERVICE_LABEL);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_disable_service() -> Result<()> {
+    let plist_path = macos_service_plist_path();
+    if !plist_path.exists() {
+        return Err(anyhow!(
+            "system service plist not found: {}",
+            plist_path.display()
+        ));
+    }
+
+    macos_service_bootout(true)?;
+    macos_service_disable(false)?;
+    println!("disabled system service: {}", plist_path.display());
+    println!("label: {}", MACOS_SERVICE_LABEL);
     Ok(())
 }
 
@@ -5207,7 +5287,7 @@ mod tests {
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "service")
             .expect("service subcommand exists");
-        for name in ["install", "uninstall", "status"] {
+        for name in ["install", "enable", "disable", "uninstall", "status"] {
             assert!(
                 service
                     .get_subcommands()

@@ -28,6 +28,7 @@ const LAN_DISCOVERY_ADDR: [u8; 4] = [239, 255, 73, 73];
 const LAN_DISCOVERY_PORT: u16 = 38911;
 const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
 const PEER_ONLINE_GRACE_SECS: u64 = 20;
+const PEER_PRESENCE_GRACE_SECS: u64 = 45;
 const TRAY_ICON_ID: &str = "nvpn-tray";
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
 const TRAY_VPN_TOGGLE_MENU_ID: &str = "tray_vpn_toggle";
@@ -68,7 +69,16 @@ struct PeerLinkStatus {
 enum ConfiguredPeerStatus {
     Local,
     Online,
+    Present,
     Offline,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerPresenceStatus {
+    Local,
+    Present,
+    Absent,
     Unknown,
 }
 
@@ -167,6 +177,7 @@ struct ParticipantView {
     magic_dns_alias: String,
     magic_dns_name: String,
     state: String,
+    presence_state: String,
     status_text: String,
     last_signal_text: String,
 }
@@ -200,6 +211,7 @@ struct UiState {
     relay_connected: bool,
     cli_installed: bool,
     service_supported: bool,
+    service_enablement_supported: bool,
     service_installed: bool,
     service_disabled: bool,
     service_running: bool,
@@ -255,6 +267,7 @@ struct NvpnBackend {
     session_active: bool,
     relay_connected: bool,
     service_supported: bool,
+    service_enablement_supported: bool,
     service_installed: bool,
     service_disabled: bool,
     service_running: bool,
@@ -327,6 +340,7 @@ impl NvpnBackend {
                 target_os = "linux",
                 target_os = "windows"
             )),
+            service_enablement_supported: cfg!(target_os = "macos"),
             service_installed: false,
             service_disabled: false,
             service_running: false,
@@ -351,7 +365,7 @@ impl NvpnBackend {
         if should_start_gui_daemon_on_launch(
             backend.config.autoconnect,
             !backend.config.participant_pubkeys_hex().is_empty(),
-            backend.gui_requires_service_install(),
+            backend.gui_requires_service_action(),
         ) && !backend.daemon_running
         {
             if let Err(error) = backend.start_daemon_process() {
@@ -360,6 +374,8 @@ impl NvpnBackend {
             backend.sync_daemon_state();
         } else if wants_autoconnect && backend.gui_requires_service_install() {
             backend.session_status = gui_service_setup_status_text(true).to_string();
+        } else if wants_autoconnect && backend.gui_requires_service_enable() {
+            backend.session_status = gui_service_enable_status_text(true).to_string();
         }
 
         Ok(backend)
@@ -372,6 +388,9 @@ impl NvpnBackend {
             self.resume_daemon_process()?;
         } else if self.gui_requires_service_install() {
             self.session_status = gui_service_setup_status_text(false).to_string();
+            return Err(anyhow!(self.session_status.clone()));
+        } else if self.gui_requires_service_enable() {
+            self.session_status = gui_service_enable_status_text(false).to_string();
             return Err(anyhow!(self.session_status.clone()));
         } else {
             self.start_daemon_process()?;
@@ -923,6 +942,70 @@ impl NvpnBackend {
         Err(anyhow!(message))
     }
 
+    fn enable_system_service(&self) -> Result<()> {
+        let args = [
+            "service",
+            "enable",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn service enable failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if requires_admin_privileges(&message) {
+            self.run_nvpn_command_with_admin_privileges(args)?;
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn disable_system_service(&self) -> Result<()> {
+        let args = [
+            "service",
+            "disable",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn service disable failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if requires_admin_privileges(&message) {
+            self.run_nvpn_command_with_admin_privileges(args)?;
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
     fn reload_daemon_if_running(&self) -> Result<()> {
         if !self.daemon_running {
             return Ok(());
@@ -1403,8 +1486,9 @@ impl NvpnBackend {
     ) -> ParticipantView {
         let tunnel_ip =
             derive_mesh_tunnel_ip(mesh_members, participant).unwrap_or_else(|| "-".to_string());
-        let state = self.peer_state_for(participant, own_pubkey_hex);
-        let status_text = self.peer_status_line(participant, state);
+        let transport_state = self.peer_state_for(participant, own_pubkey_hex);
+        let presence_state = self.peer_presence_state_for(participant, own_pubkey_hex);
+        let status_text = self.peer_status_line(participant, transport_state);
         let last_signal_text = self.peer_presence_line(participant, own_pubkey_hex);
         let magic_dns_alias = self.config.peer_alias(participant).unwrap_or_default();
         let magic_dns_name = self
@@ -1418,7 +1502,8 @@ impl NvpnBackend {
             tunnel_ip,
             magic_dns_alias,
             magic_dns_name,
-            state: peer_state_label(state).to_string(),
+            state: peer_state_label(transport_state).to_string(),
+            presence_state: peer_presence_state_label(presence_state).to_string(),
             status_text,
             last_signal_text,
         }
@@ -1488,14 +1573,14 @@ impl NvpnBackend {
             .get(participant)
             .and_then(|status| status.last_signal_seen_at)
         else {
-            return "no presence yet".to_string();
+            return "nostr unseen".to_string();
         };
 
         let age_secs = seen_at
             .elapsed()
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
-        format!("presence {age_secs}s ago")
+        format!("nostr seen {age_secs}s ago")
     }
 
     fn peer_state_for(
@@ -1509,8 +1594,34 @@ impl NvpnBackend {
 
         match self.peer_status.get(participant) {
             Some(status) if status.reachable == Some(true) => ConfiguredPeerStatus::Online,
+            Some(status)
+                if within_peer_presence_grace(status.last_signal_seen_at, SystemTime::now()) =>
+            {
+                ConfiguredPeerStatus::Present
+            }
             Some(status) if status.reachable == Some(false) => ConfiguredPeerStatus::Offline,
             _ => ConfiguredPeerStatus::Unknown,
+        }
+    }
+
+    fn peer_presence_state_for(
+        &self,
+        participant: &str,
+        own_pubkey_hex: Option<&str>,
+    ) -> PeerPresenceStatus {
+        if Some(participant) == own_pubkey_hex {
+            return PeerPresenceStatus::Local;
+        }
+
+        match self.peer_status.get(participant) {
+            Some(status) if status.reachable == Some(true) => PeerPresenceStatus::Present,
+            Some(status)
+                if within_peer_presence_grace(status.last_signal_seen_at, SystemTime::now()) =>
+            {
+                PeerPresenceStatus::Present
+            }
+            Some(status) if status.reachable == Some(false) => PeerPresenceStatus::Absent,
+            _ => PeerPresenceStatus::Unknown,
         }
     }
 
@@ -1530,6 +1641,25 @@ impl NvpnBackend {
                 match handshake_age {
                     Some(age_secs) => format!("online (handshake {age_secs}s ago)"),
                     None => "online".to_string(),
+                }
+            }
+            ConfiguredPeerStatus::Present => {
+                let Some(link) = self.peer_status.get(participant) else {
+                    return "awaiting WireGuard handshake".to_string();
+                };
+
+                match link
+                    .endpoint
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    Some(endpoint) => {
+                        format!(
+                            "awaiting WireGuard handshake via {}",
+                            shorten_middle(endpoint, 18, 10)
+                        )
+                    }
+                    None => "awaiting WireGuard handshake".to_string(),
                 }
             }
             ConfiguredPeerStatus::Offline => {
@@ -1761,6 +1891,7 @@ impl NvpnBackend {
             relay_connected: self.relay_connected,
             cli_installed: cli_binary_installed(),
             service_supported: self.service_supported,
+            service_enablement_supported: self.service_enablement_supported,
             service_installed: self.service_installed,
             service_disabled: self.service_disabled,
             service_running: self.service_running,
@@ -1800,6 +1931,19 @@ impl NvpnBackend {
             self.daemon_running,
         )
     }
+
+    fn gui_requires_service_enable(&self) -> bool {
+        gui_requires_service_enable(
+            self.service_enablement_supported,
+            self.service_installed,
+            self.service_disabled,
+            self.daemon_running,
+        )
+    }
+
+    fn gui_requires_service_action(&self) -> bool {
+        self.gui_requires_service_install() || self.gui_requires_service_enable()
+    }
 }
 
 fn within_peer_online_grace(last_handshake_at: Option<SystemTime>, now: SystemTime) -> bool {
@@ -1811,12 +1955,30 @@ fn within_peer_online_grace(last_handshake_at: Option<SystemTime>, now: SystemTi
         .unwrap_or(false)
 }
 
+fn within_peer_presence_grace(last_signal_seen_at: Option<SystemTime>, now: SystemTime) -> bool {
+    let Some(last_signal_seen_at) = last_signal_seen_at else {
+        return false;
+    };
+    now.duration_since(last_signal_seen_at)
+        .map(|elapsed| elapsed.as_secs() <= PEER_PRESENCE_GRACE_SECS)
+        .unwrap_or(false)
+}
+
 fn gui_requires_service_install(
     service_supported: bool,
     service_installed: bool,
     daemon_running: bool,
 ) -> bool {
     service_supported && !service_installed && !daemon_running
+}
+
+fn gui_requires_service_enable(
+    service_enablement_supported: bool,
+    service_installed: bool,
+    service_disabled: bool,
+    daemon_running: bool,
+) -> bool {
+    service_enablement_supported && service_installed && service_disabled && !daemon_running
 }
 
 fn should_start_gui_daemon_on_launch(
@@ -1832,6 +1994,14 @@ fn gui_service_setup_status_text(autoconnect: bool) -> &'static str {
         GUI_SERVICE_SETUP_REQUIRED_AUTOCONNECT_STATUS
     } else {
         GUI_SERVICE_SETUP_REQUIRED_STATUS
+    }
+}
+
+fn gui_service_enable_status_text(autoconnect: bool) -> &'static str {
+    if autoconnect {
+        "Background service is disabled in launchd; enable it to auto-connect from the app"
+    } else {
+        "Background service is disabled in launchd; enable it to turn VPN on from the app"
     }
 }
 
@@ -2088,8 +2258,18 @@ fn peer_state_label(state: ConfiguredPeerStatus) -> &'static str {
     match state {
         ConfiguredPeerStatus::Local => "local",
         ConfiguredPeerStatus::Online => "online",
+        ConfiguredPeerStatus::Present => "pending",
         ConfiguredPeerStatus::Offline => "offline",
         ConfiguredPeerStatus::Unknown => "unknown",
+    }
+}
+
+fn peer_presence_state_label(state: PeerPresenceStatus) -> &'static str {
+    match state {
+        PeerPresenceStatus::Local => "local",
+        PeerPresenceStatus::Present => "present",
+        PeerPresenceStatus::Absent => "absent",
+        PeerPresenceStatus::Unknown => "unknown",
     }
 }
 
@@ -2255,9 +2435,15 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Resu
     Ok(())
 }
 
-fn tray_vpn_toggle_label(session_active: bool, service_setup_required: bool) -> &'static str {
+fn tray_vpn_toggle_label(
+    session_active: bool,
+    service_setup_required: bool,
+    service_enable_required: bool,
+) -> &'static str {
     if service_setup_required && !session_active {
         "Install Service"
+    } else if service_enable_required && !session_active {
+        "Enable Service"
     } else if session_active {
         "Turn VPN Off"
     } else {
@@ -2269,6 +2455,7 @@ fn tray_vpn_toggle_label(session_active: bool, service_setup_required: bool) -> 
 struct TrayRuntimeState {
     session_active: bool,
     service_setup_required: bool,
+    service_enable_required: bool,
 }
 
 fn current_tray_runtime_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> TrayRuntimeState {
@@ -2276,17 +2463,20 @@ fn current_tray_runtime_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> T
         return TrayRuntimeState {
             session_active: false,
             service_setup_required: false,
+            service_enable_required: false,
         };
     };
     let Ok(backend) = state.backend.lock() else {
         return TrayRuntimeState {
             session_active: false,
             service_setup_required: false,
+            service_enable_required: false,
         };
     };
     TrayRuntimeState {
         session_active: backend.session_active,
         service_setup_required: backend.gui_requires_service_install(),
+        service_enable_required: backend.gui_requires_service_enable(),
     }
 }
 
@@ -2300,6 +2490,7 @@ fn build_tray_menu<R: tauri::Runtime>(
         tray_vpn_toggle_label(
             runtime_state.session_active,
             runtime_state.service_setup_required,
+            runtime_state.service_enable_required,
         ),
     )
     .build(app)?;
@@ -2338,6 +2529,8 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Ok(menu) = build_tray_menu(app, runtime_state) {
         if tray.set_menu(Some(menu)).is_ok() {
             *last_tray_runtime_state = runtime_state;
+        }
+    }
 }
 
 fn run_tray_backend_action<R: tauri::Runtime>(
@@ -2423,6 +2616,24 @@ fn install_system_service(state: State<'_, AppState>) -> Result<UiState, String>
 fn uninstall_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
     with_backend(state, |backend| {
         backend.uninstall_system_service()?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+}
+
+#[tauri::command]
+fn enable_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
+    with_backend(state, |backend| {
+        backend.enable_system_service()?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+}
+
+#[tauri::command]
+fn disable_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
+    with_backend(state, |backend| {
+        backend.disable_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
     })
@@ -2550,6 +2761,7 @@ pub fn run() {
     let initial_tray_state = TrayRuntimeState {
         session_active: backend.session_active,
         service_setup_required: backend.gui_requires_service_install(),
+        service_enable_required: backend.gui_requires_service_enable(),
     };
     let launched_from_autostart = started_from_autostart();
     let app = tauri::Builder::default()
@@ -2596,6 +2808,16 @@ pub fn run() {
                                 backend
                                     .install_system_service()
                                     .context("failed to install background service")?;
+                                backend.tick();
+                                if !backend.session_active {
+                                    backend
+                                        .connect_session()
+                                        .context("failed to resume VPN session")?;
+                                }
+                            } else if runtime_state.service_enable_required {
+                                backend
+                                    .enable_system_service()
+                                    .context("failed to enable background service")?;
                                 backend.tick();
                                 if !backend.session_active {
                                     backend
@@ -2658,6 +2880,8 @@ pub fn run() {
             uninstall_cli,
             install_system_service,
             uninstall_system_service,
+            enable_system_service,
+            disable_system_service,
             add_network,
             rename_network,
             remove_network,
@@ -2686,10 +2910,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cli_binary_installed_at, expected_peer_count, extract_json_document,
-        gui_requires_service_install, is_already_running_message, is_mesh_complete,
-        is_not_running_message, should_start_gui_daemon_on_launch, started_from_autostart_args,
-        to_npub, validate_nvpn_binary, within_peer_online_grace,
+        ConfiguredPeerStatus, PeerPresenceStatus, cli_binary_installed_at, expected_peer_count,
+        extract_json_document, gui_requires_service_enable, gui_requires_service_install,
+        is_already_running_message, is_mesh_complete, is_not_running_message,
+        peer_presence_state_label, peer_state_label, should_start_gui_daemon_on_launch,
+        started_from_autostart_args, to_npub, validate_nvpn_binary, within_peer_online_grace,
+        within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -2777,6 +3003,33 @@ mod tests {
     }
 
     #[test]
+    fn peer_presence_grace_keeps_recent_signal_present() {
+        let now = SystemTime::now();
+        assert!(within_peer_presence_grace(
+            Some(now - Duration::from_secs(5)),
+            now
+        ));
+        assert!(!within_peer_presence_grace(
+            Some(now - Duration::from_secs(90)),
+            now
+        ));
+        assert!(!within_peer_presence_grace(None, now));
+    }
+
+    #[test]
+    fn peer_labels_distinguish_transport_and_presence() {
+        assert_eq!(peer_state_label(ConfiguredPeerStatus::Present), "pending");
+        assert_eq!(
+            peer_presence_state_label(PeerPresenceStatus::Present),
+            "present"
+        );
+        assert_eq!(
+            peer_presence_state_label(PeerPresenceStatus::Absent),
+            "absent"
+        );
+    }
+
+    #[test]
     fn validate_nvpn_binary_rejects_missing_path() {
         let result = validate_nvpn_binary("/path/that/does/not/exist".into());
         assert!(result.is_err());
@@ -2800,6 +3053,15 @@ mod tests {
         assert!(!gui_requires_service_install(true, false, true));
         assert!(!gui_requires_service_install(true, true, false));
         assert!(!gui_requires_service_install(false, false, false));
+    }
+
+    #[test]
+    fn gui_requires_service_enable_only_when_service_is_disabled_and_idle() {
+        assert!(gui_requires_service_enable(true, true, true, false));
+        assert!(!gui_requires_service_enable(true, true, true, true));
+        assert!(!gui_requires_service_enable(true, true, false, false));
+        assert!(!gui_requires_service_enable(true, false, true, false));
+        assert!(!gui_requires_service_enable(false, true, true, false));
     }
 
     #[test]
