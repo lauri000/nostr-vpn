@@ -95,6 +95,7 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} -p nostr-vpn-cli -p nostr-vpn-relay
           if [ "${{ matrix.gui }}" = "true" ]; then
+            pnpm --dir crates/nostr-vpn-gui prepare:sidecar:release
             cargo build --release --target ${{ matrix.target }} -p nostr-vpn-gui
           fi
 
