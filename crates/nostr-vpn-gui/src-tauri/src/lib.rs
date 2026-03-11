@@ -20,7 +20,9 @@ use nostr_vpn_core::config::{
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use tauri::image::Image;
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::menu::{
+    CheckMenuItemBuilder, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder,
+};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State, WindowEvent};
 use tokio::runtime::Runtime;
@@ -32,7 +34,10 @@ const PEER_ONLINE_GRACE_SECS: u64 = 20;
 const PEER_PRESENCE_GRACE_SECS: u64 = 45;
 const TRAY_ICON_ID: &str = "nvpn-tray";
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
+const TRAY_IDENTITY_MENU_ID: &str = "tray_identity";
 const TRAY_VPN_TOGGLE_MENU_ID: &str = "tray_vpn_toggle";
+const TRAY_EXIT_NODE_NONE_MENU_ID: &str = "tray_exit_node_none";
+const TRAY_EXIT_NODE_MENU_ID_PREFIX: &str = "tray_exit_node::";
 const TRAY_QUIT_UI_MENU_ID: &str = "tray_quit_ui";
 const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
@@ -252,7 +257,7 @@ struct UiState {
     lan_peers: Vec<LanPeerView>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct SettingsPatch {
     node_name: Option<String>,
@@ -268,6 +273,67 @@ struct SettingsPatch {
     lan_discovery_enabled: Option<bool>,
     launch_on_startup: Option<bool>,
     close_to_tray_on_close: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrayNetworkGroup {
+    title: String,
+    devices: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrayExitNodeEntry {
+    pubkey_hex: String,
+    title: String,
+    selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrayMenuItemSpec {
+    Check {
+        id: String,
+        text: String,
+        enabled: bool,
+        checked: bool,
+    },
+    Text {
+        id: Option<String>,
+        text: String,
+        enabled: bool,
+    },
+    Submenu {
+        text: String,
+        enabled: bool,
+        items: Vec<TrayMenuItemSpec>,
+    },
+    Separator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrayRuntimeState {
+    session_active: bool,
+    service_setup_required: bool,
+    service_enable_required: bool,
+    status_text: String,
+    identity_text: String,
+    this_device_text: String,
+    network_groups: Vec<TrayNetworkGroup>,
+    exit_nodes: Vec<TrayExitNodeEntry>,
+}
+
+impl Default for TrayRuntimeState {
+    fn default() -> Self {
+        Self {
+            session_active: false,
+            service_setup_required: false,
+            service_enable_required: false,
+            status_text: "Disconnected".to_string(),
+            identity_text: "Identity: unavailable".to_string(),
+            this_device_text: "This Device: unavailable".to_string(),
+            network_groups: Vec::new(),
+            exit_nodes: Vec::new(),
+        }
+    }
 }
 
 struct NvpnBackend {
@@ -1963,7 +2029,9 @@ impl NvpnBackend {
             endpoint: self.config.node.endpoint.clone(),
             tunnel_ip: self.config.node.tunnel_ip.clone(),
             listen_port: self.config.node.listen_port,
-            exit_node: self.npub_or_none(&self.config.exit_node).unwrap_or_default(),
+            exit_node: self
+                .npub_or_none(&self.config.exit_node)
+                .unwrap_or_default(),
             advertise_exit_node: self.config.node.advertise_exit_node,
             advertised_routes: self.config.node.advertised_routes.clone(),
             effective_advertised_routes: self.config.effective_advertised_routes(),
@@ -2005,6 +2073,37 @@ impl NvpnBackend {
 
     fn gui_requires_service_action(&self) -> bool {
         self.gui_requires_service_install() || self.gui_requires_service_enable()
+    }
+
+    fn tray_runtime_state(&self) -> TrayRuntimeState {
+        let networks = self.network_rows();
+        let identity = self
+            .config
+            .own_nostr_pubkey_hex()
+            .map(|hex| to_npub(&hex))
+            .unwrap_or_else(|_| self.config.nostr.public_key.clone());
+        let service_setup_required = self.gui_requires_service_install();
+        let service_enable_required = self.gui_requires_service_enable();
+
+        TrayRuntimeState {
+            session_active: self.session_active,
+            service_setup_required,
+            service_enable_required,
+            status_text: tray_status_text(
+                self.session_active,
+                service_setup_required,
+                service_enable_required,
+                &self.session_status,
+            ),
+            identity_text: format!("Identity: {}", short_text(&identity, 16, 8)),
+            this_device_text: format!(
+                "This Device: {} ({})",
+                self.config.node_name,
+                display_tunnel_ip(&self.config.node.tunnel_ip)
+            ),
+            network_groups: tray_network_groups(&networks),
+            exit_nodes: tray_exit_node_entries(&networks, &self.config.exit_node),
+        }
     }
 }
 
@@ -2546,75 +2645,348 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Resu
     Ok(())
 }
 
-fn tray_vpn_toggle_label(
-    session_active: bool,
-    service_setup_required: bool,
-    service_enable_required: bool,
-) -> &'static str {
-    if service_setup_required && !session_active {
-        "Install Service"
-    } else if service_enable_required && !session_active {
-        "Enable Service"
-    } else if session_active {
-        "Turn VPN Off"
+fn short_text(value: &str, leading: usize, trailing: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= leading + trailing + 3 {
+        return value.to_string();
+    }
+
+    format!(
+        "{}...{}",
+        chars.iter().take(leading).collect::<String>(),
+        chars[chars.len() - trailing..].iter().collect::<String>()
+    )
+}
+
+fn display_tunnel_ip(tunnel_ip: &str) -> String {
+    let trimmed = tunnel_ip.trim();
+    if trimmed.is_empty() {
+        "-".to_string()
     } else {
-        "Turn VPN On"
+        trimmed.split('/').next().unwrap_or(trimmed).to_string()
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct TrayRuntimeState {
+fn tray_status_text(
     session_active: bool,
     service_setup_required: bool,
     service_enable_required: bool,
+    session_status: &str,
+) -> String {
+    if session_active {
+        "Connected".to_string()
+    } else if service_setup_required {
+        "Install background service".to_string()
+    } else if service_enable_required {
+        "Enable background service".to_string()
+    } else if session_status.trim().is_empty() || session_status == "Disconnected" {
+        "Disconnected".to_string()
+    } else {
+        session_status.to_string()
+    }
+}
+
+fn tray_participant_display_name(participant: &ParticipantView) -> String {
+    let alias = participant.magic_dns_alias.trim();
+    if !alias.is_empty() {
+        return alias.to_string();
+    }
+
+    if let Some(label) = participant
+        .magic_dns_name
+        .split('.')
+        .find(|segment| !segment.is_empty())
+    {
+        return label.to_string();
+    }
+
+    short_text(&participant.npub, 16, 8)
+}
+
+fn tray_network_groups(networks: &[NetworkView]) -> Vec<TrayNetworkGroup> {
+    let mut groups = Vec::new();
+
+    for network in networks.iter().filter(|network| network.enabled) {
+        let devices = network
+            .participants
+            .iter()
+            .filter(|participant| participant.state != "local")
+            .map(|participant| {
+                format!(
+                    "{} ({})",
+                    tray_participant_display_name(participant),
+                    participant.state
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if devices.is_empty() {
+            continue;
+        }
+
+        groups.push(TrayNetworkGroup {
+            title: format!(
+                "{} ({}/{} online)",
+                network.name, network.online_count, network.expected_count
+            ),
+            devices,
+        });
+    }
+
+    groups
+}
+
+fn tray_exit_node_entries(
+    networks: &[NetworkView],
+    selected_exit_node: &str,
+) -> Vec<TrayExitNodeEntry> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+
+    for network in networks.iter().filter(|network| network.enabled) {
+        for participant in &network.participants {
+            if participant.state == "local"
+                || !participant.offers_exit_node
+                || !seen.insert(participant.pubkey_hex.clone())
+            {
+                continue;
+            }
+
+            entries.push(TrayExitNodeEntry {
+                pubkey_hex: participant.pubkey_hex.clone(),
+                title: tray_participant_display_name(participant),
+                selected: participant.pubkey_hex == selected_exit_node,
+            });
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        left.title
+            .cmp(&right.title)
+            .then(left.pubkey_hex.cmp(&right.pubkey_hex))
+    });
+    entries
+}
+
+fn tray_menu_spec(runtime_state: &TrayRuntimeState) -> Vec<TrayMenuItemSpec> {
+    let mut network_items = Vec::new();
+    if runtime_state.network_groups.is_empty() {
+        network_items.push(TrayMenuItemSpec::Text {
+            id: None,
+            text: "No network devices configured".to_string(),
+            enabled: false,
+        });
+    } else {
+        for group in &runtime_state.network_groups {
+            network_items.push(TrayMenuItemSpec::Submenu {
+                text: group.title.clone(),
+                enabled: true,
+                items: group
+                    .devices
+                    .iter()
+                    .map(|device| TrayMenuItemSpec::Text {
+                        id: None,
+                        text: device.clone(),
+                        enabled: false,
+                    })
+                    .collect(),
+            });
+        }
+    }
+
+    let mut exit_node_items = vec![TrayMenuItemSpec::Check {
+        id: TRAY_EXIT_NODE_NONE_MENU_ID.to_string(),
+        text: "None".to_string(),
+        enabled: true,
+        checked: !runtime_state.exit_nodes.iter().any(|entry| entry.selected),
+    }];
+    exit_node_items.push(TrayMenuItemSpec::Separator);
+    if runtime_state.exit_nodes.is_empty() {
+        exit_node_items.push(TrayMenuItemSpec::Text {
+            id: None,
+            text: "No exit nodes available".to_string(),
+            enabled: false,
+        });
+    } else {
+        exit_node_items.extend(runtime_state.exit_nodes.iter().map(|entry| {
+            TrayMenuItemSpec::Check {
+                id: format!("{TRAY_EXIT_NODE_MENU_ID_PREFIX}{}", entry.pubkey_hex),
+                text: entry.title.clone(),
+                enabled: true,
+                checked: entry.selected,
+            }
+        }));
+    }
+
+    vec![
+        TrayMenuItemSpec::Check {
+            id: TRAY_VPN_TOGGLE_MENU_ID.to_string(),
+            text: "VPN On".to_string(),
+            enabled: true,
+            checked: runtime_state.session_active,
+        },
+        TrayMenuItemSpec::Text {
+            id: None,
+            text: runtime_state.status_text.clone(),
+            enabled: false,
+        },
+        TrayMenuItemSpec::Separator,
+        TrayMenuItemSpec::Text {
+            id: Some(TRAY_IDENTITY_MENU_ID.to_string()),
+            text: runtime_state.identity_text.clone(),
+            enabled: true,
+        },
+        TrayMenuItemSpec::Text {
+            id: None,
+            text: runtime_state.this_device_text.clone(),
+            enabled: false,
+        },
+        TrayMenuItemSpec::Submenu {
+            text: "Network Devices".to_string(),
+            enabled: true,
+            items: network_items,
+        },
+        TrayMenuItemSpec::Submenu {
+            text: "Exit Nodes".to_string(),
+            enabled: true,
+            items: exit_node_items,
+        },
+        TrayMenuItemSpec::Separator,
+        TrayMenuItemSpec::Text {
+            id: Some(TRAY_OPEN_MENU_ID.to_string()),
+            text: "Settings...".to_string(),
+            enabled: true,
+        },
+        TrayMenuItemSpec::Text {
+            id: Some(TRAY_QUIT_UI_MENU_ID.to_string()),
+            text: "Quit".to_string(),
+            enabled: true,
+        },
+    ]
 }
 
 fn current_tray_runtime_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> TrayRuntimeState {
     let Some(state) = app.try_state::<AppState>() else {
-        return TrayRuntimeState {
-            session_active: false,
-            service_setup_required: false,
-            service_enable_required: false,
-        };
+        return TrayRuntimeState::default();
     };
     let Ok(backend) = state.backend.lock() else {
-        return TrayRuntimeState {
-            session_active: false,
-            service_setup_required: false,
-            service_enable_required: false,
-        };
+        return TrayRuntimeState::default();
     };
-    TrayRuntimeState {
-        session_active: backend.session_active,
-        service_setup_required: backend.gui_requires_service_install(),
-        service_enable_required: backend.gui_requires_service_enable(),
+    backend.tray_runtime_state()
+}
+
+fn append_tray_spec_to_menu<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    menu: &Menu<R>,
+    spec: &TrayMenuItemSpec,
+) -> tauri::Result<()> {
+    match spec {
+        TrayMenuItemSpec::Check {
+            id,
+            text,
+            enabled,
+            checked,
+        } => {
+            let item = CheckMenuItemBuilder::with_id(id.clone(), text)
+                .enabled(*enabled)
+                .checked(*checked)
+                .build(app)?;
+            menu.append(&item)?;
+        }
+        TrayMenuItemSpec::Text { id, text, enabled } => {
+            let item = if let Some(id) = id {
+                MenuItemBuilder::with_id(id.clone(), text)
+                    .enabled(*enabled)
+                    .build(app)?
+            } else {
+                MenuItemBuilder::new(text).enabled(*enabled).build(app)?
+            };
+            menu.append(&item)?;
+        }
+        TrayMenuItemSpec::Submenu {
+            text,
+            enabled,
+            items,
+        } => {
+            let submenu = build_tray_submenu_from_spec(app, text, *enabled, items)?;
+            menu.append(&submenu)?;
+        }
+        TrayMenuItemSpec::Separator => {
+            let separator = PredefinedMenuItem::separator(app)?;
+            menu.append(&separator)?;
+        }
     }
+
+    Ok(())
+}
+
+fn append_tray_spec_to_submenu<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    submenu: &Submenu<R>,
+    spec: &TrayMenuItemSpec,
+) -> tauri::Result<()> {
+    match spec {
+        TrayMenuItemSpec::Check {
+            id,
+            text,
+            enabled,
+            checked,
+        } => {
+            let item = CheckMenuItemBuilder::with_id(id.clone(), text)
+                .enabled(*enabled)
+                .checked(*checked)
+                .build(app)?;
+            submenu.append(&item)?;
+        }
+        TrayMenuItemSpec::Text { id, text, enabled } => {
+            let item = if let Some(id) = id {
+                MenuItemBuilder::with_id(id.clone(), text)
+                    .enabled(*enabled)
+                    .build(app)?
+            } else {
+                MenuItemBuilder::new(text).enabled(*enabled).build(app)?
+            };
+            submenu.append(&item)?;
+        }
+        TrayMenuItemSpec::Submenu {
+            text,
+            enabled,
+            items,
+        } => {
+            let child = build_tray_submenu_from_spec(app, text, *enabled, items)?;
+            submenu.append(&child)?;
+        }
+        TrayMenuItemSpec::Separator => {
+            let separator = PredefinedMenuItem::separator(app)?;
+            submenu.append(&separator)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_tray_submenu_from_spec<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    text: &str,
+    enabled: bool,
+    items: &[TrayMenuItemSpec],
+) -> tauri::Result<Submenu<R>> {
+    let submenu = SubmenuBuilder::new(app, text).enabled(enabled).build()?;
+    for item in items {
+        append_tray_spec_to_submenu(app, &submenu, item)?;
+    }
+    Ok(submenu)
 }
 
 fn build_tray_menu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    runtime_state: TrayRuntimeState,
-) -> tauri::Result<tauri::menu::Menu<R>> {
-    let open_item = MenuItemBuilder::with_id(TRAY_OPEN_MENU_ID, "Open Nostr VPN").build(app)?;
-    let vpn_toggle_item = MenuItemBuilder::with_id(
-        TRAY_VPN_TOGGLE_MENU_ID,
-        tray_vpn_toggle_label(
-            runtime_state.session_active,
-            runtime_state.service_setup_required,
-            runtime_state.service_enable_required,
-        ),
-    )
-    .build(app)?;
-    let quit_ui_item =
-        MenuItemBuilder::with_id(TRAY_QUIT_UI_MENU_ID, "Quit Nostr VPN").build(app)?;
-
-    MenuBuilder::new(app)
-        .item(&open_item)
-        .separator()
-        .item(&vpn_toggle_item)
-        .separator()
-        .item(&quit_ui_item)
-        .build()
+    runtime_state: &TrayRuntimeState,
+) -> tauri::Result<Menu<R>> {
+    let menu = Menu::new(app)?;
+    for item in tray_menu_spec(runtime_state) {
+        append_tray_spec_to_menu(app, &menu, &item)?;
+    }
+    Ok(menu)
 }
 
 fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -2624,7 +2996,7 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 
     let runtime_state = current_tray_runtime_state(app);
     let Some(state) = app.try_state::<AppState>() else {
-        if let Ok(menu) = build_tray_menu(app, runtime_state) {
+        if let Ok(menu) = build_tray_menu(app, &runtime_state) {
             let _ = tray.set_menu(Some(menu));
         }
         return;
@@ -2637,7 +3009,7 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         return;
     }
 
-    if let Ok(menu) = build_tray_menu(app, runtime_state)
+    if let Ok(menu) = build_tray_menu(app, &runtime_state)
         && tray.set_menu(Some(menu)).is_ok()
     {
         *last_tray_runtime_state = runtime_state;
@@ -2715,121 +3087,168 @@ fn uninstall_cli(state: State<'_, AppState>) -> Result<UiState, String> {
 }
 
 #[tauri::command]
-fn install_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn install_system_service(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.install_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
-fn uninstall_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn uninstall_system_service(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.uninstall_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
-fn enable_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn enable_system_service(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.enable_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
-fn disable_system_service(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn disable_system_service(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.disable_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
-fn add_network(state: State<'_, AppState>, name: String) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn add_network(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.add_network(&name)?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
 fn rename_network(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     name: String,
 ) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+    let ui = with_backend(state, |backend| {
         backend.rename_network(&network_id, &name)?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
-fn remove_network(state: State<'_, AppState>, network_id: String) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn remove_network(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    network_id: String,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.remove_network(&network_id)?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
 fn set_network_enabled(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     enabled: bool,
 ) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+    let ui = with_backend(state, |backend| {
         backend.set_network_enabled(&network_id, enabled)?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
 fn add_participant(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     npub: String,
     alias: Option<String>,
 ) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+    let ui = with_backend(state, |backend| {
         backend.add_participant(&network_id, &npub, alias.as_deref())?;
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
 fn remove_participant(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     npub: String,
 ) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+    let ui = with_backend(state, |backend| {
         backend.remove_participant(&network_id, &npub)?;
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
 fn set_participant_alias(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     npub: String,
     alias: String,
 ) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+    let ui = with_backend(state, |backend| {
         backend.set_participant_alias(&npub, &alias)?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[tauri::command]
@@ -2851,12 +3270,18 @@ fn remove_relay(state: State<'_, AppState>, relay: String) -> Result<UiState, St
 }
 
 #[tauri::command]
-fn update_settings(state: State<'_, AppState>, patch: SettingsPatch) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+fn update_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    patch: SettingsPatch,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
         backend.update_settings(patch)?;
         backend.tick();
         Ok(backend.ui_state())
-    })
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2869,11 +3294,8 @@ pub fn run() {
 
     let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
     let launch_on_startup_default = backend.config.launch_on_startup;
-    let initial_tray_state = TrayRuntimeState {
-        session_active: backend.session_active,
-        service_setup_required: backend.gui_requires_service_install(),
-        service_enable_required: backend.gui_requires_service_enable(),
-    };
+    let initial_tray_state = backend.tray_runtime_state();
+    let setup_tray_state = initial_tray_state.clone();
     let launched_from_autostart = started_from_autostart();
     let mut builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -2908,55 +3330,84 @@ pub fn run() {
                 }
             }
 
-            let tray_menu = build_tray_menu(app.handle(), initial_tray_state)?;
+            let tray_menu = build_tray_menu(app.handle(), &setup_tray_state)?;
 
             let tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
                 .tooltip("Nostr VPN")
                 .menu(&tray_menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    TRAY_OPEN_MENU_ID => {
-                        let _ = show_main_window(app);
-                    }
-                    TRAY_VPN_TOGGLE_MENU_ID => {
-                        let runtime_state = current_tray_runtime_state(app);
-                        run_tray_backend_action(app, |backend| {
-                            if runtime_state.session_active {
-                                backend
-                                    .disconnect_session()
-                                    .context("failed to pause VPN session")?;
-                            } else if runtime_state.service_setup_required {
-                                backend
-                                    .install_system_service()
-                                    .context("failed to install background service")?;
-                                backend.tick();
-                                if !backend.session_active {
+                .on_menu_event(|app, event| {
+                    let menu_id = event.id().as_ref();
+                    match menu_id {
+                        TRAY_OPEN_MENU_ID | TRAY_IDENTITY_MENU_ID => {
+                            let _ = show_main_window(app);
+                        }
+                        TRAY_VPN_TOGGLE_MENU_ID => {
+                            let runtime_state = current_tray_runtime_state(app);
+                            run_tray_backend_action(app, |backend| {
+                                if runtime_state.session_active {
+                                    backend
+                                        .disconnect_session()
+                                        .context("failed to pause VPN session")?;
+                                } else if runtime_state.service_setup_required {
+                                    backend
+                                        .install_system_service()
+                                        .context("failed to install background service")?;
+                                    backend.tick();
+                                    if !backend.session_active {
+                                        backend
+                                            .connect_session()
+                                            .context("failed to resume VPN session")?;
+                                    }
+                                } else if runtime_state.service_enable_required {
+                                    backend
+                                        .enable_system_service()
+                                        .context("failed to enable background service")?;
+                                    backend.tick();
+                                    if !backend.session_active {
+                                        backend
+                                            .connect_session()
+                                            .context("failed to resume VPN session")?;
+                                    }
+                                } else {
                                     backend
                                         .connect_session()
                                         .context("failed to resume VPN session")?;
                                 }
-                            } else if runtime_state.service_enable_required {
+                                Ok(())
+                            });
+                            refresh_tray_menu(app);
+                        }
+                        TRAY_EXIT_NODE_NONE_MENU_ID => {
+                            run_tray_backend_action(app, |backend| {
                                 backend
-                                    .enable_system_service()
-                                    .context("failed to enable background service")?;
-                                backend.tick();
-                                if !backend.session_active {
-                                    backend
-                                        .connect_session()
-                                        .context("failed to resume VPN session")?;
-                                }
-                            } else {
+                                    .update_settings(SettingsPatch {
+                                        exit_node: Some(String::new()),
+                                        ..Default::default()
+                                    })
+                                    .context("failed to clear exit node")
+                            });
+                            refresh_tray_menu(app);
+                        }
+                        TRAY_QUIT_UI_MENU_ID => {
+                            app.exit(0);
+                        }
+                        _ if menu_id.starts_with(TRAY_EXIT_NODE_MENU_ID_PREFIX) => {
+                            let selected = menu_id
+                                .strip_prefix(TRAY_EXIT_NODE_MENU_ID_PREFIX)
+                                .unwrap_or_default()
+                                .to_string();
+                            run_tray_backend_action(app, |backend| {
                                 backend
-                                    .connect_session()
-                                    .context("failed to resume VPN session")?;
-                            }
-                            Ok(())
-                        });
-                        refresh_tray_menu(app);
+                                    .update_settings(SettingsPatch {
+                                        exit_node: Some(selected),
+                                        ..Default::default()
+                                    })
+                                    .context("failed to set exit node")
+                            });
+                            refresh_tray_menu(app);
+                        }
+                        _ => {}
                     }
-                    TRAY_QUIT_UI_MENU_ID => {
-                        app.exit(0);
-                    }
-                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -3030,13 +3481,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredPeerStatus, PeerPresenceStatus, cli_binary_installed_at, expected_peer_count,
-        extract_json_document, gui_requires_service_enable, gui_requires_service_install,
-        is_already_running_message, is_mesh_complete, is_not_running_message,
-        parse_advertised_routes_input, parse_exit_node_input, peer_offers_exit_node,
-        peer_presence_state_label, peer_state_label, should_start_gui_daemon_on_launch,
-        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
-        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
+        ConfiguredPeerStatus, NetworkView, ParticipantView, PeerPresenceStatus, TrayMenuItemSpec,
+        TrayRuntimeState, cli_binary_installed_at, expected_peer_count, extract_json_document,
+        gui_requires_service_enable, gui_requires_service_install, is_already_running_message,
+        is_mesh_complete, is_not_running_message, parse_advertised_routes_input,
+        parse_exit_node_input, peer_offers_exit_node, peer_presence_state_label, peer_state_label,
+        should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
+        started_from_autostart_args, to_npub, tray_exit_node_entries, tray_menu_spec,
+        tray_network_groups, tray_status_text, validate_nvpn_binary, within_peer_online_grace,
+        within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -3186,6 +3639,216 @@ mod tests {
             parse_exit_node_input("").expect("empty should clear selection"),
             String::new()
         );
+    }
+
+    #[test]
+    fn tray_network_groups_skip_disabled_networks_and_local_participants() {
+        let groups = tray_network_groups(&[
+            NetworkView {
+                id: "home".to_string(),
+                name: "Home".to_string(),
+                enabled: true,
+                online_count: 1,
+                expected_count: 2,
+                participants: vec![
+                    ParticipantView {
+                        npub: "npub1local".to_string(),
+                        pubkey_hex: "local".to_string(),
+                        tunnel_ip: "10.44.0.10".to_string(),
+                        magic_dns_alias: "self".to_string(),
+                        magic_dns_name: "self.nvpn".to_string(),
+                        advertised_routes: Vec::new(),
+                        offers_exit_node: false,
+                        state: "local".to_string(),
+                        presence_state: "local".to_string(),
+                        status_text: "local".to_string(),
+                        last_signal_text: "now".to_string(),
+                    },
+                    ParticipantView {
+                        npub: "npub1alice".to_string(),
+                        pubkey_hex: "alice".to_string(),
+                        tunnel_ip: "10.44.0.11".to_string(),
+                        magic_dns_alias: "alice".to_string(),
+                        magic_dns_name: "alice.nvpn".to_string(),
+                        advertised_routes: Vec::new(),
+                        offers_exit_node: false,
+                        state: "online".to_string(),
+                        presence_state: "present".to_string(),
+                        status_text: "online".to_string(),
+                        last_signal_text: "just now".to_string(),
+                    },
+                ],
+            },
+            NetworkView {
+                id: "lab".to_string(),
+                name: "Lab".to_string(),
+                enabled: false,
+                online_count: 0,
+                expected_count: 1,
+                participants: vec![ParticipantView {
+                    npub: "npub1bob".to_string(),
+                    pubkey_hex: "bob".to_string(),
+                    tunnel_ip: "10.44.0.12".to_string(),
+                    magic_dns_alias: "bob".to_string(),
+                    magic_dns_name: "bob.nvpn".to_string(),
+                    advertised_routes: Vec::new(),
+                    offers_exit_node: false,
+                    state: "offline".to_string(),
+                    presence_state: "absent".to_string(),
+                    status_text: "offline".to_string(),
+                    last_signal_text: "1m ago".to_string(),
+                }],
+            },
+        ]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "Home (1/2 online)");
+        assert_eq!(groups[0].devices, vec!["alice (online)".to_string()]);
+    }
+
+    #[test]
+    fn tray_exit_nodes_deduplicate_and_mark_selected_entry() {
+        let entries = tray_exit_node_entries(
+            &[
+                NetworkView {
+                    id: "home".to_string(),
+                    name: "Home".to_string(),
+                    enabled: true,
+                    online_count: 1,
+                    expected_count: 1,
+                    participants: vec![ParticipantView {
+                        npub: "npub1alice".to_string(),
+                        pubkey_hex: "alice".to_string(),
+                        tunnel_ip: "10.44.0.11".to_string(),
+                        magic_dns_alias: "alice".to_string(),
+                        magic_dns_name: "alice.nvpn".to_string(),
+                        advertised_routes: vec!["0.0.0.0/0".to_string()],
+                        offers_exit_node: true,
+                        state: "online".to_string(),
+                        presence_state: "present".to_string(),
+                        status_text: "online".to_string(),
+                        last_signal_text: "just now".to_string(),
+                    }],
+                },
+                NetworkView {
+                    id: "work".to_string(),
+                    name: "Work".to_string(),
+                    enabled: true,
+                    online_count: 1,
+                    expected_count: 1,
+                    participants: vec![
+                        ParticipantView {
+                            npub: "npub1alice".to_string(),
+                            pubkey_hex: "alice".to_string(),
+                            tunnel_ip: "10.44.0.11".to_string(),
+                            magic_dns_alias: "alice".to_string(),
+                            magic_dns_name: "alice.nvpn".to_string(),
+                            advertised_routes: vec!["0.0.0.0/0".to_string()],
+                            offers_exit_node: true,
+                            state: "online".to_string(),
+                            presence_state: "present".to_string(),
+                            status_text: "online".to_string(),
+                            last_signal_text: "just now".to_string(),
+                        },
+                        ParticipantView {
+                            npub: "npub1bob".to_string(),
+                            pubkey_hex: "bob".to_string(),
+                            tunnel_ip: "10.44.0.12".to_string(),
+                            magic_dns_alias: "bob".to_string(),
+                            magic_dns_name: "bob.nvpn".to_string(),
+                            advertised_routes: vec!["::/0".to_string()],
+                            offers_exit_node: true,
+                            state: "offline".to_string(),
+                            presence_state: "absent".to_string(),
+                            status_text: "offline".to_string(),
+                            last_signal_text: "1m ago".to_string(),
+                        },
+                    ],
+                },
+            ],
+            "bob",
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].title, "alice");
+        assert!(!entries[0].selected);
+        assert_eq!(entries[1].title, "bob");
+        assert!(entries[1].selected);
+    }
+
+    #[test]
+    fn tray_menu_spec_puts_toggle_first_and_settings_last() {
+        let spec = tray_menu_spec(&TrayRuntimeState {
+            session_active: true,
+            service_setup_required: false,
+            service_enable_required: false,
+            status_text: tray_status_text(true, false, false, "Connected"),
+            identity_text: "Identity: npub1alice...xyz".to_string(),
+            this_device_text: "This Device: sirius (10.44.0.10)".to_string(),
+            network_groups: tray_network_groups(&[NetworkView {
+                id: "home".to_string(),
+                name: "Home".to_string(),
+                enabled: true,
+                online_count: 1,
+                expected_count: 1,
+                participants: vec![ParticipantView {
+                    npub: "npub1alice".to_string(),
+                    pubkey_hex: "alice".to_string(),
+                    tunnel_ip: "10.44.0.11".to_string(),
+                    magic_dns_alias: "alice".to_string(),
+                    magic_dns_name: "alice.nvpn".to_string(),
+                    advertised_routes: Vec::new(),
+                    offers_exit_node: false,
+                    state: "online".to_string(),
+                    presence_state: "present".to_string(),
+                    status_text: "online".to_string(),
+                    last_signal_text: "just now".to_string(),
+                }],
+            }]),
+            exit_nodes: tray_exit_node_entries(&[], ""),
+        });
+
+        assert!(matches!(
+            spec.first(),
+            Some(TrayMenuItemSpec::Check {
+                text,
+                checked: true,
+                ..
+            }) if text == "VPN On"
+        ));
+        assert!(matches!(
+            spec.iter().find(|item| matches!(
+                item,
+                TrayMenuItemSpec::Submenu { text, .. } if text == "Network Devices"
+            )),
+            Some(_)
+        ));
+        assert!(matches!(
+            spec.iter().find(|item| matches!(
+                item,
+                TrayMenuItemSpec::Submenu { text, .. } if text == "Exit Nodes"
+            )),
+            Some(_)
+        ));
+        assert!(matches!(
+            spec.iter().find(|item| matches!(
+                item,
+                TrayMenuItemSpec::Text {
+                    text,
+                    enabled: true,
+                    ..
+                } if text == "Settings..."
+            )),
+            Some(_)
+        ));
+        assert!(matches!(
+            spec.last(),
+            Some(TrayMenuItemSpec::Text {
+                text,
+                enabled: true,
+                ..
+            }) if text == "Quit"
+        ));
     }
 
     #[test]
