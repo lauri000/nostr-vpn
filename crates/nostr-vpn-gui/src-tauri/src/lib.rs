@@ -2625,6 +2625,112 @@ where
     !started_from_autostart_args(args)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningGuiInstance {
+    pid: u32,
+    autostart: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuiLaunchDisposition {
+    Continue { terminate_pids: Vec<u32> },
+    Exit,
+}
+
+fn is_nostr_vpn_gui_process(command: &str) -> bool {
+    command.contains("Contents/MacOS/nostr-vpn-gui")
+        || command.ends_with("nostr-vpn-gui")
+        || command.contains("/nostr-vpn-gui ")
+        || command.contains("/nostr-vpn-gui --")
+}
+
+fn parse_running_gui_instances(raw: &str, current_pid: u32) -> Vec<RunningGuiInstance> {
+    raw.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let pid_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            let pid = trimmed[..pid_end].parse::<u32>().ok()?;
+            if pid == current_pid {
+                return None;
+            }
+
+            let command = trimmed[pid_end..].trim();
+            if !is_nostr_vpn_gui_process(command) {
+                return None;
+            }
+
+            Some(RunningGuiInstance {
+                pid,
+                autostart: started_from_autostart_args(command.split_whitespace()),
+            })
+        })
+        .collect()
+}
+
+fn gui_launch_disposition(
+    launched_from_autostart: bool,
+    other_instances: &[RunningGuiInstance],
+) -> GuiLaunchDisposition {
+    if launched_from_autostart {
+        if other_instances.is_empty() {
+            GuiLaunchDisposition::Continue {
+                terminate_pids: Vec::new(),
+            }
+        } else {
+            GuiLaunchDisposition::Exit
+        }
+    } else {
+        let terminate_pids = other_instances
+            .iter()
+            .filter(|instance| instance.autostart)
+            .map(|instance| instance.pid)
+            .collect::<Vec<_>>();
+        GuiLaunchDisposition::Continue { terminate_pids }
+    }
+}
+
+#[cfg(unix)]
+fn resolve_gui_launch_conflicts(launched_from_autostart: bool) -> Result<GuiLaunchDisposition> {
+    let output = ProcessCommand::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .context("failed to list running GUI processes")?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let other_instances = parse_running_gui_instances(&raw, std::process::id());
+    Ok(gui_launch_disposition(
+        launched_from_autostart,
+        &other_instances,
+    ))
+}
+
+#[cfg(not(unix))]
+fn resolve_gui_launch_conflicts(_launched_from_autostart: bool) -> Result<GuiLaunchDisposition> {
+    Ok(GuiLaunchDisposition::Continue {
+        terminate_pids: Vec::new(),
+    })
+}
+
+#[cfg(unix)]
+fn terminate_gui_instances(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+
+    let mut command = ProcessCommand::new("kill");
+    for pid in pids {
+        command.arg(pid.to_string());
+    }
+    let _ = command.status();
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+#[cfg(not(unix))]
+fn terminate_gui_instances(_pids: &[u32]) {}
+
 fn hide_main_window_to_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -3297,6 +3403,15 @@ pub fn run() {
     let initial_tray_state = backend.tray_runtime_state();
     let setup_tray_state = initial_tray_state.clone();
     let launched_from_autostart = started_from_autostart();
+    match resolve_gui_launch_conflicts(launched_from_autostart) {
+        Ok(GuiLaunchDisposition::Continue { terminate_pids }) => {
+            terminate_gui_instances(&terminate_pids);
+        }
+        Ok(GuiLaunchDisposition::Exit) => return,
+        Err(error) => {
+            eprintln!("gui: failed to resolve GUI launch conflicts: {error}");
+        }
+    }
     let mut builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     {
@@ -3481,15 +3596,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredPeerStatus, NetworkView, ParticipantView, PeerPresenceStatus, TrayMenuItemSpec,
-        TrayRuntimeState, cli_binary_installed_at, expected_peer_count, extract_json_document,
+        ConfiguredPeerStatus, GuiLaunchDisposition, NetworkView, ParticipantView,
+        PeerPresenceStatus, TrayMenuItemSpec, TrayRuntimeState, cli_binary_installed_at,
+        expected_peer_count, extract_json_document, gui_launch_disposition,
         gui_requires_service_enable, gui_requires_service_install, is_already_running_message,
         is_mesh_complete, is_not_running_message, parse_advertised_routes_input,
-        parse_exit_node_input, peer_offers_exit_node, peer_presence_state_label, peer_state_label,
-        should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
-        started_from_autostart_args, to_npub, tray_exit_node_entries, tray_menu_spec,
-        tray_network_groups, tray_status_text, validate_nvpn_binary, within_peer_online_grace,
-        within_peer_presence_grace,
+        parse_exit_node_input, parse_running_gui_instances, peer_offers_exit_node,
+        peer_presence_state_label, peer_state_label, should_start_gui_daemon_on_launch,
+        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
+        tray_exit_node_entries, tray_menu_spec, tray_network_groups, tray_status_text,
+        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -3849,6 +3965,46 @@ mod tests {
                 ..
             }) if text == "Quit"
         ));
+    }
+
+    #[test]
+    fn parse_running_gui_instances_filters_self_and_marks_autostart() {
+        let instances = parse_running_gui_instances(
+            "  627 /Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn-gui\n 1573 /Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn-gui --autostart\n 9000 /usr/bin/ssh-agent -l\n",
+            627,
+        );
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].pid, 1573);
+        assert!(instances[0].autostart);
+    }
+
+    #[test]
+    fn autostart_launch_exits_when_any_other_gui_instance_exists() {
+        let instances = parse_running_gui_instances(
+            "  627 /Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn-gui\n",
+            1573,
+        );
+
+        assert_eq!(
+            gui_launch_disposition(true, &instances),
+            GuiLaunchDisposition::Exit
+        );
+    }
+
+    #[test]
+    fn manual_launch_replaces_hidden_autostart_instance() {
+        let instances = parse_running_gui_instances(
+            " 1573 /Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn-gui --autostart\n",
+            627,
+        );
+
+        assert_eq!(
+            gui_launch_disposition(false, &instances),
+            GuiLaunchDisposition::Continue {
+                terminate_pids: vec![1573]
+            }
+        );
     }
 
     #[test]
