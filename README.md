@@ -43,7 +43,6 @@ By default, `nvpn` uses the OS config directory:
 
 - Linux: `~/.config/nvpn/config.toml`
 - macOS: `~/Library/Application Support/nvpn/config.toml`
-- Windows: `%AppData%/nvpn/config.toml`
 - Fallback when no config dir is available: `./nvpn.toml`
 
 `nvpn init` creates that file if it does not exist and generates keys automatically.
@@ -150,13 +149,10 @@ sudo nvpn service install
 nvpn service status
 ```
 
-On Windows, run the equivalent commands from an elevated shell instead of using `sudo`.
-
 The service implementation targets:
 
 - macOS via `launchd`
 - Linux via `systemd`
-- Windows via the Service Control Manager (`NvpnService`)
 
 Inspect runtime state:
 
@@ -274,7 +270,7 @@ The Docker e2e flows are Linux-oriented because they require real tunnel devices
 
 The release workflow in [`.github/workflows/release.yml`](.github/workflows/release.yml):
 
-- builds `nvpn` and `nostr-vpn-relay` for Linux, macOS, and Windows targets
-- builds `nostr-vpn-gui` on selected macOS and Windows targets
+- builds `nvpn` and `nostr-vpn-relay` for Linux and macOS targets
+- builds `nostr-vpn-gui` on selected macOS targets
 - packages Unix artifacts as `nvpn-<target>.tar.gz` with an `install.sh`
 - supports optional macOS code signing and notarization when the relevant secrets are present

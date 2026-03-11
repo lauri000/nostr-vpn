@@ -63,9 +63,6 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             gui: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            gui: true
 
     defaults:
       run:

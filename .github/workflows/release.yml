@@ -37,10 +37,6 @@ jobs:
             os: macos-14
             cross: false
             gui: true
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            cross: false
-            gui: true
     env:
       MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
       MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -161,8 +157,7 @@ jobs:
             fi
           done
 
-      - name: Prepare Unix package directory
-        if: runner.os != 'Windows'
+      - name: Prepare package directory
         shell: bash
         run: |
           BIN_DIR="target/${{ matrix.target }}/release"
@@ -259,8 +254,7 @@ jobs:
             exit 1
           fi
 
-      - name: Archive Unix artifacts
-        if: runner.os != 'Windows'
+      - name: Archive artifacts
         shell: bash
         run: |
           cd dist
@@ -271,38 +265,6 @@ jobs:
             shasum -a 256 nvpn-${{ matrix.target }}.tar.gz > nvpn-${{ matrix.target }}.sha256
           fi
           rm -rf nvpn
-
-      - name: Package Windows artifacts
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/nvpn
-          Copy-Item target/${{ matrix.target }}/release/nvpn.exe dist/nvpn/
-          Copy-Item target/${{ matrix.target }}/release/nostr-vpn-relay.exe dist/nvpn/
-          if (Test-Path target/${{ matrix.target }}/release/nostr-vpn-gui.exe) {
-            Copy-Item target/${{ matrix.target }}/release/nostr-vpn-gui.exe dist/nvpn/
-          }
-
-          @"
-          nvpn - Nostr-signaled WireGuard control plane
-          ============================================
-
-          Binaries included:
-            nvpn.exe            - CLI control plane
-            nostr-vpn-relay.exe - local relay for integration tests
-            nostr-vpn-gui.exe   - desktop GUI (when included)
-
-          Install:
-            Copy binaries to a directory in PATH.
-
-          Verify:
-            nvpn --help
-          "@ | Out-File -FilePath dist/nvpn/README.txt -Encoding UTF8
-
-          Compress-Archive -Path dist/nvpn -DestinationPath dist/nvpn-${{ matrix.target }}.zip
-          $hash = (Get-FileHash dist/nvpn-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  nvpn-${{ matrix.target }}.zip" | Out-File -FilePath dist/nvpn-${{ matrix.target }}.sha256 -Encoding ASCII
-          Remove-Item -Recurse dist/nvpn
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -372,9 +334,6 @@ jobs:
 
             tar -xzf nvpn-*.tar.gz && cd nvpn && ./install.sh
             ```
-
-            ### Windows
-            Download `nvpn-x86_64-pc-windows-msvc.zip`, extract, and add the directory to PATH.
 
             ### Verify
             ```bash
