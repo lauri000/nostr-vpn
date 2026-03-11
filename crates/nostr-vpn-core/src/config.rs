@@ -938,7 +938,8 @@ pub fn default_magic_dns_label_for_pubkey(
     used_aliases: &HashSet<String>,
 ) -> String {
     let digest = Sha256::digest(pubkey_hex.as_bytes());
-    let mut index = ((digest[0] as usize) << 8 | digest[1] as usize) % HASHTREE_ANIMAL_ALIASES.len();
+    let mut index =
+        ((digest[0] as usize) << 8 | digest[1] as usize) % HASHTREE_ANIMAL_ALIASES.len();
     for _ in 0..HASHTREE_ANIMAL_ALIASES.len() {
         let candidate = HASHTREE_ANIMAL_ALIASES[index];
         if !used_aliases.contains(candidate) {
