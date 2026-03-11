@@ -270,6 +270,7 @@ The Docker e2e flows are Linux-oriented because they require real tunnel devices
 
 The release workflow in [`.github/workflows/release.yml`](.github/workflows/release.yml):
 
+- runs on pushed `v*` tags or manual dispatch
 - builds `nvpn` and `nostr-vpn-relay` for Linux and macOS targets
 - builds `nostr-vpn-gui` on selected macOS targets
 - packages Unix artifacts as `nvpn-<target>.tar.gz` with an `install.sh`
