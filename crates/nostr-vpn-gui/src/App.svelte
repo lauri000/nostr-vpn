@@ -39,6 +39,7 @@
   let endpointDraft = ''
   let tunnelIpDraft = ''
   let listenPortDraft = ''
+  let advertisedRoutesDraft = ''
   let magicDnsSuffixDraft = ''
   let draftsInitialized = false
 
@@ -168,6 +169,7 @@
     endpointDraft = state.endpoint
     tunnelIpDraft = state.tunnelIp
     listenPortDraft = String(state.listenPort)
+    advertisedRoutesDraft = state.advertisedRoutes.join(', ')
     magicDnsSuffixDraft = state.magicDnsSuffix
     draftsInitialized = true
     syncDraftsFromState()
@@ -209,6 +211,9 @@
 
     if (!debouncers.has('magicDnsSuffix')) {
       magicDnsSuffixDraft = state.magicDnsSuffix
+    }
+    if (!debouncers.has('advertisedRoutes')) {
+      advertisedRoutesDraft = state.advertisedRoutes.join(', ')
     }
   }
 
@@ -685,6 +690,9 @@
                 </div>
                 <div class="item-sub" data-testid="participant-status-text">
                   {participant.magicDnsName} | {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
+                  {#if participant.advertisedRoutes.length > 0}
+                    | routes {participant.advertisedRoutes.join(', ')}
+                  {/if}
                 </div>
               </div>
               <div class="participant-badges">
@@ -700,6 +708,9 @@
                 >
                   {participantPresenceBadgeText(participant)}
                 </span>
+                {#if participant.offersExitNode}
+                  <span class="badge participant-badge warn">Exit node</span>
+                {/if}
               </div>
               <button
                 class="btn ghost icon-btn"
@@ -970,6 +981,18 @@
       <label class="toggle-row">
         <input
           type="checkbox"
+          checked={state.advertiseExitNode}
+          on:change={(event) =>
+            onUpdateSettings({
+              advertiseExitNode: (event.currentTarget as HTMLInputElement).checked,
+            })}
+        />
+        <span>Advertise exit node (default routes)</span>
+      </label>
+
+      <label class="toggle-row">
+        <input
+          type="checkbox"
           data-testid="autostart-toggle"
           checked={state.launchOnStartup}
           disabled={!autostartReady || autostartUpdating}
@@ -992,6 +1015,18 @@
       </label>
 
       <div class="field-grid">
+        <label>
+          <span>Advertised Routes</span>
+          <input
+            class="text-input"
+            placeholder="10.0.0.0/24, 192.168.0.0/24"
+            bind:value={advertisedRoutesDraft}
+            on:input={() =>
+              debounce('advertisedRoutes', () =>
+                onUpdateSettings({ advertisedRoutes: advertisedRoutesDraft }))}
+          />
+        </label>
+
         <label>
           <span>MagicDNS Suffix (Optional)</span>
           <input

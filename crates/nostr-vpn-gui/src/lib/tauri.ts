@@ -32,6 +32,18 @@ const countOnline = (network: NetworkView) =>
     ? network.participants.filter((participant) => participant.state === 'online').length
     : 0
 
+const computeMockEffectiveAdvertisedRoutes = () => {
+  const effective = [...mockState.advertisedRoutes]
+  if (mockState.advertiseExitNode) {
+    for (const route of ['0.0.0.0/0', '::/0']) {
+      if (!effective.includes(route)) {
+        effective.push(route)
+      }
+    }
+  }
+  return effective
+}
+
 const mockState: UiState = {
   daemonRunning: false,
   sessionActive: false,
@@ -52,6 +64,9 @@ const mockState: UiState = {
   endpoint: '192.168.1.4:51820',
   tunnelIp: '10.44.0.1/32',
   listenPort: 51820,
+  advertiseExitNode: false,
+  advertisedRoutes: [],
+  effectiveAdvertisedRoutes: [],
   magicDnsSuffix: 'nvpn',
   magicDnsStatus: 'System DNS active for .nvpn via 127.0.0.1:1053',
   autoDisconnectRelaysWhenMeshReady: true,
@@ -139,6 +154,7 @@ const refreshMockLanConfigured = () => {
 const asResult = async () => {
   recomputeMockConnectivity()
   refreshMockLanConfigured()
+  mockState.effectiveAdvertisedRoutes = computeMockEffectiveAdvertisedRoutes()
   return cloneMockState()
 }
 
@@ -357,6 +373,8 @@ export const addParticipant = (networkId: string, npub: string, alias = '') =>
           tunnelIp: '10.44.0.2/32',
           magicDnsAlias,
           magicDnsName: composeMagicDnsName(magicDnsAlias, mockState.magicDnsSuffix),
+          advertisedRoutes: [],
+          offersExitNode: false,
           state: 'unknown',
           presenceState: 'absent',
           statusText: 'no signal yet',
@@ -463,6 +481,16 @@ export const updateSettings = (patch: SettingsPatch) =>
         if (patch.listenPort !== undefined) {
           mockState.listenPort = patch.listenPort
         }
+        if (patch.advertiseExitNode !== undefined) {
+          mockState.advertiseExitNode = patch.advertiseExitNode
+        }
+        if (patch.advertisedRoutes !== undefined) {
+          mockState.advertisedRoutes = patch.advertisedRoutes
+            .split(',')
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0)
+        }
+        mockState.effectiveAdvertisedRoutes = computeMockEffectiveAdvertisedRoutes()
         if (patch.autoDisconnectRelaysWhenMeshReady !== undefined) {
           mockState.autoDisconnectRelaysWhenMeshReady =
             patch.autoDisconnectRelaysWhenMeshReady

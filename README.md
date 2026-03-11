@@ -15,6 +15,7 @@
 - Automatic key generation for both WireGuard and Nostr identities
 - Tauri + Svelte desktop GUI (single-pane settings UX)
 - LAN multicast peer discovery helper (default-enabled on fresh/no-peer configs, toggleable anytime)
+- Route advertisement metadata, including `advertise exit node` default-route signaling
 - GUI controls a background `nvpn` daemon; signaling/tunnel/MagicDNS runtime lives in the daemon process
 - Docker e2e that validates signaling + data-plane ping across 2 containers
 - UDP NAT endpoint discovery + hole-punch helpers (reflector-based)
@@ -135,6 +136,16 @@ nvpn status --json
 
 `status` reports relay policy and mesh progress, including whether
 `auto_disconnect_relays_when_mesh_ready` is enabled (default: `true`).
+
+### 6b. Advertise routes / exit node
+
+```bash
+nvpn set --advertise-routes 10.0.0.0/24,192.168.0.0/24
+nvpn set --advertise-exit-node
+```
+
+This publishes route capability in peer announcements, `status --json`, and the GUI.
+Automatic route consumption by other peers is not enabled yet.
 
 ### 7. Render WireGuard config
 

@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use nostr_sdk::prelude::{PublicKey, ToBech32};
 use nostr_vpn_core::config::{
-    AppConfig, derive_mesh_tunnel_ip, maybe_autoconfigure_node, normalize_nostr_pubkey,
+    AppConfig, derive_mesh_tunnel_ip, maybe_autoconfigure_node, normalize_advertised_route,
+    normalize_nostr_pubkey,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
@@ -63,6 +64,8 @@ struct PeerLinkStatus {
     error: Option<String>,
     checked_at: Option<SystemTime>,
     last_signal_seen_at: Option<SystemTime>,
+    advertised_routes: Vec<String>,
+    offers_exit_node: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +156,8 @@ struct DaemonPeerState {
     tunnel_ip: String,
     endpoint: String,
     public_key: String,
+    #[serde(default)]
+    advertised_routes: Vec<String>,
     presence_timestamp: u64,
     last_signal_seen_at: Option<u64>,
     reachable: bool,
@@ -176,6 +181,8 @@ struct ParticipantView {
     tunnel_ip: String,
     magic_dns_alias: String,
     magic_dns_name: String,
+    advertised_routes: Vec<String>,
+    offers_exit_node: bool,
     state: String,
     presence_state: String,
     status_text: String,
@@ -225,6 +232,9 @@ struct UiState {
     endpoint: String,
     tunnel_ip: String,
     listen_port: u16,
+    advertise_exit_node: bool,
+    advertised_routes: Vec<String>,
+    effective_advertised_routes: Vec<String>,
     magic_dns_suffix: String,
     magic_dns_status: String,
     auto_disconnect_relays_when_mesh_ready: bool,
@@ -248,6 +258,8 @@ struct SettingsPatch {
     endpoint: Option<String>,
     tunnel_ip: Option<String>,
     listen_port: Option<u16>,
+    advertise_exit_node: Option<bool>,
+    advertised_routes: Option<String>,
     magic_dns_suffix: Option<String>,
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
     autoconnect: Option<bool>,
@@ -583,6 +595,16 @@ impl NvpnBackend {
                 return Err(anyhow!("listen port must be > 0"));
             }
             self.config.node.listen_port = listen_port;
+            restart_required = true;
+        }
+
+        if let Some(advertise_exit_node) = patch.advertise_exit_node {
+            self.config.node.advertise_exit_node = advertise_exit_node;
+            restart_required = true;
+        }
+
+        if let Some(advertised_routes) = patch.advertised_routes {
+            self.config.node.advertised_routes = parse_advertised_routes_input(&advertised_routes)?;
             restart_required = true;
         }
 
@@ -1223,6 +1245,8 @@ impl NvpnBackend {
                     status.error = Some("vpn off".to_string());
                     status.checked_at = Some(SystemTime::now());
                     status.last_signal_seen_at = None;
+                    status.advertised_routes = Vec::new();
+                    status.offers_exit_node = false;
                 }
                 return;
             }
@@ -1378,6 +1402,8 @@ impl NvpnBackend {
                 status.endpoint = None;
                 status.error = None;
                 status.last_signal_seen_at = None;
+                status.advertised_routes = Vec::new();
+                status.offers_exit_node = false;
                 continue;
             }
 
@@ -1387,6 +1413,8 @@ impl NvpnBackend {
                 status.endpoint = None;
                 status.error = Some("vpn off".to_string());
                 status.last_signal_seen_at = None;
+                status.advertised_routes = Vec::new();
+                status.offers_exit_node = false;
                 continue;
             }
 
@@ -1396,6 +1424,8 @@ impl NvpnBackend {
                 status.endpoint = None;
                 status.error = Some("no signal yet".to_string());
                 status.last_signal_seen_at = None;
+                status.advertised_routes = Vec::new();
+                status.offers_exit_node = false;
                 continue;
             };
 
@@ -1432,6 +1462,8 @@ impl NvpnBackend {
                         None
                     }
                 });
+            status.advertised_routes = peer.advertised_routes.clone();
+            status.offers_exit_node = peer_offers_exit_node(&peer.advertised_routes);
             status.error = if effective_reachable {
                 None
             } else {
@@ -1495,6 +1527,23 @@ impl NvpnBackend {
             .config
             .magic_dns_name_for_participant(participant)
             .unwrap_or_default();
+        let is_local = Some(participant) == own_pubkey_hex;
+        let advertised_routes = if is_local {
+            self.config.effective_advertised_routes()
+        } else {
+            self.peer_status
+                .get(participant)
+                .map(|status| status.advertised_routes.clone())
+                .unwrap_or_default()
+        };
+        let offers_exit_node = if is_local {
+            self.config.node.advertise_exit_node
+        } else {
+            self.peer_status
+                .get(participant)
+                .map(|status| status.offers_exit_node)
+                .unwrap_or(false)
+        };
 
         ParticipantView {
             npub: to_npub(participant),
@@ -1502,6 +1551,8 @@ impl NvpnBackend {
             tunnel_ip,
             magic_dns_alias,
             magic_dns_name,
+            advertised_routes,
+            offers_exit_node,
             state: peer_state_label(transport_state).to_string(),
             presence_state: peer_presence_state_label(presence_state).to_string(),
             status_text,
@@ -1905,6 +1956,9 @@ impl NvpnBackend {
             endpoint: self.config.node.endpoint.clone(),
             tunnel_ip: self.config.node.tunnel_ip.clone(),
             listen_port: self.config.node.listen_port,
+            advertise_exit_node: self.config.node.advertise_exit_node,
+            advertised_routes: self.config.node.advertised_routes.clone(),
+            effective_advertised_routes: self.config.effective_advertised_routes(),
             magic_dns_suffix: self.config.magic_dns_suffix.clone(),
             magic_dns_status: self.magic_dns_status.clone(),
             auto_disconnect_relays_when_mesh_ready: self
@@ -1962,6 +2016,35 @@ fn within_peer_presence_grace(last_signal_seen_at: Option<SystemTime>, now: Syst
     now.duration_since(last_signal_seen_at)
         .map(|elapsed| elapsed.as_secs() <= PEER_PRESENCE_GRACE_SECS)
         .unwrap_or(false)
+}
+
+fn peer_offers_exit_node(routes: &[String]) -> bool {
+    routes
+        .iter()
+        .any(|route| route == "0.0.0.0/0" || route == "::/0")
+}
+
+fn parse_advertised_routes_input(value: &str) -> Result<Vec<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut routes = Vec::new();
+    for raw in value.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        let normalized = normalize_advertised_route(raw)
+            .ok_or_else(|| anyhow!("invalid advertised route '{raw}'"))?;
+        if !routes.iter().any(|existing| existing == &normalized) {
+            routes.push(normalized);
+        }
+    }
+
+    Ok(routes)
 }
 
 fn gui_requires_service_install(
@@ -2526,10 +2609,10 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         return;
     }
 
-    if let Ok(menu) = build_tray_menu(app, runtime_state) {
-        if tray.set_menu(Some(menu)).is_ok() {
-            *last_tray_runtime_state = runtime_state;
-        }
+    if let Ok(menu) = build_tray_menu(app, runtime_state)
+        && tray.set_menu(Some(menu)).is_ok()
+    {
+        *last_tray_runtime_state = runtime_state;
     }
 }
 
@@ -2913,9 +2996,9 @@ mod tests {
         ConfiguredPeerStatus, PeerPresenceStatus, cli_binary_installed_at, expected_peer_count,
         extract_json_document, gui_requires_service_enable, gui_requires_service_install,
         is_already_running_message, is_mesh_complete, is_not_running_message,
-        peer_presence_state_label, peer_state_label, should_start_gui_daemon_on_launch,
-        started_from_autostart_args, to_npub, validate_nvpn_binary, within_peer_online_grace,
-        within_peer_presence_grace,
+        parse_advertised_routes_input, peer_offers_exit_node, peer_presence_state_label,
+        peer_state_label, should_start_gui_daemon_on_launch, started_from_autostart_args, to_npub,
+        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -3027,6 +3110,20 @@ mod tests {
             peer_presence_state_label(PeerPresenceStatus::Absent),
             "absent"
         );
+    }
+
+    #[test]
+    fn parse_advertised_routes_input_normalizes_and_deduplicates() {
+        let routes = parse_advertised_routes_input("10.0.0.1/24, 10.0.0.0/24, ::1/64")
+            .expect("routes should parse");
+        assert_eq!(routes, vec!["10.0.0.0/24".to_string(), "::/64".to_string()]);
+    }
+
+    #[test]
+    fn peer_offers_exit_node_detects_default_routes() {
+        assert!(peer_offers_exit_node(&["0.0.0.0/0".to_string()]));
+        assert!(peer_offers_exit_node(&["::/0".to_string()]));
+        assert!(!peer_offers_exit_node(&["10.0.0.0/24".to_string()]));
     }
 
     #[test]

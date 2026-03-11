@@ -21,6 +21,8 @@ export interface ParticipantView {
   tunnelIp: string
   magicDnsAlias: string
   magicDnsName: string
+  advertisedRoutes: string[]
+  offersExitNode: boolean
   state: PeerState
   presenceState: PresenceState
   statusText: string
@@ -64,6 +66,9 @@ export interface UiState {
   endpoint: string
   tunnelIp: string
   listenPort: number
+  advertiseExitNode: boolean
+  advertisedRoutes: string[]
+  effectiveAdvertisedRoutes: string[]
   magicDnsSuffix: string
   magicDnsStatus: string
   autoDisconnectRelaysWhenMeshReady: boolean
@@ -85,6 +90,8 @@ export interface SettingsPatch {
   endpoint?: string
   tunnelIp?: string
   listenPort?: number
+  advertiseExitNode?: boolean
+  advertisedRoutes?: string
   magicDnsSuffix?: string
   autoDisconnectRelaysWhenMeshReady?: boolean
   autoconnect?: boolean
