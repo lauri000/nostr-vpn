@@ -1,57 +1,110 @@
 # nostr-vpn
 
-`nostr-vpn` is a Tailscale-style control plane on Nostr with:
+`nostr-vpn` is a Rust workspace for a Tailscale-style mesh VPN control plane built on:
 
-- `nvpn`: multiplatform CLI
-- `nostr-vpn-gui`: multiplatform desktop GUI (macOS-first UX)
-- `nostr-vpn-core`: shared core logic (boringtun keying + Nostr signaling)
+- Nostr relays for peer signaling and encrypted presence exchange
+- `boringtun` for userspace WireGuard-compatible tunnel handling
+- a CLI daemon and a Tauri desktop app that operate on the same config/runtime model
 
-## What is implemented
+This repo is not just one binary. It currently ships:
 
-- Boringtun key generation and handshake simulation (`boringtun::noise::Tunn`)
-- Nostr relay signaling client and message envelope
-- Network membership based on participant Nostr pubkeys (npub/hex allowlist)
-- Deterministic network IDs derived from participant pubkeys
-- Automatic key generation for both WireGuard and Nostr identities
-- Tauri + Svelte desktop GUI (single-pane settings UX)
-- LAN multicast peer discovery helper (default-enabled on fresh/no-peer configs, toggleable anytime)
-- Route advertisement metadata, including `advertise exit node` default-route signaling
-- GUI controls a background `nvpn` daemon; signaling/tunnel/MagicDNS runtime lives in the daemon process
-- Docker e2e that validates signaling + data-plane ping across 2 containers
-- UDP NAT endpoint discovery + hole-punch helpers (reflector-based)
+| Component | Purpose |
+| --- | --- |
+| `nvpn` | Main CLI for config, daemon lifecycle, networking, diagnostics, and tunnel sessions |
+| `nostr-vpn-gui` | Tauri + Svelte desktop app that manages the same `nvpn` daemon and config |
+| `nostr-vpn-relay` | Minimal local websocket relay used for integration and e2e testing |
+| `nvpn-reflector` | Minimal UDP reflector used for NAT discovery and hole-punch testing |
+| `nostr-vpn-core` | Shared library for config, signaling, NAT helpers, diagnostics, MagicDNS, and WireGuard helpers |
+
+## What the project does today
+
+- Generates both Nostr identity keys and WireGuard keys automatically
+- Stores a single app config with one or more named networks and participant allowlists
+- Publishes and consumes private peer announcements over Nostr relays
+- Brings up userspace WireGuard tunnels via `boringtun`
+- Tracks peer endpoints, including NAT-discovered public endpoints and hole-punch attempts
+- Supports route advertisement and exit-node selection
+- Exposes JSON status, relay checks, network diagnostics, and doctor bundles
+- Includes a desktop GUI with service-first session control, tray integration, autostart, LAN discovery, MagicDNS controls, health reporting, and port-mapping status
+- Includes Linux-focused Docker e2e coverage for signaling, mesh formation, NAT traversal, and exit-node routing
 
 ## Default relays
+
+These are compiled into `nostr-vpn-core` and used when a config does not specify its own relay list:
 
 - `wss://temp.iris.to`
 - `wss://relay.damus.io`
 - `wss://nos.lol`
 - `wss://relay.primal.net`
 
-## Quickstart
+## Config model
 
-### 1. Build and test
+By default, `nvpn` uses the OS config directory:
+
+- Linux: `~/.config/nvpn/config.toml`
+- macOS: `~/Library/Application Support/nvpn/config.toml`
+- Windows: `%AppData%/nvpn/config.toml`
+- Fallback when no config dir is available: `./nvpn.toml`
+
+`nvpn init` creates that file if it does not exist and generates keys automatically.
+
+The config contains:
+
+- global app settings such as autoconnect, LAN discovery, tray behavior, and MagicDNS suffix
+- Nostr settings including relay URLs and identity keys
+- NAT settings including STUN servers, reflectors, and discovery timeout
+- node settings including endpoint, tunnel IP, listen port, and advertised routes
+- a `[[networks]]` list of named participant sets
+
+The CLI operates on one network at a time; use `--network-id` when you want a non-default network.
+
+## Build and validate
+
+Prerequisites:
+
+- Rust stable
+- Node 22 + `corepack`/`pnpm` for the GUI
+- OS permissions to create tunnel interfaces when running real sessions
+- On Linux Docker e2e: Docker with Compose and `/dev/net/tun`
+
+The same checks used by CI are:
 
 ```bash
-cargo test --workspace --exclude nostr-vpn-gui
-cargo clippy --workspace --exclude nostr-vpn-gui --all-targets -- -D warnings
-pnpm --dir crates/nostr-vpn-gui install
+corepack enable
+pnpm --dir crates/nostr-vpn-gui install --frozen-lockfile
 pnpm --dir crates/nostr-vpn-gui build
+
+cargo fmt --check
+cargo clippy --workspace --exclude nostr-vpn-gui --all-targets -- -D warnings
+cargo test --workspace --exclude nostr-vpn-gui
 cargo check -p nostr-vpn-gui
 ```
 
-### 2. Install CLI into PATH (one-time)
+If you only want the CLI and test binaries:
 
 ```bash
-sudo cargo run --bin nvpn -- install-cli
+cargo build -p nostr-vpn-cli -p nostr-vpn-relay
 ```
 
-Uninstall later if needed:
+## Install `nvpn`
+
+From source:
 
 ```bash
-sudo cargo run --bin nvpn -- uninstall-cli
+cargo install --path crates/nostr-vpn-cli --bin nvpn
 ```
 
-### 3. Create config (auto-keygen)
+If you already have a packaged Unix release artifact produced by the release workflow, extract it and run:
+
+```bash
+./install.sh
+```
+
+That installer places whichever packaged binaries are present into `/usr/local/bin` by default.
+
+## CLI quickstart
+
+Create or refresh config and generate keys:
 
 ```bash
 nvpn init \
@@ -59,260 +112,169 @@ nvpn init \
   --participant npub1...bob
 ```
 
-This writes config to `~/.config/nvpn/config.toml`.
-
-### 4. Bring node up
+Adjust persisted settings if needed:
 
 ```bash
-nvpn up
+nvpn set \
+  --relay ws://127.0.0.1:8080 \
+  --endpoint 192.0.2.10:51820 \
+  --tunnel-ip 10.44.0.10/32
 ```
 
-`nvpn up` auto-derives:
-
-- tunnel IP from participant pubkeys
-- endpoint from your local primary IP + listen port (when endpoint is still localhost)
-
-You can still override with `--endpoint` / `--tunnel-ip` for advanced/manual setups.
-
-### 5. Start a full tunnel session from config
+Run a full foreground session:
 
 ```bash
 nvpn connect
 ```
 
-`nvpn connect` keeps running, consumes private peer presence signals from your configured
-participants, and applies boringtun interface/peer config automatically.
+If you only want to publish presence or bring the node down without running the full long-lived session, use:
 
-To run in background:
+```bash
+nvpn up
+nvpn down
+```
+
+Or run the daemonized flow the GUI also uses:
 
 ```bash
 nvpn start --daemon --connect
-```
-
-Pause/resume networking without stopping daemon:
-
-```bash
 nvpn pause
 nvpn resume
-```
-
-Stop daemon:
-
-```bash
 nvpn stop
 ```
 
-### 5b. One-time system service (recommended)
-
-To avoid repeated password prompts on every daemon start, install the system service once:
+If you want persistent privileged startup without repeated prompts, install the system service once:
 
 ```bash
-sudo nvpn service install --config ~/.config/nvpn/config.toml
-```
-
-Check status:
-
-```bash
+sudo nvpn service install
 nvpn service status
 ```
 
-Remove later:
+On Windows, run the equivalent commands from an elevated shell instead of using `sudo`.
 
-```bash
-sudo nvpn service uninstall --config ~/.config/nvpn/config.toml
-```
+The service implementation targets:
 
-Platform behavior:
+- macOS via `launchd`
+- Linux via `systemd`
+- Windows via the Service Control Manager (`NvpnService`)
 
-- macOS: `launchd` daemon (`/Library/LaunchDaemons/...`)
-- Linux: `systemd` unit (`/etc/systemd/system/nvpn.service`)
-- Windows: SCM service (`NvpnService`)
-
-### 6. Check status
+Inspect runtime state:
 
 ```bash
 nvpn status --json
+nvpn netcheck --json
+nvpn doctor --json
 ```
 
-`status` reports relay policy and mesh progress, including whether
-`auto_disconnect_relays_when_mesh_ready` is enabled (default: `true`).
+Write a support bundle:
 
-### 6b. Advertise routes / exit node
+```bash
+nvpn doctor --write-bundle /tmp/nvpn-doctor
+```
+
+Advertise routes or use an exit node:
 
 ```bash
 nvpn set --advertise-routes 10.0.0.0/24,192.168.0.0/24
-nvpn set --advertise-exit-node
+nvpn set --advertise-exit-node true
 nvpn set --exit-node npub1...peer
 ```
 
-This publishes route capability in peer announcements, `status --json`, and the GUI.
-
-On Linux, selecting an exit node installs `0.0.0.0/0` through that peer, preserves direct
-host routes for relays and the peer endpoint, and enables IPv4 forwarding/NAT plus IPv6
-forwarding on the advertising peer so internet egress works through the mesh.
-
-Clear the selection with:
+Clear exit-node selection:
 
 ```bash
 nvpn set --exit-node off
 ```
 
-### 7. Render WireGuard config
+Low-level helper commands are also available when you want to work below the daemon/session layer:
+
+- `announce`
+- `listen`
+- `render-wg`
+- `keygen`
+- `init`
+- `nat-discover`
+- `hole-punch`
+- `ping`
+- `ip`
+- `whois`
+
+## Desktop GUI
+
+The GUI lives in [`crates/nostr-vpn-gui`](crates/nostr-vpn-gui) and is a Tauri app backed by the same config and daemon used by `nvpn`.
+
+Run it in development:
 
 ```bash
-nvpn render-wg \
-  --peer "<wg-pubkey>,10.44.0.3/32,198.51.100.20:51820"
-```
-
-### 8. Start GUI
-
-```bash
-pnpm --dir crates/nostr-vpn-gui install
+corepack enable
+pnpm --dir crates/nostr-vpn-gui install --frozen-lockfile
 pnpm --dir crates/nostr-vpn-gui tauri:dev
 ```
 
-For packaged installers:
+Build a packaged app:
 
 ```bash
 pnpm --dir crates/nostr-vpn-gui tauri:build
 ```
 
-`tauri:build` prepares and bundles the `nvpn` CLI as an app sidecar, so GUI daemon
-control works without requiring `nvpn` in `PATH`.
+Important behavior:
 
-GUI session control calls the `nvpn` CLI daemon (`start/pause/resume/status`) and does not run
-WireGuard/Nostr runtime in the frontend process.
+- `tauri:dev` and `tauri:build` automatically prepare an `nvpn` sidecar binary
+- the frontend does not run the VPN runtime itself; it shells out to `nvpn`
+- the app is service-first on supported platforms: install/enable the background service, then use the app for normal on/off control
+- the GUI exposes network membership, relay state, session health, MagicDNS, exit-node selection, advertised routes, LAN discovery, autostart, and tray controls
 
-GUI now exposes one-time service install/uninstall controls. On macOS/Linux/Windows, the GUI is
-service-first: if the background service is missing, the app shows a prominent install action
-instead of silently direct-starting a privileged daemon. With service installed, normal VPN
-On/Off toggles use daemon pause/resume and do not require repeated elevation prompts.
+You can override which CLI binary the GUI uses with `NVPN_CLI_PATH`.
 
-CLI fallback remains available for manual workflows (`nvpn start --daemon`, `nvpn connect`, etc.).
+## Local relay and NAT test binaries
 
-Note: bringing the tunnel interface up requires OS network privileges in the daemon process.
-On Linux/macOS, run `nvpn`/the app with permissions that allow interface/routing updates.
+For local integration testing without public infrastructure:
 
-### 9. Run Tauri-driver UI smoke test (Docker)
+Run a websocket relay:
 
 ```bash
-./scripts/e2e-tauri-driver-docker.sh
+cargo run -p nostr-vpn-relay --bin nostr-vpn-relay -- --bind 127.0.0.1:8080
 ```
 
-This runs a Linux tauri-driver session against `nostr-vpn-gui`, performs core UI actions,
-and writes a screenshot to `artifacts/screenshots/tauri-driver-smoke.png`.
-
-## CLI commands
-
-`nvpn` includes these Tailscale-style commands:
-
-- `up`
-- `start`
-- `stop`
-- `reload`
-- `pause`
-- `resume`
-- `connect`
-- `down`
-- `status`
-- `set`
-- `ping`
-- `netcheck`
-- `ip`
-- `whois`
-- `nat-discover`
-- `hole-punch`
-- `install-cli`
-- `uninstall-cli`
-- `service`
-
-Legacy control-plane commands are still available:
-
-- `announce` (legacy low-level name for publishing presence)
-- `listen`
-- `render-wg`
-- `keygen`
-- `init`
-
-## Install from release
+Run a UDP reflector:
 
 ```bash
-REPO=<owner>/<repo>
-curl -fsSL "https://github.com/${REPO}/releases/latest/download/nvpn-$(uname -m | sed 's/arm64/aarch64/')-$(uname -s | tr '[:upper:]' '[:lower:]' | sed 's/darwin/apple-darwin/' | sed 's/linux/unknown-linux-musl/').tar.gz" | tar -xz
-cd nvpn && ./install.sh
+cargo run -p nostr-vpn-relay --bin nvpn-reflector -- --bind 127.0.0.1:3478
 ```
 
-## Docker e2e
+The reflector is what `nvpn nat-discover` and `nvpn hole-punch` are designed to test against in local and Docker e2e setups.
 
-Requirements:
+## Docker end-to-end coverage
 
-- Docker Engine with Compose plugin (`docker compose`)
-- Linux environment with `/dev/net/tun` available
+The repo includes several real integration paths under [`scripts/`](scripts):
 
-Run a real cross-container signaling + tunnel check (local relay + 2 nodes):
+- `./scripts/e2e-docker.sh`
+  Verifies relay connectivity, `announce`/`listen`, manual `tunnel-up`, and ping across two containers.
+- `./scripts/e2e-connect-docker.sh`
+  Verifies config-driven `nvpn connect`, mesh formation, relay pause-on-mesh-ready behavior, and tunnel ping.
+- `./scripts/e2e-nat-docker.sh`
+  Verifies daemon mode across separate Docker NATs, public endpoint discovery, handshake success, and ping.
+- `./scripts/e2e-exit-node-docker.sh`
+  Verifies exit-node advertisement, selection, routing, and NAT discovery egress through the advertised exit node.
+- `./scripts/e2e-tauri-driver-docker.sh`
+  Builds the GUI in a Linux container, runs a Tauri-driver smoke test, and writes a screenshot to `artifacts/screenshots/tauri-driver-smoke.png`.
 
-```bash
-./scripts/e2e-docker.sh
-```
+The Docker e2e flows are Linux-oriented because they require real tunnel devices and container networking privileges.
 
-Run config-driven CLI connect e2e (same `config.toml` flow GUI uses):
+## Workspace layout
 
-```bash
-./scripts/e2e-connect-docker.sh
-```
+- [`Cargo.toml`](Cargo.toml): workspace definition
+- [`crates/nostr-vpn-core`](crates/nostr-vpn-core): shared config, signaling, diagnostics, MagicDNS, NAT, and WireGuard helpers
+- [`crates/nostr-vpn-cli`](crates/nostr-vpn-cli): `nvpn` CLI and daemon implementation
+- [`crates/nostr-vpn-gui`](crates/nostr-vpn-gui): Tauri/Svelte desktop app
+- [`crates/nostr-vpn-relay`](crates/nostr-vpn-relay): test relay and reflector binaries
+- [`scripts`](scripts): Docker and GUI smoke-test entrypoints
 
-Run exit-node routing e2e (node B egresses through node A):
+## Release workflow notes
 
-```bash
-./scripts/e2e-exit-node-docker.sh
-```
+The release workflow in [`.github/workflows/release.yml`](.github/workflows/release.yml):
 
-What it validates:
-
-- Relay container accepts Nostr websocket connections
-- Two nodes exchange private presence signals over Nostr
-- Both nodes bring up boringtun interfaces (`tunnel-up`)
-- Tunnel data plane works (`ping` over `10.44.0.1 <-> 10.44.0.2`)
-
-## NAT traversal helpers
-
-Discover the public UDP endpoint (through a reflector):
-
-```bash
-nvpn nat-discover --reflector 198.51.100.10:3478 --listen-port 51820
-```
-
-Send punch packets to a peer endpoint:
-
-```bash
-nvpn hole-punch --listen-port 51820 --peer-endpoint 198.51.100.20:51820
-```
-
-`tunnel-up` can pre-punch automatically:
-
-```bash
-nvpn tunnel-up ... \
-  --hole-punch-attempts 40 \
-  --hole-punch-interval-ms 120
-```
-
-Run NAT-focused docker e2e:
-
-```bash
-./scripts/e2e-nat-docker.sh
-```
-
-This e2e uses two NAT router containers with deterministic UDP/51820 mapping to verify:
-private Nostr signaling, public endpoint discovery, daemon-managed boringtun handshake, and tunnel ping across separate NATed networks.
-
-## GitHub release signing/notarization (optional)
-
-The release workflow supports optional macOS signing + notarization when these secrets are set:
-
-- `MACOS_SIGNING_IDENTITY`
-- `MACOS_CERTIFICATE_P12`
-- `MACOS_CERTIFICATE_PASSWORD`
-- `MACOS_KEYCHAIN_PASSWORD` (optional override)
-- `MACOS_NOTARIZE_APPLE_ID`
-- `MACOS_NOTARIZE_APP_PASSWORD`
-- `MACOS_NOTARIZE_TEAM_ID`
+- builds `nvpn` and `nostr-vpn-relay` for Linux, macOS, and Windows targets
+- builds `nostr-vpn-gui` on selected macOS and Windows targets
+- packages Unix artifacts as `nvpn-<target>.tar.gz` with an `install.sh`
+- supports optional macOS code signing and notarization when the relevant secrets are present
