@@ -379,7 +379,7 @@ struct NvpnBackend {
 }
 
 impl NvpnBackend {
-    fn new() -> Result<Self> {
+    fn new(launched_from_autostart: bool) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let config_path = default_config_path();
 
@@ -455,16 +455,24 @@ impl NvpnBackend {
 
         let wants_autoconnect =
             backend.config.autoconnect && !backend.config.participant_pubkeys_hex().is_empty();
+        let defer_to_installed_service = should_defer_gui_daemon_start_to_service_on_autostart(
+            launched_from_autostart,
+            backend.service_installed,
+            backend.service_disabled,
+        );
         if should_start_gui_daemon_on_launch(
             backend.config.autoconnect,
             !backend.config.participant_pubkeys_hex().is_empty(),
             backend.gui_requires_service_action(),
         ) && !backend.daemon_running
+            && !defer_to_installed_service
         {
             if let Err(error) = backend.start_daemon_process() {
                 backend.session_status = format!("Daemon start failed: {error}");
             }
             backend.sync_daemon_state();
+        } else if wants_autoconnect && defer_to_installed_service && !backend.daemon_running {
+            backend.session_status = "Waiting for background service to start".to_string();
         } else if wants_autoconnect && backend.gui_requires_service_install() {
             backend.session_status = gui_service_setup_status_text(true).to_string();
         } else if wants_autoconnect && backend.gui_requires_service_enable() {
@@ -2223,6 +2231,14 @@ fn should_start_gui_daemon_on_launch(
     autoconnect && has_participants && !service_setup_required
 }
 
+fn should_defer_gui_daemon_start_to_service_on_autostart(
+    launched_from_autostart: bool,
+    service_installed: bool,
+    service_disabled: bool,
+) -> bool {
+    cfg!(target_os = "macos") && launched_from_autostart && service_installed && !service_disabled
+}
+
 fn gui_service_setup_status_text(autoconnect: bool) -> &'static str {
     if autoconnect {
         GUI_SERVICE_SETUP_REQUIRED_AUTOCONNECT_STATUS
@@ -3439,11 +3455,12 @@ pub fn run() {
         .with_env_filter(env_filter)
         .try_init();
 
-    let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
+    let launched_from_autostart = started_from_autostart();
+    let backend =
+        NvpnBackend::new(launched_from_autostart).expect("failed to initialize GUI backend state");
     let launch_on_startup_default = backend.config.launch_on_startup;
     let initial_tray_state = backend.tray_runtime_state();
     let setup_tray_state = initial_tray_state.clone();
-    let launched_from_autostart = started_from_autostart();
     match resolve_gui_launch_conflicts(launched_from_autostart) {
         Ok(GuiLaunchDisposition::Continue { terminate_pids }) => {
             terminate_gui_instances(&terminate_pids);
@@ -3662,6 +3679,10 @@ mod tests {
         started_from_autostart_args, to_npub, tray_exit_node_entries, tray_menu_spec,
         tray_network_groups, tray_status_text, validate_nvpn_binary, within_peer_online_grace,
         within_peer_presence_grace,
+        should_defer_gui_daemon_start_to_service_on_autostart, should_start_gui_daemon_on_launch,
+        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
+        tray_exit_node_entries, tray_menu_spec, tray_network_groups, tray_status_text,
+        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -4151,6 +4172,22 @@ mod tests {
         assert!(should_start_gui_daemon_on_launch(true, true, false));
         assert!(!should_start_gui_daemon_on_launch(true, false, false));
         assert!(!should_start_gui_daemon_on_launch(false, true, false));
+    }
+
+    #[test]
+    fn gui_launch_autoconnect_defers_to_installed_service_on_autostart() {
+        assert!(should_defer_gui_daemon_start_to_service_on_autostart(
+            true, true, false
+        ));
+        assert!(!should_defer_gui_daemon_start_to_service_on_autostart(
+            false, true, false
+        ));
+        assert!(!should_defer_gui_daemon_start_to_service_on_autostart(
+            true, false, false
+        ));
+        assert!(!should_defer_gui_daemon_start_to_service_on_autostart(
+            true, true, true
+        ));
     }
 
     #[cfg(unix)]
