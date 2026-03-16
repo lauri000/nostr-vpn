@@ -164,15 +164,15 @@
   const participantTransportBadgeText = (participant: ParticipantView) => {
     switch (participant.state) {
       case 'local':
-        return 'WG self'
+        return 'WireGuard self'
       case 'online':
-        return 'WG online'
+        return 'WireGuard online'
       case 'pending':
-        return 'WG waiting'
+        return 'WireGuard waiting'
       case 'offline':
-        return 'WG offline'
+        return 'WireGuard offline'
       default:
-        return 'WG unknown'
+        return 'WireGuard unknown'
     }
   }
 
