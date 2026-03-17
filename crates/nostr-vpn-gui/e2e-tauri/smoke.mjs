@@ -466,6 +466,25 @@ async function main() {
 
     await waitForSelectorText(
       sessionId,
+      '[data-testid="active-network-title"]',
+      /network 1/i,
+      'active network title',
+    )
+
+    await waitForSelectorText(
+      sessionId,
+      '[data-testid="saved-networks-title"]',
+      /saved networks/i,
+      'saved networks title',
+    )
+
+    const initialSource = await source(sessionId)
+    if (/Failed to apply startup launch setting/i.test(initialSource)) {
+      throw new Error('unexpected startup launch error banner on initial render')
+    }
+
+    await waitForSelectorText(
+      sessionId,
       '[data-testid="mesh-badge"]',
       /mesh\s*1\/1/i,
       'mesh to reach 1/1',

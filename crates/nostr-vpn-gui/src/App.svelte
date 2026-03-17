@@ -197,6 +197,59 @@
     return `${value.slice(0, head)}...${value.slice(-tail)}`
   }
 
+  const activeNetwork = (state: UiState) =>
+    state.networks.find((network) => network.enabled) ?? state.networks[0]
+
+  const heroStateBadgeClass = (state: UiState) => {
+    if (state.meshReady) {
+      return 'ok'
+    }
+    if (state.sessionActive || serviceInstallRecommended || serviceEnableRecommended) {
+      return 'warn'
+    }
+    return 'muted'
+  }
+
+  const heroStateText = (state: UiState) => {
+    if ((serviceInstallRecommended || serviceEnableRecommended) && !state.sessionActive) {
+      return 'Service required'
+    }
+    if (state.meshReady) {
+      return 'Connected'
+    }
+    if (state.sessionActive) {
+      return 'Connecting'
+    }
+    return 'Disconnected'
+  }
+
+  const heroSubtext = (state: UiState) => {
+    const network = activeNetwork(state)
+    if ((serviceInstallRecommended || serviceEnableRecommended) && !state.sessionActive) {
+      return 'Install the background service for reliable startup, reconnects, and admin-free VPN switching.'
+    }
+    if (!state.sessionActive) {
+      return `Ready to connect ${network.name}.`
+    }
+    if (state.expectedPeerCount === 0) {
+      return `${network.name} is active, but no remote devices are configured yet.`
+    }
+    if (state.meshReady) {
+      return `${network.name} is fully connected across ${state.connectedPeerCount}/${state.expectedPeerCount} peers.`
+    }
+
+    const remaining = Math.max(state.expectedPeerCount - state.connectedPeerCount, 0)
+    return `${network.name} is waiting on ${remaining} more peer${remaining === 1 ? '' : 's'}.`
+  }
+
+  const networkPeerSummary = (network: NetworkView) => {
+    const saved = `${network.participants.length} device${network.participants.length === 1 ? '' : 's'} saved`
+    if (network.enabled) {
+      return `${saved} • ${network.onlineCount}/${network.expectedCount} peers online`
+    }
+    return saved
+  }
+
   const networkHasParticipant = (network: NetworkView, npub: string) =>
     network.participants.some((participant) => participant.npub === npub)
 
@@ -619,8 +672,12 @@
     const runtimeEnabled = await isAutostartEnabled()
     if (runtimeEnabled !== state.launchOnStartup) {
       const ok = await setAutostartEnabled(state.launchOnStartup)
+      // Startup sync can run in environments where autostart cannot be managed
+      // (for example the Linux Tauri-driver container), so avoid surfacing a
+      // boot-time banner unless the user explicitly changed the setting.
       if (!ok) {
-        error = 'Failed to apply startup launch setting'
+        autostartReady = true
+        return
       }
     }
 
@@ -696,21 +753,18 @@
     <div class="window-title" data-testid="window-title">Nostr VPN</div>
   </header>
 
-  <section class="identity-card panel">
-    <div class="row identity-row">
-      <button class="btn copy-btn copy-npub-btn" data-testid="copy-pubkey" on:click={copyPubkey} disabled={!state}>
-        <span class="copy-icon" aria-hidden="true">
-          {#if copiedPubkey}
-            <Check size={16} strokeWidth={2.3} />
-          {:else}
-            <Copy size={16} strokeWidth={2.2} />
-          {/if}
-        </span>
-        <span class="copy-value" data-testid="pubkey">
-          {state ? short(state.ownNpub, 18, 14) : 'Loading...'}
-        </span>
-      </button>
-      {#if state}
+  <section class="identity-card panel hero-card">
+    {#if state}
+      {@const activeNetworkView = activeNetwork(state)}
+      <div class="row hero-row">
+        <div class="hero-copy">
+          <div class="panel-kicker">Active network</div>
+          <div class="row hero-title-row">
+            <h1 data-testid="active-network-title">{activeNetworkView.name}</h1>
+            <span class={`badge ${heroStateBadgeClass(state)}`}>{heroStateText(state)}</span>
+          </div>
+          <div class="hero-subtitle">{heroSubtext(state)}</div>
+        </div>
         {#if !serviceSetupRequired}
           <button
             class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
@@ -726,10 +780,42 @@
             <span class="session-switch-label">VPN {state.sessionActive ? 'On' : 'Off'}</span>
           </button>
         {/if}
-      {/if}
-    </div>
+      </div>
 
-    {#if state}
+      <div class="hero-stats-grid">
+        <div class="hero-stat-card">
+          <div class="panel-kicker">Identity</div>
+          <button
+            class="btn copy-btn copy-npub-btn hero-copy-btn"
+            data-testid="copy-pubkey"
+            on:click={copyPubkey}
+          >
+            <span class="copy-icon" aria-hidden="true">
+              {#if copiedPubkey}
+                <Check size={16} strokeWidth={2.3} />
+              {:else}
+                <Copy size={16} strokeWidth={2.2} />
+              {/if}
+            </span>
+            <span class="copy-value" data-testid="pubkey">
+              {short(state.ownNpub, 18, 14)}
+            </span>
+          </button>
+        </div>
+
+        <div class="hero-stat-card">
+          <div class="panel-kicker">Mesh ID</div>
+          <div class="hero-stat-value hero-stat-mono" data-testid="mesh-id">{state.networkId}</div>
+          <div class="config-path">Share this mesh ID only with devices in {activeNetworkView.name}.</div>
+        </div>
+
+        <div class="hero-stat-card">
+          <div class="panel-kicker">This device</div>
+          <div class="hero-stat-value">{state.nodeName}</div>
+          <div class="config-path">{state.tunnelIp} • {state.endpoint}</div>
+        </div>
+      </div>
+
       <div class="row status-row">
         <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
           Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
@@ -745,6 +831,12 @@
         </span>
       </div>
       <div class="identity-status" data-testid="session-status-text">{state.sessionStatus}</div>
+    {:else}
+      <div class="panel-kicker">Loading</div>
+      <div class="row hero-title-row">
+        <h1>Starting Nostr VPN</h1>
+      </div>
+      <div class="hero-subtitle">Loading config, daemon state, and local mesh status.</div>
     {/if}
   </section>
 
@@ -753,82 +845,108 @@
   {/if}
 
   {#if state}
-    <section class="panel diagnostics-panel">
-      <div class="section-title-row">
-        <h2>Diagnostics</h2>
-        <div class="section-meta">{healthSummaryText(state)}</div>
-      </div>
+    {@const activeNetworkView = activeNetwork(state)}
 
-      <div class="row status-row diagnostics-badges">
-        <span class="badge muted">
-          IF {state.network.defaultInterface || 'unknown'}
-        </span>
-        <span
-          class={`badge ${
-            state.network.captivePortal === true
-              ? 'bad'
-              : state.network.captivePortal === false
-                ? 'ok'
-                : 'muted'
-          }`}
-        >
-          {state.network.captivePortal === true
-            ? 'Captive portal'
-            : state.network.captivePortal === false
-              ? 'Open internet'
-              : 'Portal unknown'}
-        </span>
-        <span class={`badge ${state.portMapping.activeProtocol ? 'ok' : 'muted'}`}>
-          Mapping {state.portMapping.activeProtocol || 'none'}
-        </span>
-      </div>
+    {#if serviceInstallRecommended || serviceEnableRecommended}
+      <section
+        class={`panel service-panel ${serviceSetupRequired ? 'service-panel-required' : ''}`}
+        data-testid="service-panel"
+      >
+        <div class="section-title-row">
+          <div>
+            <div class="panel-kicker">Action needed</div>
+            <h2>Background Service</h2>
+          </div>
+          <div class="section-meta">{serviceMetaText(state)}</div>
+        </div>
 
-      <div class="diagnostics-copy">
-        <div class="config-path">
-          Local addresses:
-          {state.network.primaryIpv4 || 'no IPv4'}
-          {#if state.network.primaryIpv6}
-            | {state.network.primaryIpv6}
+        <div class="row status-row">
+          <span class={`badge ${state.serviceInstalled ? 'ok' : 'warn'}`}>
+            {state.serviceInstalled ? 'Installed' : 'Setup required'}
+          </span>
+          <span class={`badge ${serviceLifecycleBadgeClass(state)}`}>
+            {serviceLifecycleBadgeText(state)}
+          </span>
+          <span class="badge muted">Daemon {state.daemonRunning ? 'reachable' : 'idle'}</span>
+        </div>
+
+        <div class="service-panel-copy">
+          <div class="service-panel-title">
+            {serviceSetupRequired
+              ? 'Install once for reliable background VPN'
+              : 'Enable the service to keep VPN control out of the GUI process'}
+          </div>
+          <div class="service-panel-text">
+            Required for background startup, resilient reconnects, and avoiding repeated admin prompts.
+          </div>
+          {#if state.serviceStatusDetail}
+            <div class="service-panel-detail" data-testid="service-status-detail">
+              {state.serviceStatusDetail}
+            </div>
+          {/if}
+          {#if serviceActionStatus}
+            <div class="service-panel-detail service-panel-detail-ok">{serviceActionStatus}</div>
           {/if}
         </div>
-        <div class="config-path">
-          Gateway:
-          {state.network.gatewayIpv4 || state.network.gatewayIpv6 || 'unknown'}
-        </div>
-        <div class="config-path">
-          External endpoint:
-          {state.portMapping.externalEndpoint || 'stun / direct only'}
-        </div>
-      </div>
 
-      {#if state.health.length === 0}
-        <div class="config-path" data-testid="health-empty">Daemon reports no active health warnings.</div>
-      {:else}
-        <div class="stack rows">
-          {#each state.health as issue}
-            <div class="health-card" data-testid="health-issue">
-              <div class="row spread health-card-header">
-                <div class="item-title">{issue.summary}</div>
-                <span class={`badge ${healthBadgeClass(issue.severity)}`}>{issue.severity}</span>
-              </div>
-              <div class="item-sub">{issue.detail}</div>
-            </div>
-          {/each}
+        <div class="row service-actions-row">
+          <button
+            class={`btn ${serviceSetupRequired ? 'service-primary-btn' : ''}`}
+            data-testid="install-service-btn"
+            on:click={() =>
+              serviceEnableRecommended
+                ? onEnableSystemService()
+                : onInstallSystemService(serviceSetupRequired)}
+          >
+            {serviceEnableRecommended
+              ? 'Enable service'
+              : state.serviceInstalled
+                ? 'Reinstall service'
+                : 'Install service'}
+          </button>
+          {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
+            <button
+              class="btn ghost"
+              data-testid="disable-service-btn"
+              on:click={onDisableSystemService}
+            >
+              Disable service
+            </button>
+          {/if}
+          <button
+            class="btn ghost"
+            data-testid="uninstall-service-btn"
+            on:click={onUninstallSystemService}
+            disabled={!state.serviceInstalled}
+          >
+            Uninstall
+          </button>
         </div>
-      {/if}
-    </section>
+      </section>
+    {/if}
 
-    <section class="panel network-controls-panel">
+    <section class="panel spotlight-panel">
       <div class="section-title-row">
-        <h2>Networks</h2>
-        <div class="section-meta">
-          Enabled: {state.networks.filter((network) => network.enabled).length}/{state.networks.length}
+        <div>
+          <div class="panel-kicker">Live mesh</div>
+          <h2>Devices</h2>
         </div>
+        <div class="section-meta">{activeNetworkView.onlineCount}/{activeNetworkView.expectedCount} online</div>
       </div>
 
-      <div class="config-path" data-testid="mesh-id">Mesh ID: {state.networkId}</div>
-      <div class="config-path">
-        Peers must share this Mesh ID and list each other as participants.
+      <div class="spotlight-meta-grid">
+        <div class="spotlight-meta-card">
+          <div class="panel-kicker">Network</div>
+          <div class="spotlight-meta-value">{activeNetworkView.name}</div>
+          <div class="config-path">{networkPeerSummary(activeNetworkView)}</div>
+        </div>
+        <div class="spotlight-meta-card">
+          <div class="panel-kicker">Mesh ID</div>
+          <div class="spotlight-meta-value hero-stat-mono">{activeNetworkView.networkId}</div>
+          <div class="config-path">
+            Peers on {activeNetworkView.name} must share this Mesh ID and list each other as participants.
+          </div>
+        </div>
       </div>
 
       <label class="toggle-row lan-discovery-toggle">
@@ -844,96 +962,53 @@
         LAN discovery (multicast)
       </label>
 
-      <div class="row form-row network-create-row">
-        <input
-          class="text-input"
-          placeholder="Add network name (optional)"
-          data-testid="network-add-input"
-          bind:value={newNetworkName}
-          on:keydown={(event) => event.key === 'Enter' && onAddNetwork()}
-        />
-        <button class="btn" data-testid="network-add" on:click={onAddNetwork}>
-          Add network
-        </button>
+      <div class="participant-add-panel">
+        <div class="participant-add-label">Add device to {activeNetworkView.name}</div>
+        <div class="participant-add-fields">
+          <input
+            class="text-input participant-add-npub"
+            placeholder="Participant npub"
+            data-testid="participant-input"
+            value={participantInputDrafts[activeNetworkView.id] ?? ''}
+            on:input={(event) =>
+              (participantInputDrafts = {
+                ...participantInputDrafts,
+                [activeNetworkView.id]: (event.currentTarget as HTMLInputElement).value,
+              })}
+            on:keydown={(event) => event.key === 'Enter' && onAddParticipant(activeNetworkView.id)}
+          />
+          <input
+            class="text-input participant-add-alias"
+            placeholder="Alias (optional)"
+            data-testid="participant-add-alias-input"
+            value={participantAddAliasDrafts[activeNetworkView.id] ?? ''}
+            on:input={(event) =>
+              (participantAddAliasDrafts = {
+                ...participantAddAliasDrafts,
+                [activeNetworkView.id]: (event.currentTarget as HTMLInputElement).value,
+              })}
+            on:keydown={(event) => event.key === 'Enter' && onAddParticipant(activeNetworkView.id)}
+          />
+          <button
+            class="btn participant-add-btn"
+            data-testid="participant-add"
+            on:click={() => onAddParticipant(activeNetworkView.id)}
+          >
+            Add
+          </button>
+        </div>
       </div>
-    </section>
 
-    {#each state.networks as network}
-      <section class={`panel network-card ${network.enabled ? '' : 'network-disabled'}`} data-testid="network-card">
-        <div class="row spread network-header">
-          <div class="row network-title-group">
-            <input
-              class="text-input network-name-input"
-              value={networkNameDrafts[network.id] ?? network.name}
-              data-testid="network-name-input"
-              on:input={(event) =>
-                onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
-            />
-            <span class="badge muted" data-testid="network-mesh-badge">
-              {network.onlineCount}/{network.expectedCount}
-            </span>
-          </div>
-          <div class="row network-actions">
-            <label class="toggle-row compact">
-              <input
-                type="checkbox"
-                checked={network.enabled}
-                data-testid="network-enabled-toggle"
-                on:change={(event) =>
-                  runAction(() =>
-                    setNetworkEnabled(network.id, (event.currentTarget as HTMLInputElement).checked),
-                  )}
-              />
-              <span>{network.enabled ? 'On' : 'Off'}</span>
-            </label>
-            <button
-              class="btn ghost icon-btn"
-              data-testid="network-remove"
-              title="Delete network"
-              aria-label="Delete network"
-              disabled={state.networks.length <= 1}
-              on:click={() => runAction(() => removeNetwork(network.id))}
-            >
-              <Trash2 size={16} strokeWidth={2.2} />
-            </button>
+      {#if activeNetworkView.participants.length === 0}
+        <div class="item-row network-empty-state">
+          <div class="item-main">
+            <div class="item-title">No devices yet</div>
+            <div class="item-sub">Add participant npubs to start building the active mesh.</div>
           </div>
         </div>
-
-        <div class="participant-add-panel">
-          <div class="participant-add-label">Add participant</div>
-          <div class="participant-add-fields">
-            <input
-              class="text-input participant-add-npub"
-              placeholder="Participant npub"
-              data-testid="participant-input"
-              value={participantInputDrafts[network.id] ?? ''}
-              on:input={(event) =>
-                (participantInputDrafts = {
-                  ...participantInputDrafts,
-                  [network.id]: (event.currentTarget as HTMLInputElement).value,
-                })}
-              on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-            />
-            <input
-              class="text-input participant-add-alias"
-              placeholder="Alias (optional)"
-              data-testid="participant-add-alias-input"
-              value={participantAddAliasDrafts[network.id] ?? ''}
-              on:input={(event) =>
-                (participantAddAliasDrafts = {
-                  ...participantAddAliasDrafts,
-                  [network.id]: (event.currentTarget as HTMLInputElement).value,
-                })}
-              on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-            />
-            <button class="btn participant-add-btn" data-testid="participant-add" on:click={() => onAddParticipant(network.id)}>
-              Add
-            </button>
-          </div>
-        </div>
-
+      {:else}
         <div class="stack rows">
-          {#each network.participants as participant}
+          {#each activeNetworkView.participants as participant}
             <div class="item-row" data-testid="participant-row">
               <div class="item-main">
                 <div class="item-title">{short(participant.npub, 22, 12)}</div>
@@ -985,436 +1060,636 @@
                 data-testid="participant-remove"
                 title="Delete participant"
                 aria-label="Delete participant"
-                on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
+                on:click={() => runAction(() => removeParticipant(activeNetworkView.id, participant.npub))}
               >
                 <Trash2 size={16} strokeWidth={2.2} />
               </button>
             </div>
           {/each}
         </div>
+      {/if}
 
-        {#if state.lanDiscoveryEnabled}
-          {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(network, peer.npub))}
-          {#if unconfiguredLan.length > 0}
-            <div class="lan-title">LAN peers</div>
-            <div class="stack rows">
-              {#each unconfiguredLan as peer}
-                <div class="item-row" data-testid="lan-peer-row">
-                  <div class="item-main">
-                    <div class="item-title">{short(peer.npub, 22, 12)}</div>
-                    <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
-                  </div>
-                  <button class="btn" on:click={() => onAddLanPeer(network.id, peer.npub)}>Add</button>
+      {#if state.lanDiscoveryEnabled}
+        {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(activeNetworkView, peer.npub))}
+        {#if unconfiguredLan.length > 0}
+          <div class="lan-title">LAN peers</div>
+          <div class="stack rows">
+            {#each unconfiguredLan as peer}
+              <div class="item-row" data-testid="lan-peer-row">
+                <div class="item-main">
+                  <div class="item-title">{short(peer.npub, 22, 12)}</div>
+                  <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
                 </div>
-              {/each}
-            </div>
-          {/if}
+                <button class="btn" on:click={() => onAddLanPeer(activeNetworkView.id, peer.npub)}>
+                  Add
+                </button>
+              </div>
+            {/each}
+          </div>
         {/if}
-      </section>
-    {/each}
+      {/if}
+    </section>
 
-    {#if serviceInstallRecommended}
-      <section
-        class={`panel service-panel ${serviceSetupRequired ? 'service-panel-required' : ''}`}
-        data-testid="service-panel"
-      >
-        <div class="section-title-row">
-          <h2>Background Service</h2>
-          <div class="section-meta">{serviceMetaText(state)}</div>
-        </div>
-
-        <div class="row status-row">
-          <span class={`badge ${state.serviceInstalled ? 'ok' : 'warn'}`}>
-            {state.serviceInstalled ? 'Installed' : 'Setup required'}
-          </span>
-          <span class={`badge ${serviceLifecycleBadgeClass(state)}`}>
-            {serviceLifecycleBadgeText(state)}
-          </span>
-          <span class="badge muted">Daemon {state.daemonRunning ? 'reachable' : 'idle'}</span>
-        </div>
-
-        <div class="service-panel-copy">
-          <div class="service-panel-title">
-            {serviceSetupRequired
-              ? 'Install once for reliable background VPN'
-              : 'Background service keeps VPN control out of the GUI process'}
-          </div>
-          <div class="service-panel-text">
-            Required for background startup, resilient reconnects, and avoiding repeated admin prompts.
-          </div>
-          {#if state.serviceStatusDetail}
-            <div class="service-panel-detail" data-testid="service-status-detail">
-              {state.serviceStatusDetail}
-            </div>
-          {/if}
-          {#if serviceActionStatus}
-            <div class="service-panel-detail service-panel-detail-ok">{serviceActionStatus}</div>
-          {/if}
-        </div>
-
-        <div class="row service-actions-row">
-          <button
-            class={`btn ${serviceSetupRequired ? 'service-primary-btn' : ''}`}
-            data-testid="install-service-btn"
-            on:click={() =>
-              serviceEnableRecommended
-                ? onEnableSystemService()
-                : onInstallSystemService(serviceSetupRequired)}
-          >
-            {serviceEnableRecommended
-              ? 'Enable service'
-              : state.serviceInstalled
-                ? 'Reinstall service'
-                : 'Install service'}
-          </button>
-          {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
-            <button
-              class="btn ghost"
-              data-testid="disable-service-btn"
-              on:click={onDisableSystemService}
-            >
-              Disable service
-            </button>
-          {/if}
-          <button
-            class="btn ghost"
-            data-testid="uninstall-service-btn"
-            on:click={onUninstallSystemService}
-            disabled={!state.serviceInstalled}
-          >
-            Uninstall
-          </button>
-        </div>
-      </section>
-    {/if}
-
-    {#if state.serviceSupported && !serviceInstallRecommended}
-      <section class="panel service-panel" data-testid="service-panel">
-        <div class="section-title-row">
-          <h2>Background Service</h2>
-          <div class="section-meta">{serviceMetaText(state)}</div>
-        </div>
-
-        <div class="row status-row">
-          <span class="badge ok">Installed</span>
-          <span class={`badge ${serviceLifecycleBadgeClass(state)}`}>
-            {serviceLifecycleBadgeText(state)}
-          </span>
-          <span class={`badge ${state.daemonRunning ? 'ok' : 'muted'}`}>
-            Daemon {state.daemonRunning ? 'reachable' : 'idle'}
-          </span>
-        </div>
-
-        <div class="service-panel-copy">
-          <div class="service-panel-title">
-            Background service manages privileged VPN runtime operations.
-          </div>
-          {#if state.serviceStatusDetail}
-            <div class="service-panel-detail" data-testid="service-status-detail">
-              {state.serviceStatusDetail}
-            </div>
-          {/if}
-          {#if serviceActionStatus}
-            <div class="service-panel-detail service-panel-detail-ok">{serviceActionStatus}</div>
-          {/if}
-        </div>
-
-        <div class="row service-actions-row">
-          <button
-            class="btn"
-            data-testid="install-service-btn"
-            on:click={() =>
-              serviceEnableRecommended ? onEnableSystemService() : onInstallSystemService()}
-          >
-            {serviceEnableRecommended ? 'Enable service' : 'Reinstall service'}
-          </button>
-          {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
-            <button
-              class="btn ghost"
-              data-testid="disable-service-btn"
-              on:click={onDisableSystemService}
-            >
-              Disable service
-            </button>
-          {/if}
-          <button
-            class="btn ghost"
-            data-testid="uninstall-service-btn"
-            on:click={onUninstallSystemService}
-          >
-            Uninstall
-          </button>
-        </div>
-      </section>
-    {/if}
-
-    <section class="panel">
+    <section class="panel exit-node-panel">
       <div class="section-title-row">
-        <h2>Relays</h2>
-        <div class="section-meta relay-health">
-          <span class="ok-text">{state.relaySummary.up}/{state.relays.length} connected</span>
+        <div>
+          <div class="panel-kicker">Routing</div>
+          <h2>Exit Node</h2>
         </div>
+        <div class="section-meta">{state.exitNode ? 'Selected' : 'Direct mesh'}</div>
       </div>
 
-      <div class="row form-row">
+      <div class="config-path">{selectedExitNodeStatusText(state)}</div>
+      <div class="field-span field-panel exit-node-panel-body">
         <input
           class="text-input"
-          placeholder="Add relay URL"
-          data-testid="relay-input"
-          bind:value={relayInput}
-          on:keydown={(event) => event.key === 'Enter' && onAddRelay()}
+          placeholder="Search peers by alias, npub, or tunnel IP"
+          data-testid="exit-node-search"
+          bind:value={exitNodeSearch}
         />
-        <button class="btn" data-testid="relay-add" on:click={onAddRelay}>Add</button>
+        <div class="exit-node-list" data-testid="exit-node-select">
+          <button
+            class={`exit-node-card ${!state.exitNode ? 'selected' : ''}`}
+            type="button"
+            on:click={() => onSelectExitNode('')}
+          >
+            <div class="row spread">
+              <div class="item-title">No exit node</div>
+              <span class="badge muted">Direct mesh</span>
+            </div>
+            <div class="item-sub">Keep default-route traffic off peer relays and use mesh routing only.</div>
+          </button>
+
+          {#each filteredExitNodeCandidates(state, exitNodeSearch) as participant}
+            <button
+              class={`exit-node-card ${
+                state.exitNode === participant.npub ? 'selected' : ''
+              } ${!participant.offersExitNode ? 'disabled' : ''}`}
+              type="button"
+              on:click={() => onSelectExitNode(participant.npub)}
+              disabled={!participant.offersExitNode}
+            >
+              <div class="row spread">
+                <div class="item-title">{participant.magicDnsName || short(participant.npub, 18, 12)}</div>
+                <span class={`badge ${exitNodeAvailabilityClass(participant)}`}>
+                  {exitNodeAvailabilityText(participant)}
+                </span>
+              </div>
+              <div class="item-sub">
+                {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
+              </div>
+            </button>
+          {/each}
+
+          {#if filteredExitNodeCandidates(state, exitNodeSearch).length === 0}
+            <div class="config-path">No peers match that search.</div>
+          {/if}
+        </div>
+      </div>
+    </section>
+
+    <section class="panel network-directory-panel">
+      <div class="section-title-row">
+        <div>
+          <div class="panel-kicker">Profiles</div>
+          <h2 data-testid="saved-networks-title">Saved Networks</h2>
+        </div>
+        <div class="section-meta">{state.networks.length} total</div>
       </div>
 
-      <div class="stack rows">
-        {#each state.relays as relay}
-          <div class="item-row" data-testid="relay-row">
-            <div class="item-main">
-              <div class="item-title relay-url">{relay.url}</div>
-              {#if relay.state !== 'unknown' && relay.statusText}
-                <div class="item-sub">{relay.statusText}</div>
-              {/if}
+      <div class="config-path">
+        Keep one network active at a time. Switch here, then manage live devices above.
+      </div>
+
+      <div class="row form-row network-create-row">
+        <input
+          class="text-input"
+          placeholder="Add network name (optional)"
+          data-testid="network-add-input"
+          bind:value={newNetworkName}
+          on:keydown={(event) => event.key === 'Enter' && onAddNetwork()}
+        />
+        <button class="btn" data-testid="network-add" on:click={onAddNetwork}>
+          Add network
+        </button>
+      </div>
+
+      <div class="stack rows network-stack">
+        {#each [activeNetworkView, ...state.networks.filter((network) => network.id !== activeNetworkView.id)] as network}
+          <section class={`network-card ${network.enabled ? 'network-card-active' : 'network-disabled'}`} data-testid="network-card">
+            <div class="row spread network-header">
+              <div class="network-directory-main">
+                <div class="row network-directory-title-row">
+                  <input
+                    class="text-input network-name-input"
+                    value={networkNameDrafts[network.id] ?? network.name}
+                    data-testid="network-name-input"
+                    on:input={(event) =>
+                      onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
+                  />
+                  {#if network.enabled}
+                    <span class="badge ok" data-testid="network-active-badge">Active</span>
+                  {:else}
+                    <span class="badge muted">Saved</span>
+                  {/if}
+                </div>
+                <div class="config-path" data-testid="network-mesh-id">Mesh ID: {network.networkId}</div>
+                <div class="config-path">{networkPeerSummary(network)}</div>
+              </div>
+
+              <div class="row network-actions">
+                {#if !network.enabled}
+                  <button
+                    class="btn ghost"
+                    data-testid="network-activate"
+                    on:click={() => runAction(() => setNetworkEnabled(network.id, true))}
+                  >
+                    Activate
+                  </button>
+                {/if}
+                <button
+                  class="btn ghost icon-btn"
+                  data-testid="network-remove"
+                  title="Delete network"
+                  aria-label="Delete network"
+                  disabled={state.networks.length <= 1}
+                  on:click={() => runAction(() => removeNetwork(network.id))}
+                >
+                  <Trash2 size={16} strokeWidth={2.2} />
+                </button>
+              </div>
             </div>
-            <span class={`badge ${relay.state === 'up' ? 'ok' : relay.state === 'down' ? 'bad' : relay.state === 'checking' ? 'warn' : 'muted'}`}>
-              {relay.state}
-            </span>
-            <button
-              class="btn ghost icon-btn"
-              data-testid="relay-remove"
-              title="Delete relay"
-              aria-label="Delete relay"
-              on:click={() => runAction(() => removeRelay(relay.url))}
-            >
-              <Trash2 size={16} strokeWidth={2.2} />
-            </button>
-          </div>
+
+            {#if network.enabled}
+              <div class="config-path saved-network-note">
+                This network is live now. Devices, presence, and tunnel state are shown above.
+              </div>
+            {:else}
+              <details class="network-editor">
+                <summary class="network-editor-summary">Edit saved devices</summary>
+                <div class="config-path saved-network-note">
+                  Status badges appear here once you activate this network.
+                </div>
+
+                <div class="participant-add-panel">
+                  <div class="participant-add-label">Add device to {network.name}</div>
+                  <div class="participant-add-fields">
+                    <input
+                      class="text-input participant-add-npub"
+                      placeholder="Participant npub"
+                      data-testid="participant-input"
+                      value={participantInputDrafts[network.id] ?? ''}
+                      on:input={(event) =>
+                        (participantInputDrafts = {
+                          ...participantInputDrafts,
+                          [network.id]: (event.currentTarget as HTMLInputElement).value,
+                        })}
+                      on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+                    />
+                    <input
+                      class="text-input participant-add-alias"
+                      placeholder="Alias (optional)"
+                      data-testid="participant-add-alias-input"
+                      value={participantAddAliasDrafts[network.id] ?? ''}
+                      on:input={(event) =>
+                        (participantAddAliasDrafts = {
+                          ...participantAddAliasDrafts,
+                          [network.id]: (event.currentTarget as HTMLInputElement).value,
+                        })}
+                      on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+                    />
+                    <button
+                      class="btn participant-add-btn"
+                      data-testid="participant-add"
+                      on:click={() => onAddParticipant(network.id)}
+                    >
+                      Add
+                    </button>
+                  </div>
+                </div>
+
+                {#if network.participants.length === 0}
+                  <div class="item-row network-empty-state">
+                    <div class="item-main">
+                      <div class="item-title">No saved devices yet</div>
+                      <div class="item-sub">Add npubs now and activate this network later when you want it live.</div>
+                    </div>
+                  </div>
+                {:else}
+                  <div class="stack rows">
+                    {#each network.participants as participant}
+                      <div class="item-row saved-participant-row">
+                        <div class="item-main">
+                          <div class="item-title">{short(participant.npub, 22, 12)}</div>
+                          <div class="row alias-row">
+                            <input
+                              class="text-input alias-input"
+                              value={participantAliasDrafts[participant.pubkeyHex] ?? participant.magicDnsAlias}
+                              on:input={(event) =>
+                                onParticipantAliasInput(
+                                  participant.npub,
+                                  participant.pubkeyHex,
+                                  (event.currentTarget as HTMLInputElement).value,
+                                )}
+                            />
+                            {#if state.magicDnsSuffix}
+                              <span class="alias-suffix">.{state.magicDnsSuffix}</span>
+                            {/if}
+                          </div>
+                          <div class="item-sub">
+                            {participant.magicDnsName || participant.magicDnsAlias || short(participant.npub, 16, 10)} | {participant.tunnelIp}
+                            {#if participant.offersExitNode}
+                              | exit routes advertised
+                            {/if}
+                          </div>
+                        </div>
+                        <button
+                          class="btn ghost icon-btn"
+                          title="Delete participant"
+                          aria-label="Delete participant"
+                          on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
+                        >
+                          <Trash2 size={16} strokeWidth={2.2} />
+                        </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+
+                {#if state.lanDiscoveryEnabled}
+                  {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(network, peer.npub))}
+                  {#if unconfiguredLan.length > 0}
+                    <div class="lan-title">LAN peers</div>
+                    <div class="stack rows">
+                      {#each unconfiguredLan as peer}
+                        <div class="item-row" data-testid="lan-peer-row">
+                          <div class="item-main">
+                            <div class="item-title">{short(peer.npub, 22, 12)}</div>
+                            <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
+                          </div>
+                          <button class="btn" on:click={() => onAddLanPeer(network.id, peer.npub)}>
+                            Add
+                          </button>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                {/if}
+              </details>
+            {/if}
+          </section>
         {/each}
       </div>
     </section>
 
-    <section class="panel">
-      <div class="section-title-row">
-        <h2>App & Node</h2>
-      </div>
-
-      <div class="row settings-action-row">
-        <div class="config-path">Config: {state.configPath}</div>
-      </div>
-      <div class="row spread settings-action-row">
-        <div class="config-path">Terminal CLI</div>
-        <div class="row cli-actions-row">
-          <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>
-            {state.cliInstalled ? 'Reinstall CLI' : 'Install CLI'}
-          </button>
-          <button
-            class="btn ghost"
-            data-testid="uninstall-cli-btn"
-            on:click={onUninstallCli}
-            disabled={!state.cliInstalled}
-          >
-            Uninstall CLI
-          </button>
+    <details class="panel collapsible-panel" open={state.health.length > 0}>
+      <summary class="collapsible-summary">
+        <div>
+          <div class="panel-kicker">Advanced</div>
+          <h2>Diagnostics</h2>
         </div>
-      </div>
-      {#if cliActionStatus}
-        <div class="config-path">{cliActionStatus}</div>
-      {/if}
-      <div class="config-path" data-testid="magic-dns-status">DNS: {state.magicDnsStatus}</div>
+        <div class="section-meta">{healthSummaryText(state)}</div>
+      </summary>
 
-      <label class="toggle-row">
-        <input
-          type="checkbox"
-          checked={state.autoDisconnectRelaysWhenMeshReady}
-          on:change={(event) =>
-            onUpdateSettings({
-              autoDisconnectRelaysWhenMeshReady: (event.target as HTMLInputElement).checked,
-            })}
-        />
-        <span>Auto-disconnect relays when mesh is ready</span>
-      </label>
+      <div class="collapsible-body diagnostics-panel">
+        <div class="row status-row diagnostics-badges">
+          <span class="badge muted">
+            IF {state.network.defaultInterface || 'unknown'}
+          </span>
+          <span
+            class={`badge ${
+              state.network.captivePortal === true
+                ? 'bad'
+                : state.network.captivePortal === false
+                  ? 'ok'
+                  : 'muted'
+            }`}
+          >
+            {state.network.captivePortal === true
+              ? 'Captive portal'
+              : state.network.captivePortal === false
+                ? 'Open internet'
+                : 'Portal unknown'}
+          </span>
+          <span class={`badge ${state.portMapping.activeProtocol ? 'ok' : 'muted'}`}>
+            Mapping {state.portMapping.activeProtocol || 'none'}
+          </span>
+        </div>
 
-      <label class="toggle-row">
-        <input
-          type="checkbox"
-          checked={state.autoconnect}
-          on:change={(event) =>
-            onUpdateSettings({
-              autoconnect: (event.currentTarget as HTMLInputElement).checked,
-            })}
-        />
-        <span>Auto-connect session on app start</span>
-      </label>
-
-      <label class="toggle-row">
-        <input
-          type="checkbox"
-          checked={state.advertiseExitNode}
-          on:change={(event) =>
-            onUpdateSettings({
-              advertiseExitNode: (event.currentTarget as HTMLInputElement).checked,
-            })}
-        />
-        <span>Offer this device as exit node</span>
-      </label>
-      <div class="config-path settings-note">{offerExitNodeStatusText(state)}</div>
-
-      <label class="toggle-row">
-        <input
-          type="checkbox"
-          data-testid="autostart-toggle"
-          checked={state.launchOnStartup}
-          disabled={!autostartReady || autostartUpdating}
-          on:change={(event) =>
-            onToggleAutostart((event.currentTarget as HTMLInputElement).checked)}
-        />
-        <span>Launch on system startup</span>
-      </label>
-
-      <label class="toggle-row">
-        <input
-          type="checkbox"
-          checked={state.closeToTrayOnClose}
-          on:change={(event) =>
-            onUpdateSettings({
-              closeToTrayOnClose: (event.currentTarget as HTMLInputElement).checked,
-            })}
-        />
-        <span>Keep running in menu bar when window is closed</span>
-      </label>
-
-      <div class="field-grid">
-        <div class="field-span field-panel">
-          <span>Use Another Device as Exit Node</span>
-          <input
-            class="text-input"
-            placeholder="Search peers by alias, npub, or tunnel IP"
-            data-testid="exit-node-search"
-            bind:value={exitNodeSearch}
-          />
-          <div class="exit-node-list" data-testid="exit-node-select">
-            <button
-              class={`exit-node-card ${!state.exitNode ? 'selected' : ''}`}
-              type="button"
-              on:click={() => onSelectExitNode('')}
-            >
-              <div class="row spread">
-                <div class="item-title">No exit node</div>
-                <span class="badge muted">Direct mesh</span>
-              </div>
-              <div class="item-sub">Keep internet-bound traffic local and only use mesh-specific routes.</div>
-            </button>
-
-            {#each filteredExitNodeCandidates(state, exitNodeSearch) as participant}
-              <button
-                class={`exit-node-card ${
-                  state.exitNode === participant.npub ? 'selected' : ''
-                } ${!participant.offersExitNode ? 'disabled' : ''}`}
-                type="button"
-                on:click={() => onSelectExitNode(participant.npub)}
-                disabled={!participant.offersExitNode}
-              >
-                <div class="row spread">
-                  <div class="item-title">{participant.magicDnsName || short(participant.npub, 18, 12)}</div>
-                  <span class={`badge ${exitNodeAvailabilityClass(participant)}`}>
-                    {exitNodeAvailabilityText(participant)}
-                  </span>
-                </div>
-                <div class="item-sub">
-                  {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
-                </div>
-              </button>
-            {/each}
-
-            {#if filteredExitNodeCandidates(state, exitNodeSearch).length === 0}
-              <div class="config-path">No peers match that search.</div>
+        <div class="diagnostics-copy">
+          <div class="config-path">
+            Local addresses:
+            {state.network.primaryIpv4 || 'no IPv4'}
+            {#if state.network.primaryIpv6}
+              | {state.network.primaryIpv6}
             {/if}
           </div>
-          <div class="config-path">{selectedExitNodeStatusText(state)}</div>
+          <div class="config-path">
+            Gateway:
+            {state.network.gatewayIpv4 || state.network.gatewayIpv6 || 'unknown'}
+          </div>
+          <div class="config-path">
+            External endpoint:
+            {state.portMapping.externalEndpoint || 'stun / direct only'}
+          </div>
         </div>
 
-        <div class="field-span field-panel advanced-panel">
-          <button
-            class="advanced-toggle"
-            type="button"
-            on:click={() => {
-              showAdvancedRoutes = !showAdvancedRoutes
-            }}
-          >
-            {showAdvancedRoutes ? 'Hide advanced route advertising' : 'Advanced: advertise extra routes'}
-          </button>
-          <div class="config-path">{additionalRoutesStatusText(state)}</div>
+        {#if state.health.length === 0}
+          <div class="config-path" data-testid="health-empty">Daemon reports no active health warnings.</div>
+        {:else}
+          <div class="stack rows">
+            {#each state.health as issue}
+              <div class="health-card" data-testid="health-issue">
+                <div class="row spread health-card-header">
+                  <div class="item-title">{issue.summary}</div>
+                  <span class={`badge ${healthBadgeClass(issue.severity)}`}>{issue.severity}</span>
+                </div>
+                <div class="item-sub">{issue.detail}</div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </details>
 
-          {#if showAdvancedRoutes}
-            <label class="advanced-routes-field">
-              <span>Additional Advertised Routes</span>
-              <input
-                class="text-input"
-                placeholder="10.0.0.0/24, 192.168.0.0/24"
-                bind:value={advertisedRoutesDraft}
-                on:input={() =>
-                  debounce('advertisedRoutes', () =>
-                    onUpdateSettings({ advertisedRoutes: advertisedRoutesDraft }))}
-              />
-            </label>
-          {/if}
+    {#if state.serviceSupported && !serviceInstallRecommended && !serviceEnableRecommended}
+      <details class="panel collapsible-panel service-panel" data-testid="service-panel">
+        <summary class="collapsible-summary">
+          <div>
+            <div class="panel-kicker">Advanced</div>
+            <h2>Background Service</h2>
+          </div>
+          <div class="section-meta">{serviceMetaText(state)}</div>
+        </summary>
+
+        <div class="collapsible-body">
+          <div class="row status-row">
+            <span class="badge ok">Installed</span>
+            <span class={`badge ${serviceLifecycleBadgeClass(state)}`}>
+              {serviceLifecycleBadgeText(state)}
+            </span>
+            <span class={`badge ${state.daemonRunning ? 'ok' : 'muted'}`}>
+              Daemon {state.daemonRunning ? 'reachable' : 'idle'}
+            </span>
+          </div>
+
+          <div class="service-panel-copy">
+            <div class="service-panel-title">
+              Background service manages privileged VPN runtime operations.
+            </div>
+            {#if state.serviceStatusDetail}
+              <div class="service-panel-detail" data-testid="service-status-detail">
+                {state.serviceStatusDetail}
+              </div>
+            {/if}
+            {#if serviceActionStatus}
+              <div class="service-panel-detail service-panel-detail-ok">{serviceActionStatus}</div>
+            {/if}
+          </div>
+
+          <div class="row service-actions-row">
+            <button
+              class="btn"
+              data-testid="install-service-btn"
+              on:click={() =>
+                serviceEnableRecommended ? onEnableSystemService() : onInstallSystemService()}
+            >
+              {serviceEnableRecommended ? 'Enable service' : 'Reinstall service'}
+            </button>
+            {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
+              <button
+                class="btn ghost"
+                data-testid="disable-service-btn"
+                on:click={onDisableSystemService}
+              >
+                Disable service
+              </button>
+            {/if}
+            <button
+              class="btn ghost"
+              data-testid="uninstall-service-btn"
+              on:click={onUninstallSystemService}
+            >
+              Uninstall
+            </button>
+          </div>
+        </div>
+      </details>
+    {/if}
+
+    <details class="panel collapsible-panel">
+      <summary class="collapsible-summary">
+        <div>
+          <div class="panel-kicker">Advanced</div>
+          <h2>Relays</h2>
+        </div>
+        <div class="section-meta relay-health">
+          <span class="ok-text">{state.relaySummary.up}/{state.relays.length} connected</span>
+        </div>
+      </summary>
+
+      <div class="collapsible-body">
+        <div class="row form-row">
+          <input
+            class="text-input"
+            placeholder="Add relay URL"
+            data-testid="relay-input"
+            bind:value={relayInput}
+            on:keydown={(event) => event.key === 'Enter' && onAddRelay()}
+          />
+          <button class="btn" data-testid="relay-add" on:click={onAddRelay}>Add</button>
         </div>
 
-        <label>
-          <span>MagicDNS Suffix (Optional)</span>
-          <input
-            class="text-input"
-            data-testid="magic-dns-suffix-input"
-            bind:value={magicDnsSuffixDraft}
-            on:input={() =>
-              debounce('magicDnsSuffix', () =>
-                onUpdateSettings({ magicDnsSuffix: magicDnsSuffixDraft }))}
-          />
-        </label>
+        <div class="stack rows">
+          {#each state.relays as relay}
+            <div class="item-row" data-testid="relay-row">
+              <div class="item-main">
+                <div class="item-title relay-url">{relay.url}</div>
+                {#if relay.state !== 'unknown' && relay.statusText}
+                  <div class="item-sub">{relay.statusText}</div>
+                {/if}
+              </div>
+              <span class={`badge ${relay.state === 'up' ? 'ok' : relay.state === 'down' ? 'bad' : relay.state === 'checking' ? 'warn' : 'muted'}`}>
+                {relay.state}
+              </span>
+              <button
+                class="btn ghost icon-btn"
+                data-testid="relay-remove"
+                title="Delete relay"
+                aria-label="Delete relay"
+                on:click={() => runAction(() => removeRelay(relay.url))}
+              >
+                <Trash2 size={16} strokeWidth={2.2} />
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+    </details>
 
-        <label>
-          <span>Node Name</span>
-          <input
-            class="text-input"
-            data-testid="node-name-input"
-            bind:value={nodeNameDraft}
-            on:input={() => debounce('nodeName', () => onUpdateSettings({ nodeName: nodeNameDraft }))}
-          />
-        </label>
+    <details class="panel collapsible-panel">
+      <summary class="collapsible-summary">
+        <div>
+          <div class="panel-kicker">Advanced</div>
+          <h2>Settings</h2>
+        </div>
+        <div class="section-meta">Node & app</div>
+      </summary>
 
-        <label>
-          <span>Endpoint</span>
-          <input
-            class="text-input"
-            bind:value={endpointDraft}
-            on:input={() => debounce('endpoint', () => onUpdateSettings({ endpoint: endpointDraft }))}
-          />
-        </label>
+      <div class="collapsible-body">
+        <div class="row settings-action-row">
+          <div class="config-path">Config: {state.configPath}</div>
+        </div>
+        <div class="row spread settings-action-row">
+          <div class="config-path">Terminal CLI</div>
+          <div class="row cli-actions-row">
+            <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>
+              {state.cliInstalled ? 'Reinstall CLI' : 'Install CLI'}
+            </button>
+            <button
+              class="btn ghost"
+              data-testid="uninstall-cli-btn"
+              on:click={onUninstallCli}
+              disabled={!state.cliInstalled}
+            >
+              Uninstall CLI
+            </button>
+          </div>
+        </div>
+        {#if cliActionStatus}
+          <div class="config-path">{cliActionStatus}</div>
+        {/if}
+        <div class="config-path" data-testid="magic-dns-status">DNS: {state.magicDnsStatus}</div>
 
-        <label>
-          <span>Tunnel IP</span>
+        <label class="toggle-row">
           <input
-            class="text-input"
-            bind:value={tunnelIpDraft}
-            on:input={() => debounce('tunnelIp', () => onUpdateSettings({ tunnelIp: tunnelIpDraft }))}
-          />
-        </label>
-
-        <label>
-          <span>Listen Port</span>
-          <input
-            class="text-input"
-            bind:value={listenPortDraft}
-            on:input={() =>
-              debounce('listenPort', async () => {
-                const parsed = Number.parseInt(listenPortDraft, 10)
-                if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
-                  await onUpdateSettings({ listenPort: parsed })
-                }
+            type="checkbox"
+            checked={state.autoDisconnectRelaysWhenMeshReady}
+            on:change={(event) =>
+              onUpdateSettings({
+                autoDisconnectRelaysWhenMeshReady: (event.target as HTMLInputElement).checked,
               })}
           />
+          <span>Auto-disconnect relays when mesh is ready</span>
         </label>
+
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={state.autoconnect}
+            on:change={(event) =>
+              onUpdateSettings({
+                autoconnect: (event.currentTarget as HTMLInputElement).checked,
+              })}
+          />
+          <span>Auto-connect session on app start</span>
+        </label>
+
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={state.advertiseExitNode}
+            on:change={(event) =>
+              onUpdateSettings({
+                advertiseExitNode: (event.currentTarget as HTMLInputElement).checked,
+              })}
+          />
+          <span>Advertise exit node (default routes)</span>
+        </label>
+
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            data-testid="autostart-toggle"
+            checked={state.launchOnStartup}
+            disabled={!autostartReady || autostartUpdating}
+            on:change={(event) =>
+              onToggleAutostart((event.currentTarget as HTMLInputElement).checked)}
+          />
+          <span>Launch on system startup</span>
+        </label>
+
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={state.closeToTrayOnClose}
+            on:change={(event) =>
+              onUpdateSettings({
+                closeToTrayOnClose: (event.currentTarget as HTMLInputElement).checked,
+              })}
+          />
+          <span>Keep running in menu bar when window is closed</span>
+        </label>
+
+        <div class="field-grid">
+          <label>
+            <span>Advertised Routes</span>
+            <input
+              class="text-input"
+              placeholder="10.0.0.0/24, 192.168.0.0/24"
+              bind:value={advertisedRoutesDraft}
+              on:input={() =>
+                debounce('advertisedRoutes', () =>
+                  onUpdateSettings({ advertisedRoutes: advertisedRoutesDraft }))}
+            />
+          </label>
+
+          <label>
+            <span>MagicDNS Suffix (Optional)</span>
+            <input
+              class="text-input"
+              data-testid="magic-dns-suffix-input"
+              bind:value={magicDnsSuffixDraft}
+              on:input={() =>
+                debounce('magicDnsSuffix', () =>
+                  onUpdateSettings({ magicDnsSuffix: magicDnsSuffixDraft }))}
+            />
+          </label>
+
+          <label>
+            <span>Node Name</span>
+            <input
+              class="text-input"
+              data-testid="node-name-input"
+              bind:value={nodeNameDraft}
+              on:input={() => debounce('nodeName', () => onUpdateSettings({ nodeName: nodeNameDraft }))}
+            />
+          </label>
+
+          <label>
+            <span>Endpoint</span>
+            <input
+              class="text-input"
+              bind:value={endpointDraft}
+              on:input={() => debounce('endpoint', () => onUpdateSettings({ endpoint: endpointDraft }))}
+            />
+          </label>
+
+          <label>
+            <span>Tunnel IP</span>
+            <input
+              class="text-input"
+              bind:value={tunnelIpDraft}
+              on:input={() => debounce('tunnelIp', () => onUpdateSettings({ tunnelIp: tunnelIpDraft }))}
+            />
+          </label>
+
+          <label>
+            <span>Listen Port</span>
+            <input
+              class="text-input"
+              bind:value={listenPortDraft}
+              on:input={() =>
+                debounce('listenPort', async () => {
+                  const parsed = Number.parseInt(listenPortDraft, 10)
+                  if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
+                    await onUpdateSettings({ listenPort: parsed })
+                  }
+                })}
+            />
+          </label>
+        </div>
       </div>
-    </section>
+    </details>
   {/if}
 </main>
