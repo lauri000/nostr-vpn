@@ -327,6 +327,13 @@ body {
   font-size: 18px;
 }
 
+.mesh-share-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
 .section-title-row {
   display: flex;
   align-items: center;
@@ -704,6 +711,24 @@ body {
 .participant-add-fields {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(170px, 220px) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.invite-import-panel {
+  margin-top: 10px;
+}
+
+.invite-help {
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.invite-import-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
 }
@@ -1108,6 +1133,10 @@ body {
   }
 
   .participant-add-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .invite-import-fields {
     grid-template-columns: 1fr;
   }
 

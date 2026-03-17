@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nostr_sdk::prelude::{PublicKey, ToBech32};
 use nostr_vpn_core::config::{
     AppConfig, derive_mesh_tunnel_ip, maybe_autoconfigure_node, normalize_advertised_route,
@@ -47,6 +48,8 @@ const GUI_SERVICE_SETUP_REQUIRED_STATUS: &str =
     "Install background service to turn VPN on from the app";
 const GUI_SERVICE_SETUP_REQUIRED_AUTOCONNECT_STATUS: &str =
     "Install background service to enable app auto-connect";
+const NETWORK_INVITE_PREFIX: &str = "nvpn://invite/";
+const NETWORK_INVITE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Default)]
 struct RelayStatus {
@@ -242,6 +245,7 @@ struct UiState {
     own_npub: String,
     own_pubkey_hex: String,
     network_id: String,
+    active_network_invite: String,
     node_id: String,
     node_name: String,
     endpoint: String,
@@ -286,6 +290,16 @@ struct SettingsPatch {
     lan_discovery_enabled: Option<bool>,
     launch_on_startup: Option<bool>,
     close_to_tray_on_close: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct NetworkInvite {
+    v: u8,
+    network_name: String,
+    network_id: String,
+    inviter_npub: String,
+    relays: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,6 +597,30 @@ impl NvpnBackend {
         }
         self.sync_daemon_state();
         self.maybe_refresh_lan_discovery();
+
+        Ok(())
+    }
+
+    fn import_network_invite(&mut self, invite_code: &str) -> Result<()> {
+        let invite = parse_network_invite(invite_code)?;
+        apply_network_invite_to_active_network(&mut self.config, &invite)?;
+        let normalized_inviter = normalize_nostr_pubkey(&invite.inviter_npub)?;
+        self.peer_status.entry(normalized_inviter).or_default();
+
+        self.config.ensure_defaults();
+        maybe_autoconfigure_node(&mut self.config);
+        self.persist_config()?;
+
+        self.ensure_peer_status_entries();
+        self.ensure_relay_status_entries();
+        self.reload_daemon_if_running()?;
+        self.sync_daemon_state();
+        self.maybe_refresh_lan_discovery();
+        self.session_status = if self.daemon_running {
+            format!("Invite imported and applied for {}.", invite.network_name)
+        } else {
+            format!("Invite imported for {}.", invite.network_name)
+        };
 
         Ok(())
     }
@@ -2067,6 +2105,7 @@ impl NvpnBackend {
             own_npub,
             own_pubkey_hex,
             network_id: self.config.effective_network_id(),
+            active_network_invite: active_network_invite_code(&self.config).unwrap_or_default(),
             node_id: self.config.node.id.clone(),
             node_name: self.config.node_name.clone(),
             endpoint: self.config.node.endpoint.clone(),
@@ -2176,6 +2215,111 @@ fn peer_offers_exit_node(routes: &[String]) -> bool {
     routes
         .iter()
         .any(|route| route == "0.0.0.0/0" || route == "::/0")
+}
+
+fn active_network_invite_code(config: &AppConfig) -> Result<String> {
+    let invite = NetworkInvite {
+        v: NETWORK_INVITE_VERSION,
+        network_name: config.active_network().name.trim().to_string(),
+        network_id: config.effective_network_id(),
+        inviter_npub: to_npub(&config.own_nostr_pubkey_hex()?),
+        relays: normalized_invite_relays(&config.nostr.relays)?,
+    };
+    let encoded = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&invite).context("failed to encode network invite JSON")?);
+    Ok(format!("{NETWORK_INVITE_PREFIX}{encoded}"))
+}
+
+fn parse_network_invite(value: &str) -> Result<NetworkInvite> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("invite code is empty"));
+    }
+
+    let mut invite = if trimmed.starts_with('{') {
+        serde_json::from_str::<NetworkInvite>(trimmed)
+            .context("failed to parse network invite JSON")?
+    } else {
+        let payload = trimmed
+            .strip_prefix(NETWORK_INVITE_PREFIX)
+            .unwrap_or(trimmed);
+        let decoded = URL_SAFE_NO_PAD
+            .decode(payload)
+            .context("failed to decode network invite payload")?;
+        serde_json::from_slice::<NetworkInvite>(&decoded)
+            .context("failed to parse network invite payload")?
+    };
+
+    if invite.v != NETWORK_INVITE_VERSION {
+        return Err(anyhow!(
+            "unsupported invite version {}; expected {}",
+            invite.v,
+            NETWORK_INVITE_VERSION
+        ));
+    }
+
+    invite.network_name = invite.network_name.trim().to_string();
+    if invite.network_name.is_empty() {
+        return Err(anyhow!("invite network name is empty"));
+    }
+
+    invite.network_id = invite.network_id.trim().to_string();
+    if invite.network_id.is_empty() {
+        return Err(anyhow!("invite network id is empty"));
+    }
+
+    invite.inviter_npub = to_npub(&normalize_nostr_pubkey(&invite.inviter_npub)?);
+    invite.relays = normalized_invite_relays(&invite.relays)?;
+
+    Ok(invite)
+}
+
+fn apply_network_invite_to_active_network(
+    config: &mut AppConfig,
+    invite: &NetworkInvite,
+) -> Result<()> {
+    let should_adopt_name = {
+        let active = config.active_network();
+        active.participants.is_empty()
+            && (active.name.trim().is_empty() || active.name.trim().starts_with("Network "))
+    };
+    let active_network_entry_id = config.active_network().id.clone();
+
+    config.set_active_network_id(&invite.network_id)?;
+    config.add_participant_to_network(&active_network_entry_id, &invite.inviter_npub)?;
+
+    if should_adopt_name {
+        config.rename_network(&active_network_entry_id, &invite.network_name)?;
+    }
+
+    for relay in &invite.relays {
+        if !config.nostr.relays.iter().any(|existing| existing == relay) {
+            config.nostr.relays.push(relay.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn normalized_invite_relays(relays: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for relay in relays {
+        let relay = relay.trim();
+        if relay.is_empty() {
+            continue;
+        }
+        if !is_valid_relay_url(relay) {
+            return Err(anyhow!("invalid invite relay '{relay}'"));
+        }
+        if !normalized.iter().any(|existing| existing == relay) {
+            normalized.push(relay.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
+fn is_valid_relay_url(value: &str) -> bool {
+    value.starts_with("ws://") || value.starts_with("wss://")
 }
 
 fn parse_exit_node_input(value: &str) -> Result<String> {
@@ -3391,6 +3535,20 @@ fn add_participant(
 }
 
 #[tauri::command]
+fn import_network_invite(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    invite: String,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
+        backend.import_network_invite(&invite)?;
+        Ok(backend.ui_state())
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
 fn remove_participant(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -3652,6 +3810,7 @@ pub fn run() {
             remove_network,
             set_network_enabled,
             add_participant,
+            import_network_invite,
             remove_participant,
             set_participant_alias,
             add_relay,
@@ -3675,18 +3834,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredPeerStatus, GuiLaunchDisposition, NetworkView, ParticipantView,
-        PeerPresenceStatus, TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID,
-        TrayMenuItemSpec, TrayRuntimeState, cli_binary_installed_at, expected_peer_count,
+        ConfiguredPeerStatus, GuiLaunchDisposition, NETWORK_INVITE_PREFIX, NetworkInvite,
+        NetworkView, ParticipantView, PeerPresenceStatus, TRAY_EXIT_NODE_NONE_MENU_ID,
+        TRAY_RUN_EXIT_NODE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
+        apply_network_invite_to_active_network, cli_binary_installed_at, expected_peer_count,
         extract_json_document, gui_launch_disposition, gui_requires_service_enable,
         gui_requires_service_install, is_already_running_message, is_mesh_complete,
         is_not_running_message, parse_advertised_routes_input, parse_exit_node_input,
-        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
-        peer_state_label, should_defer_gui_daemon_start_to_service_on_autostart,
-        should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
-        started_from_autostart_args, to_npub, tray_exit_node_entries, tray_menu_spec,
-        tray_network_groups, tray_status_text, validate_nvpn_binary, within_peer_online_grace,
-        within_peer_presence_grace,
+        parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
+        peer_presence_state_label, peer_state_label,
+        should_defer_gui_daemon_start_to_service_on_autostart, should_start_gui_daemon_on_launch,
+        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
+        tray_exit_node_entries, tray_menu_spec, tray_network_groups, tray_status_text,
+        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -3835,6 +3995,73 @@ mod tests {
         assert_eq!(
             parse_exit_node_input("").expect("empty should clear selection"),
             String::new()
+        );
+    }
+
+    #[test]
+    fn active_network_invite_round_trips() {
+        let inviter_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let inviter_npub = to_npub(&inviter_hex);
+        let mut config = AppConfig::generated();
+        config.nostr.public_key = inviter_npub.clone();
+        config.networks[0].name = "Home".to_string();
+        config.networks[0].network_id = "mesh-home".to_string();
+        config.nostr.relays = vec![
+            "wss://relay.one.example".to_string(),
+            "wss://relay.two.example".to_string(),
+        ];
+
+        let code = active_network_invite_code(&config).expect("invite code should encode");
+        assert!(code.starts_with(NETWORK_INVITE_PREFIX));
+
+        let parsed = parse_network_invite(&code).expect("invite code should decode");
+        assert_eq!(
+            parsed,
+            NetworkInvite {
+                v: 1,
+                network_name: "Home".to_string(),
+                network_id: "mesh-home".to_string(),
+                inviter_npub,
+                relays: vec![
+                    "wss://relay.one.example".to_string(),
+                    "wss://relay.two.example".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn applying_network_invite_updates_active_network_and_merges_relays() {
+        let inviter_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let invite = NetworkInvite {
+            v: 1,
+            network_name: "Home".to_string(),
+            network_id: "mesh-home".to_string(),
+            inviter_npub: to_npub(&inviter_hex),
+            relays: vec![
+                "wss://existing.example".to_string(),
+                "wss://invite.example".to_string(),
+            ],
+        };
+        let mut config = AppConfig::generated();
+        config.networks[0].name = "Network 1".to_string();
+        config.nostr.public_key =
+            "npub1j4c4x0w2g6q3jz9q8ruy6xw0jfs6w8szk8dks3l8h0f5syv2sgzq9w8m7n".to_string();
+        config.nostr.relays = vec!["wss://existing.example".to_string()];
+
+        apply_network_invite_to_active_network(&mut config, &invite).expect("invite should apply");
+
+        assert_eq!(config.networks[0].name, "Home");
+        assert_eq!(config.effective_network_id(), "mesh-home");
+        assert_eq!(config.participant_pubkeys_hex(), vec![inviter_hex]);
+        assert_eq!(
+            config.nostr.relays,
+            vec![
+                "wss://existing.example".to_string(),
+                "wss://invite.example".to_string(),
+            ]
         );
     }
 

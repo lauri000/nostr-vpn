@@ -10,6 +10,7 @@
     disableSystemService,
     disconnectSession,
     enableSystemService,
+    importNetworkInvite,
     installCli,
     installSystemService,
     isAutostartEnabled,
@@ -40,9 +41,10 @@
   let error = ''
   let cliActionStatus = ''
   let serviceActionStatus = ''
-  let copiedPubkey = false
+  let copiedValue: 'pubkey' | 'meshId' | 'invite' | null = null
 
   let newNetworkName = ''
+  let inviteInputDraft = ''
   let nodeNameDraft = ''
   let endpointDraft = ''
   let tunnelIpDraft = ''
@@ -625,6 +627,18 @@
     await runAction(() => addParticipant(networkId, npub, ''))
   }
 
+  async function onImportInvite() {
+    const invite = inviteInputDraft.trim()
+    if (!invite) {
+      return
+    }
+
+    await runAction(() => importNetworkInvite(invite))
+    if (!error) {
+      inviteInputDraft = ''
+    }
+  }
+
   async function onAddRelay() {
     const relay = relayInput.trim()
     if (!relay) {
@@ -704,24 +718,44 @@
     autostartUpdating = false
   }
 
-  async function copyPubkey() {
-    if (!state) {
-      return
-    }
-
+  async function copyText(value: string, kind: 'pubkey' | 'meshId' | 'invite') {
     try {
-      await navigator.clipboard.writeText(state.ownNpub)
-      copiedPubkey = true
+      await navigator.clipboard.writeText(value)
+      copiedValue = kind
       if (copiedHandle) {
         window.clearTimeout(copiedHandle)
       }
       copiedHandle = window.setTimeout(() => {
-        copiedPubkey = false
+        copiedValue = null
         copiedHandle = null
       }, 2000)
     } catch {
       error = 'Clipboard copy failed'
     }
+  }
+
+  async function copyPubkey() {
+    if (!state) {
+      return
+    }
+
+    await copyText(state.ownNpub, 'pubkey')
+  }
+
+  async function copyMeshId() {
+    if (!state) {
+      return
+    }
+
+    await copyText(state.networkId, 'meshId')
+  }
+
+  async function copyInvite() {
+    if (!state?.activeNetworkInvite) {
+      return
+    }
+
+    await copyText(state.activeNetworkInvite, 'invite')
   }
 
   onMount(async () => {
@@ -791,7 +825,7 @@
             on:click={copyPubkey}
           >
             <span class="copy-icon" aria-hidden="true">
-              {#if copiedPubkey}
+              {#if copiedValue === 'pubkey'}
                 <Check size={16} strokeWidth={2.3} />
               {:else}
                 <Copy size={16} strokeWidth={2.2} />
@@ -807,6 +841,18 @@
           <div class="panel-kicker">Mesh ID</div>
           <div class="hero-stat-value hero-stat-mono" data-testid="mesh-id">{state.networkId}</div>
           <div class="config-path">Share this mesh ID only with devices in {activeNetworkView.name}.</div>
+          <div class="mesh-share-actions">
+            <button class="btn copy-btn" data-testid="copy-mesh-id" on:click={copyMeshId}>
+              <span class="copy-icon" aria-hidden="true">
+                {#if copiedValue === 'meshId'}
+                  <Check size={16} strokeWidth={2.3} />
+                {:else}
+                  <Copy size={16} strokeWidth={2.2} />
+                {/if}
+              </span>
+              <span>{copiedValue === 'meshId' ? 'Copied' : 'Copy Mesh ID'}</span>
+            </button>
+          </div>
         </div>
 
         <div class="hero-stat-card">
@@ -941,10 +987,22 @@
           <div class="config-path">{networkPeerSummary(activeNetworkView)}</div>
         </div>
         <div class="spotlight-meta-card">
-          <div class="panel-kicker">Mesh ID</div>
-          <div class="spotlight-meta-value hero-stat-mono">{activeNetworkView.networkId}</div>
+          <div class="panel-kicker">Invite</div>
+          <div class="spotlight-meta-value">One paste to join</div>
           <div class="config-path">
-            Peers on {activeNetworkView.name} must share this Mesh ID and list each other as participants.
+            Includes the Mesh ID, your npub, and the relay list for {activeNetworkView.name}.
+          </div>
+          <div class="mesh-share-actions">
+            <button class="btn copy-btn" data-testid="copy-network-invite" on:click={copyInvite}>
+              <span class="copy-icon" aria-hidden="true">
+                {#if copiedValue === 'invite'}
+                  <Check size={16} strokeWidth={2.3} />
+                {:else}
+                  <Copy size={16} strokeWidth={2.2} />
+                {/if}
+              </span>
+              <span>{copiedValue === 'invite' ? 'Copied' : 'Copy Invite'}</span>
+            </button>
           </div>
         </div>
       </div>
@@ -961,6 +1019,25 @@
         />
         LAN discovery (multicast)
       </label>
+
+      <div class="participant-add-panel invite-import-panel">
+        <div class="participant-add-label">Join from invite</div>
+        <div class="invite-help">
+          Paste an invite copied from another device to set the Mesh ID, add that device, and merge its relays.
+        </div>
+        <div class="invite-import-fields">
+          <input
+            class="text-input invite-import-input"
+            placeholder="nvpn://invite/..."
+            data-testid="invite-input"
+            bind:value={inviteInputDraft}
+            on:keydown={(event) => event.key === 'Enter' && onImportInvite()}
+          />
+          <button class="btn participant-add-btn" data-testid="invite-import" on:click={onImportInvite}>
+            Import
+          </button>
+        </div>
+      </div>
 
       <div class="participant-add-panel">
         <div class="participant-add-label">Add device to {activeNetworkView.name}</div>

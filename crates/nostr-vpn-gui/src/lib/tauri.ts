@@ -14,12 +14,56 @@ const normalizeAlias = (value: string) =>
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/^-+|-+$/g, '')
 
+const NETWORK_INVITE_PREFIX = 'nvpn://invite/'
+
+type MockNetworkInvite = {
+  v: number
+  networkName: string
+  networkId: string
+  inviterNpub: string
+  relays: string[]
+}
+
 const pseudoHexFromNpub = (npub: string) => {
   const seed = npub
     .replace(/^npub1/i, '')
     .replace(/[^a-z0-9]/gi, '')
     .toLowerCase()
   return (seed + 'a'.repeat(64)).slice(0, 64)
+}
+
+const encodeInvitePayload = (payload: MockNetworkInvite) => {
+  const bytes = new TextEncoder().encode(JSON.stringify(payload))
+  let binary = ''
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte)
+  }
+  return `${NETWORK_INVITE_PREFIX}${btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')}`
+}
+
+const decodeInvitePayload = (invite: string): MockNetworkInvite => {
+  const trimmed = invite.trim()
+  if (!trimmed) {
+    throw new Error('Invite code is empty')
+  }
+
+  const payload = trimmed.startsWith('{')
+    ? trimmed
+    : trimmed.startsWith(NETWORK_INVITE_PREFIX)
+      ? trimmed.slice(NETWORK_INVITE_PREFIX.length)
+      : trimmed
+
+  if (payload.startsWith('{')) {
+    return JSON.parse(payload) as MockNetworkInvite
+  }
+
+  const padded = payload + '='.repeat((4 - (payload.length % 4 || 4)) % 4)
+  const binary = atob(padded.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
+  return JSON.parse(new TextDecoder().decode(bytes)) as MockNetworkInvite
 }
 
 const countExpected = (network: NetworkView) =>
@@ -60,6 +104,7 @@ const mockState: UiState = {
   ownNpub: 'npub1akgu9lxldpt32lnjf97k005a4kgasewmvsrmkpzqeff39ssev0ssd6t3u',
   ownPubkeyHex: 'f'.repeat(64),
   networkId: 'nostr-vpn:mockmesh',
+  activeNetworkInvite: '',
   nodeId: 'mock-node',
   nodeName: 'nostr-vpn-node',
   endpoint: '192.168.1.4:51820',
@@ -79,6 +124,20 @@ const mockState: UiState = {
   connectedPeerCount: 0,
   expectedPeerCount: 0,
   meshReady: false,
+  health: [],
+  network: {
+    defaultInterface: 'en0',
+    primaryIpv4: '192.168.1.4',
+    primaryIpv6: 'fd00::4',
+    gatewayIpv4: '192.168.1.1',
+    gatewayIpv6: 'fd00::1',
+    captivePortal: false,
+  },
+  portMapping: {
+    upnp: { state: 'unknown', detail: 'not checked' },
+    natPmp: { state: 'unknown', detail: 'not checked' },
+    pcp: { state: 'unknown', detail: 'not checked' },
+  },
   networks: [
     {
       id: 'network-1',
@@ -112,6 +171,21 @@ const cloneMockState = () => structuredClone(mockState)
 const mockActiveNetwork = () =>
   mockState.networks.find((network) => network.enabled) ?? mockState.networks[0]
 
+const buildMockActiveNetworkInvite = () => {
+  const activeNetwork = mockActiveNetwork()
+  if (!activeNetwork) {
+    return ''
+  }
+
+  return encodeInvitePayload({
+    v: 1,
+    networkName: activeNetwork.name,
+    networkId: activeNetwork.networkId,
+    inviterNpub: mockState.ownNpub,
+    relays: mockState.relays.map((relay) => relay.url),
+  })
+}
+
 const activateMockNetwork = (networkId: string) => {
   mockState.networks = mockState.networks.map((network) => ({
     ...network,
@@ -140,6 +214,7 @@ const recomputeMockConnectivity = () => {
 
   const activeNetwork = mockActiveNetwork()
   mockState.networkId = activeNetwork?.networkId || mockState.networkId
+  mockState.activeNetworkInvite = buildMockActiveNetworkInvite()
   mockState.connectedPeerCount = activeNetwork?.onlineCount || 0
   mockState.expectedPeerCount = activeNetwork?.expectedCount || 0
   mockState.meshReady =
@@ -363,37 +438,75 @@ export const setNetworkEnabled = (networkId: string, enabled: boolean) =>
         return asResult()
       })()
 
+const upsertMockParticipant = (networkId: string, npub: string, alias = '') => {
+  const target = mockState.networks.find((network) => network.id === networkId)
+  if (!target || target.participants.some((participant) => participant.npub === npub)) {
+    return
+  }
+
+  const pubkeyHex = pseudoHexFromNpub(npub)
+  const aliasCandidate = normalizeAlias(alias)
+  const magicDnsAlias =
+    aliasCandidate.length > 0 ? aliasCandidate : `peer-${pubkeyHex.slice(0, 10)}`
+
+  target.participants.push({
+    npub,
+    pubkeyHex,
+    tunnelIp: '10.44.0.2/32',
+    magicDnsAlias,
+    magicDnsName: composeMagicDnsName(magicDnsAlias, mockState.magicDnsSuffix),
+    advertisedRoutes: [],
+    offersExitNode: false,
+    state: 'unknown',
+    presenceState: 'absent',
+    statusText: 'no signal yet',
+    lastSignalText: 'nostr unseen',
+  })
+}
+
 export const addParticipant = (networkId: string, npub: string, alias = '') =>
   isTauriRuntime()
     ? invoke<UiState>('add_participant', { networkId, npub, alias: alias.trim() || null })
     : (() => {
-        const target = mockState.networks.find((network) => network.id === networkId)
-        if (!target) {
+        upsertMockParticipant(networkId, npub, alias)
+        return asResult()
+      })()
+
+export const importNetworkInvite = (invite: string) =>
+  isTauriRuntime()
+    ? invoke<UiState>('import_network_invite', { invite })
+    : (() => {
+        const parsed = decodeInvitePayload(invite)
+        const activeNetwork = mockActiveNetwork()
+        if (!activeNetwork) {
           return asResult()
         }
 
-        if (target.participants.some((participant) => participant.npub === npub)) {
-          return asResult()
+        if (
+          parsed.networkName.trim() &&
+          (activeNetwork.participants.length === 0 || /^Network \d+/.test(activeNetwork.name))
+        ) {
+          activeNetwork.name = parsed.networkName.trim()
         }
-
-        const pubkeyHex = pseudoHexFromNpub(npub)
-        const aliasCandidate = normalizeAlias(alias)
-        const magicDnsAlias = aliasCandidate.length > 0 ? aliasCandidate : `peer-${pubkeyHex.slice(0, 10)}`
-
-        target.participants.push({
-          npub,
-          pubkeyHex,
-          tunnelIp: '10.44.0.2/32',
-          magicDnsAlias,
-          magicDnsName: composeMagicDnsName(magicDnsAlias, mockState.magicDnsSuffix),
-          advertisedRoutes: [],
-          offersExitNode: false,
-          state: 'unknown',
-          presenceState: 'absent',
-          statusText: 'no signal yet',
-          lastSignalText: 'nostr unseen',
-        })
-
+        if (parsed.networkId.trim()) {
+          activeNetwork.networkId = parsed.networkId.trim()
+        }
+        upsertMockParticipant(activeNetwork.id, parsed.inviterNpub)
+        for (const relay of parsed.relays) {
+          const normalizedRelay = relay.trim()
+          if (
+            normalizedRelay &&
+            !mockState.relays.some((entry) => entry.url === normalizedRelay)
+          ) {
+            mockState.relays.push({
+              url: normalizedRelay,
+              state: 'unknown',
+              statusText: 'not checked',
+            })
+          }
+        }
+        updateMockRelaySummary()
+        mockState.sessionStatus = `Invite imported for ${parsed.networkName.trim() || activeNetwork.name}`
         return asResult()
       })()
 
