@@ -783,7 +783,7 @@
       </div>
 
       <div class="hero-stats-grid">
-        <div class="hero-stat-card">
+        <div class="hero-stat-card" data-testid="hero-identity-card">
           <div class="panel-kicker">Identity</div>
           <button
             class="btn copy-btn copy-npub-btn hero-copy-btn"
@@ -803,7 +803,7 @@
           </button>
         </div>
 
-        <div class="hero-stat-card">
+        <div class="hero-stat-card" data-testid="hero-mesh-card">
           <div class="panel-kicker">Mesh ID</div>
           <div class="hero-stat-value hero-stat-mono" data-testid="mesh-id">{state.networkId}</div>
           <div class="config-path">Share this mesh ID only with devices in {activeNetworkView.name}.</div>

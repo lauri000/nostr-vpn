@@ -294,6 +294,7 @@ body {
 .hero-stat-card,
 .spotlight-meta-card {
   min-width: 0;
+  overflow: hidden;
   border: 1px solid rgba(116, 123, 189, 0.28);
   border-radius: 12px;
   background: rgba(17, 19, 48, 0.64);
@@ -316,7 +317,10 @@ body {
 }
 
 .hero-copy-btn {
+  display: flex;
   width: 100%;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .hero-copy-btn .copy-value {
@@ -504,6 +508,8 @@ body {
 }
 
 .copy-value {
+  display: block;
+  flex: 1 1 auto;
   min-width: 0;
   font-family: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, monospace;
   font-size: 24px;

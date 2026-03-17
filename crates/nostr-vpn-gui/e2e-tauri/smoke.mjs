@@ -291,6 +291,11 @@ async function getText(sessionId, id) {
   return String(response.value || '')
 }
 
+async function getRect(sessionId, id) {
+  const response = await http('GET', `/session/${sessionId}/element/${id}/rect`)
+  return response.value
+}
+
 async function textForSelector(sessionId, selector) {
   const id = await find(sessionId, selector)
   return await getText(sessionId, id)
@@ -477,6 +482,27 @@ async function main() {
       /saved networks/i,
       'saved networks title',
     )
+
+    const identityCardId = await find(sessionId, '[data-testid="hero-identity-card"]')
+    const meshCardId = await find(sessionId, '[data-testid="hero-mesh-card"]')
+    const copyButtonId = await find(sessionId, '[data-testid="copy-pubkey"]')
+    const identityCardRect = await getRect(sessionId, identityCardId)
+    const meshCardRect = await getRect(sessionId, meshCardId)
+    const copyButtonRect = await getRect(sessionId, copyButtonId)
+    const copyButtonRight = copyButtonRect.x + copyButtonRect.width
+    const identityCardRight = identityCardRect.x + identityCardRect.width
+
+    if (copyButtonRight > identityCardRight + 1) {
+      throw new Error(
+        `identity copy button overflowed its card: buttonRight=${copyButtonRight}, cardRight=${identityCardRight}`,
+      )
+    }
+
+    if (copyButtonRight > meshCardRect.x - 1) {
+      throw new Error(
+        `identity copy button overlaps mesh id card: buttonRight=${copyButtonRight}, meshLeft=${meshCardRect.x}`,
+      )
+    }
 
     const initialSource = await source(sessionId)
     if (/Failed to apply startup launch setting/i.test(initialSource)) {
