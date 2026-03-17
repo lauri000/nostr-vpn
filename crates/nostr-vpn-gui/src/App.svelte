@@ -224,22 +224,31 @@
   }
 
   const heroSubtext = (state: UiState) => {
+    const enabledNetworks = state.networks.filter((network) => network.enabled)
     const network = activeNetwork(state)
     if ((serviceInstallRecommended || serviceEnableRecommended) && !state.sessionActive) {
       return 'Install the background service for reliable startup, reconnects, and admin-free VPN switching.'
     }
     if (!state.sessionActive) {
-      return `Ready to connect ${network.name}.`
+      return enabledNetworks.length > 1
+        ? `Ready to connect ${enabledNetworks.length} enabled networks.`
+        : `Ready to connect ${network.name}.`
     }
     if (state.expectedPeerCount === 0) {
-      return `${network.name} is active, but no remote devices are configured yet.`
+      return enabledNetworks.length > 1
+        ? 'Enabled networks are active, but no remote devices are configured yet.'
+        : `${network.name} is active, but no remote devices are configured yet.`
     }
     if (state.meshReady) {
-      return `${network.name} is fully connected across ${state.connectedPeerCount}/${state.expectedPeerCount} peers.`
+      return enabledNetworks.length > 1
+        ? `Enabled networks are fully connected across ${state.connectedPeerCount}/${state.expectedPeerCount} peers.`
+        : `${network.name} is fully connected across ${state.connectedPeerCount}/${state.expectedPeerCount} peers.`
     }
 
     const remaining = Math.max(state.expectedPeerCount - state.connectedPeerCount, 0)
-    return `${network.name} is waiting on ${remaining} more peer${remaining === 1 ? '' : 's'}.`
+    return enabledNetworks.length > 1
+      ? `Enabled networks are waiting on ${remaining} more peer${remaining === 1 ? '' : 's'}.`
+      : `${network.name} is waiting on ${remaining} more peer${remaining === 1 ? '' : 's'}.`
   }
 
   const networkPeerSummary = (network: NetworkView) => {
@@ -758,7 +767,7 @@
       {@const activeNetworkView = activeNetwork(state)}
       <div class="row hero-row">
         <div class="hero-copy">
-          <div class="panel-kicker">Active network</div>
+          <div class="panel-kicker">Spotlight network</div>
           <div class="row hero-title-row">
             <h1 data-testid="active-network-title">{activeNetworkView.name}</h1>
             <span class={`badge ${heroStateBadgeClass(state)}`}>{heroStateText(state)}</span>
@@ -1152,13 +1161,13 @@
       <div class="section-title-row">
         <div>
           <div class="panel-kicker">Profiles</div>
-          <h2 data-testid="saved-networks-title">Saved Networks</h2>
+          <h2 data-testid="saved-networks-title">Networks</h2>
         </div>
         <div class="section-meta">{state.networks.length} total</div>
       </div>
 
       <div class="config-path">
-        Keep one network active at a time. Switch here, then manage live devices above.
+        Enabled networks participate together. The first enabled network is spotlighted above.
       </div>
 
       <div class="row form-row network-create-row">
@@ -1181,14 +1190,16 @@
               <div class="network-directory-main">
                 <div class="row network-directory-title-row">
                   <input
-                    class="text-input network-name-input"
-                    value={networkNameDrafts[network.id] ?? network.name}
-                    data-testid="network-name-input"
-                    on:input={(event) =>
-                      onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
+                  class="text-input network-name-input"
+                  value={networkNameDrafts[network.id] ?? network.name}
+                  data-testid="network-name-input"
+                  on:input={(event) =>
+                    onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
                   />
                   {#if network.enabled}
-                    <span class="badge ok" data-testid="network-active-badge">Active</span>
+                    <span class="badge ok" data-testid="network-active-badge">
+                      {network.id === activeNetworkView.id ? 'Spotlight' : 'Enabled'}
+                    </span>
                   {:else}
                     <span class="badge muted">Saved</span>
                   {/if}
@@ -1198,15 +1209,13 @@
               </div>
 
               <div class="row network-actions">
-                {#if !network.enabled}
-                  <button
-                    class="btn ghost"
-                    data-testid="network-activate"
-                    on:click={() => runAction(() => setNetworkEnabled(network.id, true))}
-                  >
-                    Activate
-                  </button>
-                {/if}
+                <button
+                  class="btn ghost"
+                  data-testid="network-enabled-toggle"
+                  on:click={() => runAction(() => setNetworkEnabled(network.id, !network.enabled))}
+                >
+                  {network.enabled ? 'Disable' : 'Enable'}
+                </button>
                 <button
                   class="btn ghost icon-btn"
                   data-testid="network-remove"
@@ -1222,13 +1231,17 @@
 
             {#if network.enabled}
               <div class="config-path saved-network-note">
-                This network is live now. Devices, presence, and tunnel state are shown above.
+                {#if network.id === activeNetworkView.id}
+                  This network is spotlighted above. Devices, presence, and tunnel state are shown in the live mesh panel.
+                {:else}
+                  This network is also enabled. It participates in the mesh while the live panel above spotlights {activeNetworkView.name}.
+                {/if}
               </div>
             {:else}
               <details class="network-editor">
                 <summary class="network-editor-summary">Edit saved devices</summary>
                 <div class="config-path saved-network-note">
-                  Status badges appear here once you activate this network.
+                  Enable this network when you want it participating in the live mesh.
                 </div>
 
                 <div class="participant-add-panel">

@@ -3677,14 +3677,11 @@ mod tests {
         gui_requires_service_install, is_already_running_message, is_mesh_complete,
         is_not_running_message, parse_advertised_routes_input, parse_exit_node_input,
         parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
-        peer_state_label, should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
+        peer_state_label, should_defer_gui_daemon_start_to_service_on_autostart,
+        should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
         started_from_autostart_args, to_npub, tray_exit_node_entries, tray_menu_spec,
         tray_network_groups, tray_status_text, validate_nvpn_binary, within_peer_online_grace,
         within_peer_presence_grace,
-        should_defer_gui_daemon_start_to_service_on_autostart, should_start_gui_daemon_on_launch,
-        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
-        tray_exit_node_entries, tray_menu_spec, tray_network_groups, tray_status_text,
-        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};

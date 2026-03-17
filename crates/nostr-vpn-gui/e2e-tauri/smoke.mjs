@@ -479,8 +479,8 @@ async function main() {
     await waitForSelectorText(
       sessionId,
       '[data-testid="saved-networks-title"]',
-      /saved networks/i,
-      'saved networks title',
+      /networks/i,
+      'networks title',
     )
 
     const identityCardId = await find(sessionId, '[data-testid="hero-identity-card"]')
