@@ -517,6 +517,45 @@ fn explicit_network_id_takes_precedence_over_participant_hash() {
 }
 
 #[test]
+fn set_network_mesh_id_updates_the_selected_network() {
+    let mut config = AppConfig::generated();
+    let original_active_id = config.networks[0].id.clone();
+    let added_id = config.add_network("Work");
+
+    config
+        .set_network_mesh_id(&added_id, "mesh-work")
+        .expect("mesh id should update");
+
+    assert_eq!(
+        config
+            .network_by_id(&added_id)
+            .expect("saved network")
+            .network_id,
+        "mesh-work"
+    );
+    assert_eq!(
+        config
+            .network_by_id(&original_active_id)
+            .expect("active network")
+            .network_id,
+        "nostr-vpn"
+    );
+    assert_eq!(config.effective_network_id(), "nostr-vpn");
+}
+
+#[test]
+fn set_network_mesh_id_rejects_empty_values() {
+    let mut config = AppConfig::generated();
+    let active_id = config.networks[0].id.clone();
+
+    let error = config
+        .set_network_mesh_id(&active_id, "   ")
+        .expect_err("empty mesh id should fail");
+
+    assert_eq!(error.to_string(), "network id cannot be empty");
+}
+
+#[test]
 fn magic_dns_aliases_are_generated_and_resolve_to_configured_participant() {
     let own = Keys::generate();
     let peer = Keys::generate();

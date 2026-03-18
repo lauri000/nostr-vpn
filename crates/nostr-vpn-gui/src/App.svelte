@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
   import { Check, Copy, Trash2 } from 'lucide-svelte'
+  import QRCode from 'qrcode'
 
   import {
     addNetwork,
@@ -19,6 +20,7 @@
     removeRelay,
     renameNetwork,
     setNetworkEnabled,
+    setNetworkMeshId,
     setParticipantAlias,
     setAutostartEnabled,
     tick,
@@ -42,6 +44,10 @@
   let cliActionStatus = ''
   let serviceActionStatus = ''
   let copiedValue: 'pubkey' | 'meshId' | 'invite' | null = null
+  let inviteQrDataUrl = ''
+  let inviteQrError = ''
+  let inviteQrSource = ''
+  let inviteQrSequence = 0
 
   let newNetworkName = ''
   let inviteInputDraft = ''
@@ -57,6 +63,7 @@
   let showAdvancedRoutes = false
 
   let networkNameDrafts: Record<string, string> = {}
+  let networkIdDrafts: Record<string, string> = {}
   let participantInputDrafts: Record<string, string> = {}
   let participantAddAliasDrafts: Record<string, string> = {}
   let participantAliasDrafts: Record<string, string> = {}
@@ -77,6 +84,43 @@
   $: serviceEnableRecommended =
     !!state?.serviceEnablementSupported && !!state?.serviceInstalled && !!state?.serviceDisabled
   $: serviceSetupRequired = serviceInstallRecommended && !state?.daemonRunning
+  $: {
+    const invite = state?.activeNetworkInvite ?? ''
+    if (invite !== inviteQrSource) {
+      inviteQrSource = invite
+      void refreshInviteQr(invite)
+    }
+  }
+
+  async function refreshInviteQr(invite: string) {
+    const sequence = ++inviteQrSequence
+    if (!invite) {
+      inviteQrDataUrl = ''
+      inviteQrError = ''
+      return
+    }
+
+    try {
+      const dataUrl = await QRCode.toDataURL(invite, {
+        errorCorrectionLevel: 'M',
+        margin: 1,
+        scale: 8,
+        color: {
+          dark: '#dde8ff',
+          light: '#0000',
+        },
+      })
+      if (sequence === inviteQrSequence) {
+        inviteQrDataUrl = dataUrl
+        inviteQrError = ''
+      }
+    } catch {
+      if (sequence === inviteQrSequence) {
+        inviteQrDataUrl = ''
+        inviteQrError = 'Invite QR unavailable'
+      }
+    }
+  }
 
   const serviceMetaText = (state: UiState) => {
     if (!state.serviceInstalled) {
@@ -201,6 +245,8 @@
 
   const activeNetwork = (state: UiState) =>
     state.networks.find((network) => network.enabled) ?? state.networks[0]
+
+  const inactiveNetworks = (state: UiState) => state.networks.filter((network) => !network.enabled)
 
   const heroStateBadgeClass = (state: UiState) => {
     if (state.meshReady) {
@@ -419,20 +465,26 @@
   function syncDraftsFromState() {
     if (!state) {
       networkNameDrafts = {}
+      networkIdDrafts = {}
       participantAliasDrafts = {}
       return
     }
 
     const nextNetworkNames: Record<string, string> = {}
+    const nextNetworkIds: Record<string, string> = {}
     const nextParticipantInput: Record<string, string> = {}
     const nextParticipantAddAlias: Record<string, string> = {}
     const nextParticipantAliases: Record<string, string> = {}
 
     for (const network of state.networks) {
       const nameDebounceKey = `network-name-${network.id}`
+      const meshIdDebounceKey = `network-id-${network.id}`
       nextNetworkNames[network.id] = debouncers.has(nameDebounceKey)
         ? (networkNameDrafts[network.id] ?? network.name)
         : network.name
+      nextNetworkIds[network.id] = debouncers.has(meshIdDebounceKey)
+        ? (networkIdDrafts[network.id] ?? network.networkId)
+        : network.networkId
 
       nextParticipantInput[network.id] = participantInputDrafts[network.id] ?? ''
       nextParticipantAddAlias[network.id] = participantAddAliasDrafts[network.id] ?? ''
@@ -446,6 +498,7 @@
     }
 
     networkNameDrafts = nextNetworkNames
+    networkIdDrafts = nextNetworkIds
     participantInputDrafts = nextParticipantInput
     participantAddAliasDrafts = nextParticipantAddAlias
     participantAliasDrafts = nextParticipantAliases
@@ -605,6 +658,17 @@
     }, 500)
   }
 
+  function onNetworkMeshIdInput(networkId: string, value: string) {
+    networkIdDrafts = {
+      ...networkIdDrafts,
+      [networkId]: value,
+    }
+
+    debounce(`network-id-${networkId}`, async () => {
+      await runAction(() => setNetworkMeshId(networkId, value))
+    }, 500)
+  }
+
   async function onAddParticipant(networkId: string) {
     const npub = participantInputDrafts[networkId]?.trim() || ''
     const alias = participantAddAliasDrafts[networkId]?.trim() || ''
@@ -747,7 +811,9 @@
       return
     }
 
-    await copyText(state.networkId, 'meshId')
+    const network = activeNetwork(state)
+    const visibleMeshId = networkIdDrafts[network.id]?.trim() || network.networkId
+    await copyText(visibleMeshId, 'meshId')
   }
 
   async function copyInvite() {
@@ -792,7 +858,7 @@
       {@const activeNetworkView = activeNetwork(state)}
       <div class="row hero-row">
         <div class="hero-copy">
-          <div class="panel-kicker">Active network</div>
+          <div class="panel-kicker">Status</div>
           <div class="row hero-title-row">
             <h1 data-testid="active-network-title">{activeNetworkView.name}</h1>
             <span class={`badge ${heroStateBadgeClass(state)}`}>{heroStateText(state)}</span>
@@ -835,24 +901,6 @@
               {short(state.ownNpub, 18, 14)}
             </span>
           </button>
-        </div>
-
-        <div class="hero-stat-card" data-testid="hero-mesh-card">
-          <div class="panel-kicker">Mesh ID</div>
-          <div class="hero-stat-value hero-stat-mono" data-testid="mesh-id">{state.networkId}</div>
-          <div class="config-path">Share this mesh ID only with devices in {activeNetworkView.name}.</div>
-          <div class="mesh-share-actions">
-            <button class="btn copy-btn" data-testid="copy-mesh-id" on:click={copyMeshId}>
-              <span class="copy-icon" aria-hidden="true">
-                {#if copiedValue === 'meshId'}
-                  <Check size={16} strokeWidth={2.3} />
-                {:else}
-                  <Copy size={16} strokeWidth={2.2} />
-                {/if}
-              </span>
-              <span>{copiedValue === 'meshId' ? 'Copied' : 'Copy Mesh ID'}</span>
-            </button>
-          </div>
         </div>
 
         <div class="hero-stat-card">
@@ -974,21 +1022,55 @@
     <section class="panel spotlight-panel">
       <div class="section-title-row">
         <div>
-          <div class="panel-kicker">Live mesh</div>
-          <h2>Devices</h2>
+          <div class="panel-kicker">Active network</div>
+          <h2>{activeNetworkView.name}</h2>
         </div>
         <div class="section-meta">{activeNetworkView.onlineCount}/{activeNetworkView.expectedCount} online</div>
       </div>
 
       <div class="spotlight-meta-grid">
-        <div class="spotlight-meta-card">
-          <div class="panel-kicker">Network</div>
-          <div class="spotlight-meta-value">{activeNetworkView.name}</div>
+        <div class="spotlight-meta-card spotlight-profile-card">
+          <div class="panel-kicker">Profile</div>
+          <div class="spotlight-profile-fields">
+            <label class="field-label" for={`active-network-name-${activeNetworkView.id}`}>Name</label>
+            <input
+              id={`active-network-name-${activeNetworkView.id}`}
+              class="text-input active-network-name-input"
+              data-testid="network-name-input"
+              value={networkNameDrafts[activeNetworkView.id] ?? activeNetworkView.name}
+              on:input={(event) =>
+                onNetworkNameInput(activeNetworkView.id, (event.currentTarget as HTMLInputElement).value)}
+            />
+            <label class="field-label" for={`active-network-mesh-${activeNetworkView.id}`}>Mesh ID</label>
+            <div class="inline-copy-field">
+              <input
+                id={`active-network-mesh-${activeNetworkView.id}`}
+                class="text-input network-mesh-id-input"
+                data-testid="active-network-mesh-id-input"
+                value={networkIdDrafts[activeNetworkView.id] ?? activeNetworkView.networkId}
+                on:input={(event) =>
+                  onNetworkMeshIdInput(activeNetworkView.id, (event.currentTarget as HTMLInputElement).value)}
+              />
+              <button class="btn copy-btn" data-testid="copy-mesh-id" on:click={copyMeshId}>
+                <span class="copy-icon" aria-hidden="true">
+                  {#if copiedValue === 'meshId'}
+                    <Check size={16} strokeWidth={2.3} />
+                  {:else}
+                    <Copy size={16} strokeWidth={2.2} />
+                  {/if}
+                </span>
+                <span>{copiedValue === 'meshId' ? 'Copied' : 'Copy Mesh ID'}</span>
+              </button>
+            </div>
+          </div>
           <div class="config-path">{networkPeerSummary(activeNetworkView)}</div>
+          <div class="config-path">
+            Stable identifier used for tunnel addressing and matching the right mesh.
+          </div>
         </div>
-        <div class="spotlight-meta-card">
-          <div class="panel-kicker">Invite</div>
-          <div class="spotlight-meta-value">One paste to join</div>
+        <div class="spotlight-meta-card spotlight-share-card">
+          <div class="panel-kicker">Join & share</div>
+          <div class="spotlight-meta-value">Copy, scan, or paste</div>
           <div class="config-path">
             Includes the Mesh ID, your npub, and the relay list for {activeNetworkView.name}.
           </div>
@@ -1004,26 +1086,21 @@
               <span>{copiedValue === 'invite' ? 'Copied' : 'Copy Invite'}</span>
             </button>
           </div>
+          {#if inviteQrDataUrl}
+            <div class="invite-qr-wrap">
+              <img class="invite-qr" src={inviteQrDataUrl} alt={`Invite QR for ${activeNetworkView.name}`} />
+            </div>
+            <div class="invite-qr-caption">Scan on another device to join this mesh.</div>
+          {:else if inviteQrError}
+            <div class="config-path">{inviteQrError}</div>
+          {/if}
         </div>
       </div>
 
-      <label class="toggle-row lan-discovery-toggle">
-        <input
-          type="checkbox"
-          checked={state.lanDiscoveryEnabled}
-          data-testid="lan-discovery-toggle"
-          on:change={(event) =>
-            onUpdateSettings({
-              lanDiscoveryEnabled: (event.currentTarget as HTMLInputElement).checked,
-            })}
-        />
-        LAN discovery (multicast)
-      </label>
-
-      <div class="participant-add-panel invite-import-panel">
-        <div class="participant-add-label">Join from invite</div>
+      <div class="participant-add-panel network-onboarding-panel">
+        <div class="participant-add-label">Add devices</div>
         <div class="invite-help">
-          Paste an invite copied from another device to set the Mesh ID, add that device, and merge its relays.
+          Fastest: paste an invite from another device. That sets the mesh ID, adds that device, and merges its relays.
         </div>
         <div class="invite-import-fields">
           <input
@@ -1037,10 +1114,7 @@
             Import
           </button>
         </div>
-      </div>
-
-      <div class="participant-add-panel">
-        <div class="participant-add-label">Add device to {activeNetworkView.name}</div>
+        <div class="participant-add-separator">or add one manually</div>
         <div class="participant-add-fields">
           <input
             class="text-input participant-add-npub"
@@ -1075,6 +1149,19 @@
           </button>
         </div>
       </div>
+
+      <label class="toggle-row lan-discovery-toggle">
+        <input
+          type="checkbox"
+          checked={state.lanDiscoveryEnabled}
+          data-testid="lan-discovery-toggle"
+          on:change={(event) =>
+            onUpdateSettings({
+              lanDiscoveryEnabled: (event.currentTarget as HTMLInputElement).checked,
+            })}
+        />
+        LAN discovery (multicast)
+      </label>
 
       {#if activeNetworkView.participants.length === 0}
         <div class="item-row network-empty-state">
@@ -1225,205 +1312,215 @@
       </div>
     </section>
 
-    <section class="panel network-directory-panel">
-      <div class="section-title-row">
+    <details class="panel collapsible-panel network-directory-panel">
+      <summary class="collapsible-summary">
         <div>
-          <div class="panel-kicker">Profiles</div>
-          <h2 data-testid="saved-networks-title">Networks</h2>
+          <div class="panel-kicker">Saved networks</div>
+          <h2 data-testid="saved-networks-title">Other networks</h2>
         </div>
-        <div class="section-meta">{state.networks.length} total</div>
-      </div>
+        <div class="section-meta">{inactiveNetworks(state).length} saved</div>
+      </summary>
 
-      <div class="config-path">
-        Only one network is active at a time. Activate a saved network to switch the live mesh.
-      </div>
+      <div class="collapsible-body">
+        <div class="config-path">
+          Keep alternate network profiles here. Activate one when you want to switch the current mesh.
+        </div>
 
-      <div class="row form-row network-create-row">
-        <input
-          class="text-input"
-          placeholder="Add network name (optional)"
-          data-testid="network-add-input"
-          bind:value={newNetworkName}
-          on:keydown={(event) => event.key === 'Enter' && onAddNetwork()}
-        />
-        <button class="btn" data-testid="network-add" on:click={onAddNetwork}>
-          Add network
-        </button>
-      </div>
+        <div class="row form-row network-create-row">
+          <input
+            class="text-input"
+            placeholder="Add network name (optional)"
+            data-testid="network-add-input"
+            bind:value={newNetworkName}
+            on:keydown={(event) => event.key === 'Enter' && onAddNetwork()}
+          />
+          <button class="btn" data-testid="network-add" on:click={onAddNetwork}>
+            Add network
+          </button>
+        </div>
 
-      <div class="stack rows network-stack">
-        {#each [activeNetworkView, ...state.networks.filter((network) => network.id !== activeNetworkView.id)] as network}
-          <section class={`network-card ${network.enabled ? 'network-card-active' : 'network-disabled'}`} data-testid="network-card">
-            <div class="row spread network-header">
-              <div class="network-directory-main">
-                <div class="row network-directory-title-row">
-                  <input
-                  class="text-input network-name-input"
-                  value={networkNameDrafts[network.id] ?? network.name}
-                  data-testid="network-name-input"
-                  on:input={(event) =>
-                    onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
-                  />
-                  {#if network.enabled}
-                    <span class="badge ok" data-testid="network-active-badge">
-                      Active
-                    </span>
-                  {:else}
-                    <span class="badge muted">Saved</span>
-                  {/if}
-                </div>
-                <div class="config-path" data-testid="network-mesh-id">Mesh ID: {network.networkId}</div>
-                <div class="config-path">{networkPeerSummary(network)}</div>
-              </div>
-
-              <div class="row network-actions">
-                {#if network.enabled}
-                  <button class="btn ghost" data-testid="network-enabled-toggle" disabled>
-                    Active
-                  </button>
-                {:else}
-                  <button
-                    class="btn ghost"
-                    data-testid="network-enabled-toggle"
-                    on:click={() => runAction(() => setNetworkEnabled(network.id, true))}
-                  >
-                    Activate
-                  </button>
-                {/if}
-                <button
-                  class="btn ghost icon-btn"
-                  data-testid="network-remove"
-                  title="Delete network"
-                  aria-label="Delete network"
-                  disabled={state.networks.length <= 1}
-                  on:click={() => runAction(() => removeNetwork(network.id))}
-                >
-                  <Trash2 size={16} strokeWidth={2.2} />
-                </button>
-              </div>
+        {#if inactiveNetworks(state).length === 0}
+          <div class="item-row network-empty-state">
+            <div class="item-main">
+              <div class="item-title">No saved networks yet</div>
+              <div class="item-sub">Add another network if you want a separate mesh profile.</div>
             </div>
+          </div>
+        {:else}
+          <div class="stack rows network-stack">
+            {#each inactiveNetworks(state) as network}
+              <section class="network-card" data-testid="network-card">
+                <div class="row spread network-header">
+                  <div class="network-directory-main">
+                    <div class="row network-directory-title-row">
+                      <div class="item-title">{network.name}</div>
+                      <span class="badge muted">Saved</span>
+                    </div>
+                    <div class="config-path" data-testid="network-mesh-id">Mesh ID: {network.networkId}</div>
+                    <div class="config-path">{networkPeerSummary(network)}</div>
+                  </div>
 
-            {#if network.enabled}
-              <div class="config-path saved-network-note">
-                This is the active network. Devices, presence, and tunnel state are shown in the live mesh panel above.
-              </div>
-            {:else}
-              <details class="network-editor">
-                <summary class="network-editor-summary">Edit saved devices</summary>
-                <div class="config-path saved-network-note">
-                  Activate this saved network when you want to switch the live mesh to it.
-                </div>
-
-                <div class="participant-add-panel">
-                  <div class="participant-add-label">Add device to {network.name}</div>
-                  <div class="participant-add-fields">
-                    <input
-                      class="text-input participant-add-npub"
-                      placeholder="Participant npub"
-                      data-testid="participant-input"
-                      value={participantInputDrafts[network.id] ?? ''}
-                      on:input={(event) =>
-                        (participantInputDrafts = {
-                          ...participantInputDrafts,
-                          [network.id]: (event.currentTarget as HTMLInputElement).value,
-                        })}
-                      on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-                    />
-                    <input
-                      class="text-input participant-add-alias"
-                      placeholder="Alias (optional)"
-                      data-testid="participant-add-alias-input"
-                      value={participantAddAliasDrafts[network.id] ?? ''}
-                      on:input={(event) =>
-                        (participantAddAliasDrafts = {
-                          ...participantAddAliasDrafts,
-                          [network.id]: (event.currentTarget as HTMLInputElement).value,
-                        })}
-                      on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-                    />
+                  <div class="row network-actions">
                     <button
-                      class="btn participant-add-btn"
-                      data-testid="participant-add"
-                      on:click={() => onAddParticipant(network.id)}
+                      class="btn ghost"
+                      data-testid="network-enabled-toggle"
+                      on:click={() => runAction(() => setNetworkEnabled(network.id, true))}
                     >
-                      Add
+                      Activate
+                    </button>
+                    <button
+                      class="btn ghost icon-btn"
+                      data-testid="network-remove"
+                      title="Delete network"
+                      aria-label="Delete network"
+                      disabled={state.networks.length <= 1}
+                      on:click={() => runAction(() => removeNetwork(network.id))}
+                    >
+                      <Trash2 size={16} strokeWidth={2.2} />
                     </button>
                   </div>
                 </div>
 
-                {#if network.participants.length === 0}
-                  <div class="item-row network-empty-state">
-                    <div class="item-main">
-                      <div class="item-title">No saved devices yet</div>
-                      <div class="item-sub">Add npubs now and activate this network later when you want it live.</div>
+                <details class="network-editor">
+                  <summary class="network-editor-summary">Edit saved network</summary>
+                  <div class="participant-add-panel network-profile-editor">
+                    <div class="participant-add-label">Profile</div>
+                    <div class="spotlight-profile-fields">
+                      <label class="field-label" for={`saved-network-name-${network.id}`}>Name</label>
+                      <input
+                        id={`saved-network-name-${network.id}`}
+                        class="text-input active-network-name-input"
+                        data-testid="network-name-input"
+                        value={networkNameDrafts[network.id] ?? network.name}
+                        on:input={(event) =>
+                          onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
+                      />
+                      <label class="field-label" for={`saved-network-mesh-${network.id}`}>Mesh ID</label>
+                      <input
+                        id={`saved-network-mesh-${network.id}`}
+                        class="text-input network-mesh-id-input"
+                        data-testid="saved-network-mesh-id-input"
+                        value={networkIdDrafts[network.id] ?? network.networkId}
+                        on:input={(event) =>
+                          onNetworkMeshIdInput(network.id, (event.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                    <div class="config-path saved-network-note">
+                      Activate this saved network when you want to switch the current mesh to it.
                     </div>
                   </div>
-                {:else}
-                  <div class="stack rows">
-                    {#each network.participants as participant}
-                      <div class="item-row saved-participant-row">
-                        <div class="item-main">
-                          <div class="item-title">{short(participant.npub, 22, 12)}</div>
-                          <div class="row alias-row">
-                            <input
-                              class="text-input alias-input"
-                              value={participantAliasDrafts[participant.pubkeyHex] ?? participant.magicDnsAlias}
-                              on:input={(event) =>
-                                onParticipantAliasInput(
-                                  participant.npub,
-                                  participant.pubkeyHex,
-                                  (event.currentTarget as HTMLInputElement).value,
-                                )}
-                            />
-                            {#if state.magicDnsSuffix}
-                              <span class="alias-suffix">.{state.magicDnsSuffix}</span>
-                            {/if}
-                          </div>
-                          <div class="item-sub">
-                            {participant.magicDnsName || participant.magicDnsAlias || short(participant.npub, 16, 10)} | {participant.tunnelIp}
-                            {#if participant.offersExitNode}
-                              | exit routes advertised
-                            {/if}
-                          </div>
-                        </div>
-                        <button
-                          class="btn ghost icon-btn"
-                          title="Delete participant"
-                          aria-label="Delete participant"
-                          on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
-                        >
-                          <Trash2 size={16} strokeWidth={2.2} />
-                        </button>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
 
-                {#if state.lanDiscoveryEnabled}
-                  {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(network, peer.npub))}
-                  {#if unconfiguredLan.length > 0}
-                    <div class="lan-title">LAN peers</div>
+                  <div class="participant-add-panel">
+                    <div class="participant-add-label">Add device to {network.name}</div>
+                    <div class="participant-add-fields">
+                      <input
+                        class="text-input participant-add-npub"
+                        placeholder="Participant npub"
+                        data-testid="participant-input"
+                        value={participantInputDrafts[network.id] ?? ''}
+                        on:input={(event) =>
+                          (participantInputDrafts = {
+                            ...participantInputDrafts,
+                            [network.id]: (event.currentTarget as HTMLInputElement).value,
+                          })}
+                        on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+                      />
+                      <input
+                        class="text-input participant-add-alias"
+                        placeholder="Alias (optional)"
+                        data-testid="participant-add-alias-input"
+                        value={participantAddAliasDrafts[network.id] ?? ''}
+                        on:input={(event) =>
+                          (participantAddAliasDrafts = {
+                            ...participantAddAliasDrafts,
+                            [network.id]: (event.currentTarget as HTMLInputElement).value,
+                          })}
+                        on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
+                      />
+                      <button
+                        class="btn participant-add-btn"
+                        data-testid="participant-add"
+                        on:click={() => onAddParticipant(network.id)}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+
+                  {#if network.participants.length === 0}
+                    <div class="item-row network-empty-state">
+                      <div class="item-main">
+                        <div class="item-title">No saved devices yet</div>
+                        <div class="item-sub">Add npubs now and activate this network later when you want it live.</div>
+                      </div>
+                    </div>
+                  {:else}
                     <div class="stack rows">
-                      {#each unconfiguredLan as peer}
-                        <div class="item-row" data-testid="lan-peer-row">
+                      {#each network.participants as participant}
+                        <div class="item-row saved-participant-row">
                           <div class="item-main">
-                            <div class="item-title">{short(peer.npub, 22, 12)}</div>
-                            <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
+                            <div class="item-title">{short(participant.npub, 22, 12)}</div>
+                            <div class="row alias-row">
+                              <input
+                                class="text-input alias-input"
+                                value={participantAliasDrafts[participant.pubkeyHex] ?? participant.magicDnsAlias}
+                                on:input={(event) =>
+                                  onParticipantAliasInput(
+                                    participant.npub,
+                                    participant.pubkeyHex,
+                                    (event.currentTarget as HTMLInputElement).value,
+                                  )}
+                              />
+                              {#if state.magicDnsSuffix}
+                                <span class="alias-suffix">.{state.magicDnsSuffix}</span>
+                              {/if}
+                            </div>
+                            <div class="item-sub">
+                              {participant.magicDnsName || participant.magicDnsAlias || short(participant.npub, 16, 10)} | {participant.tunnelIp}
+                              {#if participant.offersExitNode}
+                                | exit routes advertised
+                              {/if}
+                            </div>
                           </div>
-                          <button class="btn" on:click={() => onAddLanPeer(network.id, peer.npub)}>
-                            Add
+                          <button
+                            class="btn ghost icon-btn"
+                            title="Delete participant"
+                            aria-label="Delete participant"
+                            on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
+                          >
+                            <Trash2 size={16} strokeWidth={2.2} />
                           </button>
                         </div>
                       {/each}
                     </div>
                   {/if}
-                {/if}
-              </details>
-            {/if}
-          </section>
-        {/each}
+
+                  {#if state.lanDiscoveryEnabled}
+                    {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(network, peer.npub))}
+                    {#if unconfiguredLan.length > 0}
+                      <div class="lan-title">LAN peers</div>
+                      <div class="stack rows">
+                        {#each unconfiguredLan as peer}
+                          <div class="item-row" data-testid="lan-peer-row">
+                            <div class="item-main">
+                              <div class="item-title">{short(peer.npub, 22, 12)}</div>
+                              <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
+                            </div>
+                            <button class="btn" on:click={() => onAddLanPeer(network.id, peer.npub)}>
+                              Add
+                            </button>
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+                  {/if}
+                </details>
+              </section>
+            {/each}
+          </div>
+        {/if}
       </div>
-    </section>
+    </details>
 
     <details class="panel collapsible-panel" open={state.health.length > 0}>
       <summary class="collapsible-summary">

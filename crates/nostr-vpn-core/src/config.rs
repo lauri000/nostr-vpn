@@ -497,15 +497,28 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn set_active_network_id(&mut self, network_id: &str) -> Result<()> {
-        let network_id = network_id.trim();
-        if network_id.is_empty() {
+    pub fn set_network_mesh_id(&mut self, network_id: &str, mesh_id: &str) -> Result<()> {
+        let normalized = mesh_id.trim();
+        if normalized.is_empty() {
             return Err(anyhow::anyhow!("network id cannot be empty"));
         }
 
-        self.active_network_mut().network_id = network_id.to_string();
-        self.sync_legacy_network_id();
+        let active_network_entry_id = self.active_network().id.clone();
+        let network = self
+            .network_by_id_mut(network_id)
+            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+        network.network_id = normalized.to_string();
+
+        if network_id == active_network_entry_id {
+            self.sync_legacy_network_id();
+        }
+
         Ok(())
+    }
+
+    pub fn set_active_network_id(&mut self, network_id: &str) -> Result<()> {
+        let active_network_entry_id = self.active_network().id.clone();
+        self.set_network_mesh_id(&active_network_entry_id, network_id)
     }
 
     pub fn add_participant_to_network(

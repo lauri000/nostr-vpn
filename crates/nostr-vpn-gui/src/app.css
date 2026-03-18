@@ -286,7 +286,7 @@ body {
 
 .hero-stats-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   margin-top: 14px;
 }
@@ -332,6 +332,63 @@ body {
   gap: 8px;
   flex-wrap: wrap;
   margin-top: 10px;
+}
+
+.spotlight-profile-fields {
+  display: grid;
+  gap: 8px;
+}
+
+.field-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.active-network-name-input {
+  max-width: none;
+}
+
+.network-mesh-id-input {
+  font-family: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, monospace;
+}
+
+.inline-copy-field {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.inline-copy-field .network-mesh-id-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.spotlight-share-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.invite-qr-wrap {
+  margin-top: 12px;
+  width: fit-content;
+  border-radius: 14px;
+  padding: 10px;
+  background: rgba(8, 11, 34, 0.78);
+  border: 1px solid rgba(116, 123, 189, 0.24);
+}
+
+.invite-qr {
+  display: block;
+  width: 164px;
+  height: 164px;
+}
+
+.invite-qr-caption {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .section-title-row {
@@ -659,6 +716,10 @@ body {
   margin-top: 8px;
 }
 
+.network-profile-editor {
+  margin-top: 12px;
+}
+
 .network-editor {
   margin-top: 12px;
   padding-top: 12px;
@@ -719,6 +780,10 @@ body {
   margin-top: 10px;
 }
 
+.network-onboarding-panel {
+  margin-top: 10px;
+}
+
 .invite-help {
   margin-bottom: 10px;
   color: var(--muted);
@@ -743,6 +808,14 @@ body {
 
 .participant-add-btn {
   min-width: 92px;
+}
+
+.participant-add-separator {
+  margin: 12px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .item-row {
@@ -1138,6 +1211,15 @@ body {
 
   .invite-import-fields {
     grid-template-columns: 1fr;
+  }
+
+  .inline-copy-field {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .inline-copy-field .btn {
+    width: 100%;
   }
 
   .participant-add-btn {

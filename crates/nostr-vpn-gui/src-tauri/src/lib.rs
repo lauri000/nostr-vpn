@@ -544,6 +544,31 @@ impl NvpnBackend {
         Ok(())
     }
 
+    fn set_network_mesh_id(&mut self, network_id: &str, mesh_id: &str) -> Result<()> {
+        let is_active_network = self
+            .config
+            .network_by_id(network_id)
+            .map(|network| network.enabled)
+            .ok_or_else(|| anyhow!("network not found"))?;
+
+        self.config.set_network_mesh_id(network_id, mesh_id)?;
+        self.config.ensure_defaults();
+        maybe_autoconfigure_node(&mut self.config);
+        self.persist_config()?;
+
+        if is_active_network {
+            self.ensure_peer_status_entries();
+            self.reload_daemon_if_running()?;
+            self.maybe_refresh_lan_discovery();
+            if self.daemon_running {
+                self.session_status = "Mesh ID updated and applied.".to_string();
+            }
+        }
+
+        self.sync_daemon_state();
+        Ok(())
+    }
+
     fn remove_network(&mut self, network_id: &str) -> Result<()> {
         self.config.remove_network(network_id)?;
         self.config.ensure_defaults();
@@ -3503,6 +3528,22 @@ fn remove_network(
 }
 
 #[tauri::command]
+fn set_network_mesh_id(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    network_id: String,
+    mesh_id: String,
+) -> Result<UiState, String> {
+    let ui = with_backend(state, |backend| {
+        backend.set_network_mesh_id(&network_id, &mesh_id)?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
 fn set_network_enabled(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -3808,6 +3849,7 @@ pub fn run() {
             add_network,
             rename_network,
             remove_network,
+            set_network_mesh_id,
             set_network_enabled,
             add_participant,
             import_network_invite,

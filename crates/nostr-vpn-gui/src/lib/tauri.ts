@@ -412,6 +412,18 @@ export const renameNetwork = (networkId: string, name: string) =>
         return asResult()
       })()
 
+export const setNetworkMeshId = (networkId: string, meshId: string) =>
+  isTauriRuntime()
+    ? invoke<UiState>('set_network_mesh_id', { networkId, meshId })
+    : (() => {
+        mockState.networks = mockState.networks.map((network) =>
+          network.id === networkId
+            ? { ...network, networkId: meshId.trim() || network.networkId }
+            : network,
+        )
+        return asResult()
+      })()
+
 export const removeNetwork = (networkId: string) =>
   isTauriRuntime()
     ? invoke<UiState>('remove_network', { networkId })

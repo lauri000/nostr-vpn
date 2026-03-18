@@ -23,6 +23,8 @@ const PEER_ENDPOINT = process.env.TAURI_E2E_PEER_ENDPOINT || '127.0.0.1:51821'
 const GUI_TUNNEL_IP = process.env.TAURI_E2E_GUI_TUNNEL_IP || '10.44.0.10/32'
 const PEER_TUNNEL_IP = process.env.TAURI_E2E_PEER_TUNNEL_IP || '10.44.0.11/32'
 const PEER_IFACE = process.env.TAURI_E2E_PEER_IFACE || 'utun101'
+const WINDOW_WIDTH = Number(process.env.TAURI_E2E_WINDOW_WIDTH || '0')
+const WINDOW_HEIGHT = Number(process.env.TAURI_E2E_WINDOW_HEIGHT || '0')
 
 const processes = []
 let driver
@@ -306,6 +308,15 @@ async function screenshot(sessionId) {
   return response.value
 }
 
+async function setWindowRect(sessionId, width, height) {
+  await http('POST', `/session/${sessionId}/window/rect`, {
+    x: 0,
+    y: 0,
+    width,
+    height,
+  })
+}
+
 async function source(sessionId) {
   const response = await http('GET', `/session/${sessionId}/source`)
   return response.value || ''
@@ -455,6 +466,9 @@ async function main() {
 
   const sessionId = await createSession()
   log(`webdriver session started: ${sessionId}`)
+  if (WINDOW_WIDTH > 0 || WINDOW_HEIGHT > 0) {
+    await setWindowRect(sessionId, WINDOW_WIDTH || 1280, WINDOW_HEIGHT || 900)
+  }
 
   try {
     await waitUntil(
@@ -479,15 +493,15 @@ async function main() {
     await waitForSelectorText(
       sessionId,
       '[data-testid="saved-networks-title"]',
-      /networks/i,
+      /other networks/i,
       'networks title',
     )
 
     const identityCardId = await find(sessionId, '[data-testid="hero-identity-card"]')
-    const meshCardId = await find(sessionId, '[data-testid="hero-mesh-card"]')
     const copyButtonId = await find(sessionId, '[data-testid="copy-pubkey"]')
+    await find(sessionId, '[data-testid="active-network-mesh-id-input"]')
+    await find(sessionId, '[data-testid="copy-mesh-id"]')
     const identityCardRect = await getRect(sessionId, identityCardId)
-    const meshCardRect = await getRect(sessionId, meshCardId)
     const copyButtonRect = await getRect(sessionId, copyButtonId)
     const copyButtonRight = copyButtonRect.x + copyButtonRect.width
     const identityCardRight = identityCardRect.x + identityCardRect.width
@@ -495,12 +509,6 @@ async function main() {
     if (copyButtonRight > identityCardRight + 1) {
       throw new Error(
         `identity copy button overflowed its card: buttonRight=${copyButtonRight}, cardRight=${identityCardRight}`,
-      )
-    }
-
-    if (copyButtonRight > meshCardRect.x - 1) {
-      throw new Error(
-        `identity copy button overlaps mesh id card: buttonRight=${copyButtonRight}, meshLeft=${meshCardRect.x}`,
       )
     }
 
