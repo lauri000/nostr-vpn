@@ -3,7 +3,6 @@
   line-height: 1.4;
   color: #f1f1f1;
   background: #0f0f0f;
-  color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -30,6 +29,115 @@
   --field-bg: #121212;
   --focus-ring: rgba(117, 236, 255, 0.28);
   --overlay-bg: rgba(15, 15, 15, 0.92);
+  --window-rule: rgba(255, 255, 255, 0.08);
+  --title-color: rgba(241, 241, 241, 0.92);
+  --required-panel-border: rgba(255, 92, 226, 0.35);
+  --required-panel-bg: rgba(255, 92, 226, 0.08);
+  --input-border: rgba(255, 255, 255, 0.14);
+  --focus-border: rgba(117, 236, 255, 0.62);
+  --button-border: rgba(255, 255, 255, 0.14);
+  --primary-border: rgba(255, 92, 226, 0.4);
+  --primary-bg: rgba(255, 92, 226, 0.14);
+  --primary-bg-hover: rgba(255, 92, 226, 0.22);
+  --primary-text: #ffd8f9;
+  --primary-shadow: inset 0 0 0 1px rgba(255, 92, 226, 0.12);
+  --switch-track-border: rgba(255, 255, 255, 0.18);
+  --switch-track-bg: rgba(255, 255, 255, 0.08);
+  --switch-thumb: #d8d8d8;
+  --switch-on-bg: rgba(62, 225, 143, 0.4);
+  --switch-on-border: rgba(62, 225, 143, 0.72);
+  --switch-on-thumb: #bfffdc;
+  --danger-bg: rgba(134, 35, 53, 0.2);
+  --danger-border: rgba(203, 92, 117, 0.7);
+  --success-soft-text: #bcffe0;
+  --success-soft-bg: rgba(30, 108, 70, 0.4);
+  --success-soft-border: rgba(62, 225, 143, 0.5);
+  --danger-soft-text: #ffd7dc;
+  --danger-soft-bg: rgba(134, 35, 53, 0.45);
+  --danger-soft-border: rgba(255, 102, 102, 0.55);
+  --warn-soft-text: #ffefbe;
+  --warn-soft-bg: rgba(134, 102, 19, 0.45);
+  --warn-soft-border: rgba(255, 216, 79, 0.55);
+  --muted-soft-text: #d5dcf1;
+  --muted-soft-bg: rgba(57, 63, 98, 0.45);
+  --muted-soft-border: rgba(141, 153, 187, 0.5);
+  --active-border: rgba(62, 225, 143, 0.36);
+  --active-bg: rgba(62, 225, 143, 0.08);
+  --selected-border: rgba(100, 220, 174, 0.55);
+  --selected-bg: rgba(15, 36, 32, 0.86);
+  --interactive-hover-border: rgba(120, 206, 255, 0.46);
+  --error-text: #ffd7dc;
+  --error-bg: rgba(55, 16, 31, 0.85);
+  --error-border: rgba(203, 92, 117, 0.7);
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  color: #121926;
+  background: #f4f5f7;
+  color-scheme: light;
+
+  --bg-base: #f4f5f7;
+  --surface-1: #ffffff;
+  --surface-2: #eef1f5;
+  --surface-3: #d9dee6;
+  --surface-4: #e4e8ee;
+  --panel: var(--surface-1);
+  --panel-border: rgba(18, 25, 38, 0.1);
+  --row: var(--surface-2);
+  --text: #121926;
+  --muted: #5d6675;
+  --cyan: #0b87ad;
+  --pink: #c04393;
+  --orange: #b86a24;
+  --green: #1b8a51;
+  --red: #c2414d;
+  --yellow: #9a6b00;
+  --button-bg: var(--surface-2);
+  --button-hover: var(--surface-4);
+  --field-bg: #ffffff;
+  --focus-ring: rgba(11, 135, 173, 0.18);
+  --overlay-bg: rgba(244, 245, 247, 0.92);
+  --window-rule: rgba(18, 25, 38, 0.08);
+  --title-color: rgba(18, 25, 38, 0.84);
+  --required-panel-border: rgba(192, 67, 147, 0.24);
+  --required-panel-bg: rgba(192, 67, 147, 0.08);
+  --input-border: rgba(18, 25, 38, 0.16);
+  --focus-border: rgba(11, 135, 173, 0.48);
+  --button-border: rgba(18, 25, 38, 0.12);
+  --primary-border: rgba(192, 67, 147, 0.28);
+  --primary-bg: rgba(192, 67, 147, 0.12);
+  --primary-bg-hover: rgba(192, 67, 147, 0.18);
+  --primary-text: #8f2f6d;
+  --primary-shadow: inset 0 0 0 1px rgba(192, 67, 147, 0.1);
+  --switch-track-border: rgba(18, 25, 38, 0.16);
+  --switch-track-bg: rgba(18, 25, 38, 0.08);
+  --switch-thumb: #ffffff;
+  --switch-on-bg: rgba(27, 138, 81, 0.24);
+  --switch-on-border: rgba(27, 138, 81, 0.42);
+  --switch-on-thumb: #e7fff1;
+  --danger-bg: rgba(194, 65, 77, 0.12);
+  --danger-border: rgba(194, 65, 77, 0.36);
+  --success-soft-text: #16643b;
+  --success-soft-bg: rgba(27, 138, 81, 0.12);
+  --success-soft-border: rgba(27, 138, 81, 0.28);
+  --danger-soft-text: #a63342;
+  --danger-soft-bg: rgba(194, 65, 77, 0.12);
+  --danger-soft-border: rgba(194, 65, 77, 0.28);
+  --warn-soft-text: #7a5600;
+  --warn-soft-bg: rgba(154, 107, 0, 0.12);
+  --warn-soft-border: rgba(154, 107, 0, 0.28);
+  --muted-soft-text: #4b5563;
+  --muted-soft-bg: rgba(93, 102, 117, 0.12);
+  --muted-soft-border: rgba(93, 102, 117, 0.22);
+  --active-border: rgba(27, 138, 81, 0.28);
+  --active-bg: rgba(27, 138, 81, 0.12);
+  --selected-border: rgba(27, 138, 81, 0.34);
+  --selected-bg: rgba(27, 138, 81, 0.12);
+  --interactive-hover-border: rgba(11, 135, 173, 0.3);
+  --error-text: #a63342;
+  --error-bg: rgba(194, 65, 77, 0.12);
+  --error-border: rgba(194, 65, 77, 0.28);
 }
 
 * {
@@ -46,6 +154,7 @@ body,
 
 body {
   background: var(--bg-base);
+  color: var(--text);
 }
 
 .app-shell {
@@ -123,7 +232,7 @@ body {
   right: 12px;
   bottom: 0;
   height: 1px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--window-rule);
 }
 
 .window-title {
@@ -135,7 +244,7 @@ body {
   letter-spacing: 0.13em;
   text-transform: uppercase;
   font-weight: 700;
-  color: rgba(241, 241, 241, 0.92);
+  color: var(--title-color);
 }
 
 .panel {
@@ -160,8 +269,8 @@ body {
 }
 
 .service-panel-required {
-  border-color: rgba(255, 92, 226, 0.35);
-  background: rgba(255, 92, 226, 0.08);
+  border-color: var(--required-panel-border);
+  background: var(--required-panel-bg);
 }
 
 .service-panel-copy {
@@ -426,7 +535,7 @@ body {
   width: 100%;
   min-width: 0;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--input-border);
   background: var(--field-bg);
   color: var(--text);
   padding: 10px 12px;
@@ -435,12 +544,12 @@ body {
 }
 
 .text-input:focus {
-  border-color: rgba(117, 236, 255, 0.62);
+  border-color: var(--focus-border);
   box-shadow: 0 0 0 1px var(--focus-ring);
 }
 
 .btn {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--button-border);
   background: var(--button-bg);
   color: var(--text);
   border-radius: 10px;
@@ -470,19 +579,19 @@ body {
 .service-primary-btn {
   min-width: 170px;
   padding: 11px 16px;
-  border-color: rgba(255, 92, 226, 0.4);
-  background: rgba(255, 92, 226, 0.14);
-  color: #ffd8f9;
-  box-shadow: inset 0 0 0 1px rgba(255, 92, 226, 0.12);
+  border-color: var(--primary-border);
+  background: var(--primary-bg);
+  color: var(--primary-text);
+  box-shadow: var(--primary-shadow);
 }
 
 .service-primary-btn:hover:not(:disabled) {
-  background: rgba(255, 92, 226, 0.22);
+  background: var(--primary-bg-hover);
 }
 
 .session-switch {
   min-width: 158px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--button-border);
   background: var(--surface-2);
   color: var(--text);
   border-radius: 999px;
@@ -498,7 +607,7 @@ body {
 }
 
 .session-switch:focus-visible {
-  outline: 1px solid rgba(117, 236, 255, 0.62);
+  outline: 1px solid var(--focus-border);
   outline-offset: 2px;
 }
 
@@ -507,8 +616,8 @@ body {
   width: 42px;
   height: 23px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--switch-track-border);
+  background: var(--switch-track-bg);
   transition: all 140ms ease;
 }
 
@@ -519,7 +628,7 @@ body {
   width: 17px;
   height: 17px;
   border-radius: 50%;
-  background: #d8d8d8;
+  background: var(--switch-thumb);
   transition: transform 140ms ease, background 140ms ease;
 }
 
@@ -532,13 +641,13 @@ body {
 }
 
 .session-switch.on .session-switch-track {
-  background: rgba(62, 225, 143, 0.4);
-  border-color: rgba(62, 225, 143, 0.72);
+  background: var(--switch-on-bg);
+  border-color: var(--switch-on-border);
 }
 
 .session-switch.on .session-switch-thumb {
   transform: translateX(19px);
-  background: #bfffdc;
+  background: var(--switch-on-thumb);
 }
 
 .copy-icon {
@@ -597,8 +706,8 @@ body {
 }
 
 .btn.bad {
-  background: rgba(134, 35, 53, 0.2);
-  border-color: rgba(203, 92, 117, 0.7);
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
 }
 
 .stack.rows {
@@ -635,8 +744,8 @@ body {
 }
 
 .network-card-active {
-  border-color: rgba(62, 225, 143, 0.36);
-  background: rgba(62, 225, 143, 0.08);
+  border-color: var(--active-border);
+  background: var(--active-bg);
 }
 
 .network-disabled {
@@ -704,7 +813,7 @@ body {
 .network-editor {
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid var(--window-rule);
 }
 
 .network-editor-summary {
@@ -883,27 +992,27 @@ body {
 }
 
 .badge.ok {
-  color: #bcffe0;
-  background: rgba(30, 108, 70, 0.4);
-  border-color: rgba(62, 225, 143, 0.5);
+  color: var(--success-soft-text);
+  background: var(--success-soft-bg);
+  border-color: var(--success-soft-border);
 }
 
 .badge.bad {
-  color: #ffd7dc;
-  background: rgba(134, 35, 53, 0.45);
-  border-color: rgba(255, 102, 102, 0.55);
+  color: var(--danger-soft-text);
+  background: var(--danger-soft-bg);
+  border-color: var(--danger-soft-border);
 }
 
 .badge.warn {
-  color: #ffefbe;
-  background: rgba(134, 102, 19, 0.45);
-  border-color: rgba(255, 216, 79, 0.55);
+  color: var(--warn-soft-text);
+  background: var(--warn-soft-bg);
+  border-color: var(--warn-soft-border);
 }
 
 .badge.muted {
-  color: #d5dcf1;
-  background: rgba(57, 63, 98, 0.45);
-  border-color: rgba(141, 153, 187, 0.5);
+  color: var(--muted-soft-text);
+  background: var(--muted-soft-bg);
+  border-color: var(--muted-soft-border);
 }
 
 .toggle-row {
@@ -963,7 +1072,7 @@ body {
 }
 
 .advanced-toggle:hover {
-  color: #ffffff;
+  color: var(--text);
 }
 
 .advanced-routes-field {
@@ -1030,7 +1139,7 @@ body {
 
 .collapsible-body {
   padding: 0 14px 14px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid var(--window-rule);
 }
 
 .diagnostics-badges {
@@ -1080,14 +1189,14 @@ body {
 }
 
 .exit-node-card:hover:not(:disabled) {
-  border-color: rgba(120, 206, 255, 0.46);
+  border-color: var(--interactive-hover-border);
   background: var(--surface-2);
   transform: translateY(-1px);
 }
 
 .exit-node-card.selected {
-  border-color: rgba(100, 220, 174, 0.55);
-  background: rgba(15, 36, 32, 0.86);
+  border-color: var(--selected-border);
+  background: var(--selected-bg);
 }
 
 .exit-node-card.disabled {
@@ -1107,9 +1216,9 @@ body {
 }
 
 .error {
-  color: #ffd7dc;
-  border-color: rgba(203, 92, 117, 0.7);
-  background: rgba(55, 16, 31, 0.85);
+  color: var(--error-text);
+  border-color: var(--error-border);
+  background: var(--error-bg);
 }
 
 @media (max-width: 760px) {

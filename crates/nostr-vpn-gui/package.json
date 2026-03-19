@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test:unit": "node --test src/lib/theme.test.js",
     "prepare:sidecar:debug": "node ./scripts/prepare-sidecar.mjs --debug",
     "prepare:sidecar:release": "node ./scripts/prepare-sidecar.mjs --release",
     "tauri:dev": "tauri dev",
