@@ -1,29 +1,35 @@
 :root {
   font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif;
   line-height: 1.4;
-  color: #dde8ff;
-  background: #060316;
+  color: #f1f1f1;
+  background: #0f0f0f;
+  color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  --bg-top: #12092e;
-  --bg-mid: #090723;
-  --bg-bottom: #040314;
-  --panel: rgba(6, 8, 31, 0.9);
-  --panel-border: rgba(98, 100, 196, 0.45);
-  --row: rgba(44, 33, 88, 0.45);
-  --text: #dbe8ff;
-  --muted: #9ea9c8;
+  --bg-base: #0f0f0f;
+  --surface-1: #181818;
+  --surface-2: #232323;
+  --surface-3: #3f3f3f;
+  --surface-4: #2b2b2b;
+  --panel: var(--surface-1);
+  --panel-border: rgba(255, 255, 255, 0.1);
+  --row: var(--surface-2);
+  --text: #f1f1f1;
+  --muted: #aaaaaa;
   --cyan: #75ecff;
   --pink: #ff5ce2;
   --orange: #ffa970;
   --green: #3ee18f;
   --red: #ff6666;
   --yellow: #ffd84f;
-  --button-bg: #2c2d4b;
-  --button-hover: #40446f;
+  --button-bg: var(--surface-2);
+  --button-hover: var(--surface-4);
+  --field-bg: #121212;
+  --focus-ring: rgba(117, 236, 255, 0.28);
+  --overlay-bg: rgba(15, 15, 15, 0.92);
 }
 
 * {
@@ -39,10 +45,7 @@ body,
 }
 
 body {
-  background:
-    radial-gradient(circle at 85% 20%, rgba(255, 92, 226, 0.22), transparent 32%),
-    radial-gradient(circle at 70% 17%, rgba(255, 169, 112, 0.18), transparent 30%),
-    linear-gradient(180deg, var(--bg-top), var(--bg-mid) 45%, var(--bg-bottom));
+  background: var(--bg-base);
 }
 
 .app-shell {
@@ -103,16 +106,9 @@ body {
   cursor: grab;
   user-select: none;
   -webkit-user-select: none;
-  background:
-    linear-gradient(
-      180deg,
-      rgba(7, 6, 24, 0.92) 0%,
-      rgba(7, 6, 24, 0.8) 58%,
-      rgba(7, 6, 24, 0.24) 86%,
-      rgba(7, 6, 24, 0) 100%
-    );
-  backdrop-filter: blur(10px) saturate(130%);
-  -webkit-backdrop-filter: blur(10px) saturate(130%);
+  background: var(--overlay-bg);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
 .window-chrome:active,
@@ -127,12 +123,7 @@ body {
   right: 12px;
   bottom: 0;
   height: 1px;
-  background: linear-gradient(
-    90deg,
-    rgba(125, 136, 220, 0.18),
-    rgba(160, 106, 218, 0.34),
-    rgba(125, 136, 220, 0.18)
-  );
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .window-title {
@@ -144,8 +135,7 @@ body {
   letter-spacing: 0.13em;
   text-transform: uppercase;
   font-weight: 700;
-  color: rgba(225, 236, 255, 0.9);
-  text-shadow: 0 0 12px rgba(128, 100, 255, 0.42);
+  color: rgba(241, 241, 241, 0.92);
 }
 
 .panel {
@@ -158,26 +148,20 @@ body {
 }
 
 .identity-card {
-  background: linear-gradient(170deg, rgba(17, 14, 46, 0.95), rgba(9, 8, 30, 0.9));
+  background: var(--panel);
 }
 
 .hero-card {
-  background:
-    radial-gradient(circle at 84% 24%, rgba(117, 236, 255, 0.13), transparent 32%),
-    linear-gradient(160deg, rgba(17, 14, 46, 0.97), rgba(9, 8, 30, 0.92));
+  background: var(--panel);
 }
 
 .service-panel {
-  background:
-    linear-gradient(135deg, rgba(18, 13, 48, 0.96), rgba(9, 10, 34, 0.92)),
-    radial-gradient(circle at 86% 18%, rgba(117, 236, 255, 0.12), transparent 34%);
+  background: var(--panel);
 }
 
 .service-panel-required {
-  border-color: rgba(255, 92, 226, 0.4);
-  background:
-    linear-gradient(135deg, rgba(32, 14, 57, 0.94), rgba(12, 11, 37, 0.92)),
-    radial-gradient(circle at 88% 20%, rgba(255, 92, 226, 0.18), transparent 34%);
+  border-color: rgba(255, 92, 226, 0.35);
+  background: rgba(255, 92, 226, 0.08);
 }
 
 .service-panel-copy {
@@ -295,9 +279,9 @@ body {
 .spotlight-meta-card {
   min-width: 0;
   overflow: hidden;
-  border: 1px solid rgba(116, 123, 189, 0.28);
+  border: 1px solid var(--panel-border);
   border-radius: 12px;
-  background: rgba(17, 19, 48, 0.64);
+  background: var(--surface-2);
   padding: 12px;
 }
 
@@ -375,8 +359,8 @@ body {
   width: fit-content;
   border-radius: 14px;
   padding: 10px;
-  background: rgba(8, 11, 34, 0.78);
-  border: 1px solid rgba(116, 123, 189, 0.24);
+  background: var(--surface-2);
+  border: 1px solid var(--panel-border);
 }
 
 .invite-qr {
@@ -442,8 +426,8 @@ body {
   width: 100%;
   min-width: 0;
   border-radius: 10px;
-  border: 1px solid rgba(100, 102, 185, 0.5);
-  background: rgba(10, 10, 33, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: var(--field-bg);
   color: var(--text);
   padding: 10px 12px;
   font-size: 19px;
@@ -451,12 +435,12 @@ body {
 }
 
 .text-input:focus {
-  border-color: var(--pink);
-  box-shadow: 0 0 0 1px rgba(255, 92, 226, 0.4);
+  border-color: rgba(117, 236, 255, 0.62);
+  box-shadow: 0 0 0 1px var(--focus-ring);
 }
 
 .btn {
-  border: 1px solid rgba(132, 132, 200, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   background: var(--button-bg);
   color: var(--text);
   border-radius: 10px;
@@ -486,19 +470,20 @@ body {
 .service-primary-btn {
   min-width: 170px;
   padding: 11px 16px;
-  border-color: rgba(255, 92, 226, 0.54);
-  background: linear-gradient(180deg, rgba(102, 41, 121, 0.92), rgba(69, 28, 92, 0.92));
-  box-shadow: 0 0 0 1px rgba(255, 92, 226, 0.15) inset;
+  border-color: rgba(255, 92, 226, 0.4);
+  background: rgba(255, 92, 226, 0.14);
+  color: #ffd8f9;
+  box-shadow: inset 0 0 0 1px rgba(255, 92, 226, 0.12);
 }
 
 .service-primary-btn:hover:not(:disabled) {
-  background: linear-gradient(180deg, rgba(124, 49, 145, 0.94), rgba(85, 35, 111, 0.94));
+  background: rgba(255, 92, 226, 0.22);
 }
 
 .session-switch {
   min-width: 158px;
-  border: 1px solid rgba(124, 128, 200, 0.55);
-  background: rgba(31, 35, 63, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: var(--surface-2);
   color: var(--text);
   border-radius: 999px;
   padding: 7px 11px;
@@ -509,11 +494,11 @@ body {
 }
 
 .session-switch:hover {
-  background: rgba(49, 55, 90, 0.9);
+  background: var(--surface-4);
 }
 
 .session-switch:focus-visible {
-  outline: 1px solid rgba(255, 92, 226, 0.65);
+  outline: 1px solid rgba(117, 236, 255, 0.62);
   outline-offset: 2px;
 }
 
@@ -522,8 +507,8 @@ body {
   width: 42px;
   height: 23px;
   border-radius: 999px;
-  border: 1px solid rgba(149, 157, 202, 0.62);
-  background: rgba(99, 109, 149, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.08);
   transition: all 140ms ease;
 }
 
@@ -534,7 +519,7 @@ body {
   width: 17px;
   height: 17px;
   border-radius: 50%;
-  background: #d9e1f7;
+  background: #d8d8d8;
   transition: transform 140ms ease, background 140ms ease;
 }
 
@@ -543,7 +528,7 @@ body {
   line-height: 1;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: #d7def4;
+  color: var(--text);
 }
 
 .session-switch.on .session-switch-track {
@@ -593,7 +578,7 @@ body {
 }
 
 .btn.ghost {
-  background: rgba(29, 30, 49, 0.82);
+  background: var(--surface-1);
 }
 
 .btn.icon-btn {
@@ -612,7 +597,7 @@ body {
 }
 
 .btn.bad {
-  background: rgba(88, 31, 46, 0.9);
+  background: rgba(134, 35, 53, 0.2);
   border-color: rgba(203, 92, 117, 0.7);
 }
 
@@ -628,9 +613,7 @@ body {
 }
 
 .spotlight-panel {
-  background:
-    linear-gradient(180deg, rgba(11, 12, 39, 0.94), rgba(7, 10, 31, 0.92)),
-    radial-gradient(circle at 82% 18%, rgba(117, 236, 255, 0.08), transparent 30%);
+  background: var(--panel);
 }
 
 .spotlight-meta-grid {
@@ -641,21 +624,19 @@ body {
 }
 
 .network-directory-panel {
-  background:
-    linear-gradient(180deg, rgba(10, 11, 36, 0.94), rgba(7, 8, 29, 0.9)),
-    radial-gradient(circle at 86% 18%, rgba(255, 169, 112, 0.08), transparent 28%);
+  background: var(--panel);
 }
 
 .network-card {
-  border: 1px solid rgba(92, 95, 171, 0.48);
+  border: 1px solid var(--panel-border);
   border-radius: 10px;
   padding: 10px;
-  background: rgba(11, 12, 38, 0.62);
+  background: var(--surface-2);
 }
 
 .network-card-active {
   border-color: rgba(62, 225, 143, 0.36);
-  background: rgba(11, 17, 42, 0.74);
+  background: rgba(62, 225, 143, 0.08);
 }
 
 .network-disabled {
@@ -723,7 +704,7 @@ body {
 .network-editor {
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid rgba(84, 75, 147, 0.35);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .network-editor-summary {
@@ -755,10 +736,10 @@ body {
 
 .participant-add-panel {
   margin-bottom: 10px;
-  border: 1px solid rgba(84, 75, 147, 0.4);
+  border: 1px solid var(--panel-border);
   border-radius: 10px;
   padding: 10px;
-  background: rgba(15, 14, 44, 0.62);
+  background: var(--surface-2);
 }
 
 .participant-add-label {
@@ -824,7 +805,7 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  border: 1px solid rgba(84, 75, 147, 0.4);
+  border: 1px solid var(--panel-border);
   border-radius: 10px;
   padding: 10px;
   background: var(--row);
@@ -836,7 +817,7 @@ body {
 }
 
 .network-empty-state {
-  background: rgba(15, 14, 44, 0.62);
+  background: var(--surface-2);
 }
 
 .saved-participant-row .item-sub {
@@ -965,10 +946,10 @@ body {
 }
 
 .advanced-panel {
-  border: 1px solid rgba(118, 130, 173, 0.24);
+  border: 1px solid var(--panel-border);
   border-radius: 16px;
   padding: 14px 16px;
-  background: rgba(12, 15, 40, 0.45);
+  background: var(--surface-1);
 }
 
 .advanced-toggle {
@@ -982,7 +963,7 @@ body {
 }
 
 .advanced-toggle:hover {
-  color: #f8fbff;
+  color: #ffffff;
 }
 
 .advanced-routes-field {
@@ -1049,7 +1030,7 @@ body {
 
 .collapsible-body {
   padding: 0 14px 14px;
-  border-top: 1px solid rgba(84, 75, 147, 0.28);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .diagnostics-badges {
@@ -1062,10 +1043,10 @@ body {
 }
 
 .health-card {
-  border: 1px solid rgba(118, 130, 173, 0.24);
+  border: 1px solid var(--panel-border);
   border-radius: 16px;
   padding: 14px 16px;
-  background: rgba(12, 15, 40, 0.68);
+  background: var(--surface-1);
 }
 
 .health-card-header {
@@ -1085,8 +1066,8 @@ body {
 .exit-node-card {
   width: 100%;
   border-radius: 16px;
-  border: 1px solid rgba(118, 130, 173, 0.24);
-  background: rgba(12, 15, 40, 0.68);
+  border: 1px solid var(--panel-border);
+  background: var(--surface-1);
   color: var(--text);
   padding: 14px 16px;
   text-align: left;
@@ -1100,7 +1081,7 @@ body {
 
 .exit-node-card:hover:not(:disabled) {
   border-color: rgba(120, 206, 255, 0.46);
-  background: rgba(17, 22, 54, 0.9);
+  background: var(--surface-2);
   transform: translateY(-1px);
 }
 
