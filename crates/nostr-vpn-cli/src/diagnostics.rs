@@ -432,13 +432,17 @@ pub(crate) fn build_health_issues(
     app: &AppConfig,
     session_active: bool,
     relay_connected: bool,
+    mesh_ready: bool,
     network: &NetworkSummary,
     port_mapping: &PortMappingStatus,
     peers: &[DaemonPeerState],
 ) -> Vec<HealthIssue> {
     let mut issues = Vec::new();
 
-    if session_active && !relay_connected {
+    let relays_intentionally_paused =
+        app.auto_disconnect_relays_when_mesh_ready && mesh_ready && !relay_connected;
+
+    if session_active && !relay_connected && !relays_intentionally_paused {
         issues.push(HealthIssue::new(
             "relay.disconnected",
             HealthSeverity::Warning,
@@ -1058,6 +1062,7 @@ mod tests {
             &app,
             true,
             true,
+            false,
             &network,
             &Default::default(),
             &[DaemonPeerState {
@@ -1091,7 +1096,37 @@ mod tests {
         }
         .summary(Some(10), Some(false));
 
-        let issues = build_health_issues(&app, false, false, &network, &Default::default(), &[]);
+        let issues = build_health_issues(
+            &app,
+            false,
+            false,
+            false,
+            &network,
+            &Default::default(),
+            &[],
+        );
         assert!(issues.iter().all(|issue| issue.code != "exit_node.unknown"));
+    }
+
+    #[test]
+    fn health_issues_skip_relay_warning_when_relays_are_paused_for_mesh() {
+        let app = AppConfig {
+            auto_disconnect_relays_when_mesh_ready: true,
+            ..AppConfig::default()
+        };
+        let network = NetworkSnapshot {
+            default_interface: Some("en0".to_string()),
+            primary_ipv4: Some(Ipv4Addr::new(192, 168, 1, 4)),
+            ..NetworkSnapshot::default()
+        }
+        .summary(Some(10), Some(false));
+
+        let issues =
+            build_health_issues(&app, true, false, true, &network, &Default::default(), &[]);
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.code != "relay.disconnected")
+        );
     }
 }
