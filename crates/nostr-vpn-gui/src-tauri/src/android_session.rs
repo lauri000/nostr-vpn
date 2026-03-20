@@ -69,6 +69,17 @@ struct PlannedTunnelPeer {
     peer: TunnelPeer,
 }
 
+struct ReconcileSession<'a> {
+    own_pubkey: Option<&'a str>,
+    recipients: &'a [String],
+}
+
+struct ReconcileTunnelState<'a> {
+    current_tunnel: &'a mut Option<ActiveTunnelTask>,
+    current_listen_port: &'a mut u16,
+    current_fingerprint: &'a mut Option<String>,
+}
+
 impl AndroidSessionManager {
     pub(crate) fn new(app: tauri::AppHandle, runtime_handle: Handle) -> Self {
         Self {
@@ -254,13 +265,17 @@ async fn run_android_session(
                     &app_handle,
                     &client,
                     &config,
-                    own_pubkey.as_deref(),
-                    &recipients,
+                    ReconcileSession {
+                        own_pubkey: own_pubkey.as_deref(),
+                        recipients: &recipients,
+                    },
                     &mut presence,
                     &mut path_book,
-                    &mut current_tunnel,
-                    &mut current_listen_port,
-                    &mut current_fingerprint,
+                    ReconcileTunnelState {
+                        current_tunnel: &mut current_tunnel,
+                        current_listen_port: &mut current_listen_port,
+                        current_fingerprint: &mut current_fingerprint,
+                    },
                 )
                 .await?;
                 update_snapshot(
@@ -327,19 +342,16 @@ async fn reconcile_tunnel(
     app_handle: &tauri::AppHandle,
     client: &NostrSignalingClient,
     config: &AppConfig,
-    own_pubkey: Option<&str>,
-    recipients: &[String],
+    session: ReconcileSession<'_>,
     presence: &mut PeerPresenceBook,
     path_book: &mut PeerPathBook,
-    current_tunnel: &mut Option<ActiveTunnelTask>,
-    current_listen_port: &mut u16,
-    current_fingerprint: &mut Option<String>,
+    tunnel_state: ReconcileTunnelState<'_>,
 ) -> Result<()> {
     let now = unix_timestamp();
-    let own_endpoint = local_signal_endpoint(config, *current_listen_port);
+    let own_endpoint = local_signal_endpoint(config, *tunnel_state.current_listen_port);
     let planned = planned_tunnel_peers(
         config,
-        own_pubkey,
+        session.own_pubkey,
         presence.known(),
         path_book,
         Some(&own_endpoint),
@@ -352,23 +364,23 @@ async fn reconcile_tunnel(
 
     if planned.is_empty() {
         eprintln!("android-session: no planned peers; stopping tunnel");
-        if let Some(tunnel) = current_tunnel.take() {
+        if let Some(tunnel) = tunnel_state.current_tunnel.take() {
             stop_tunnel_task(app_handle, tunnel).await;
         } else {
             let _ = app_handle.android_vpn().stop();
         }
-        *current_listen_port = config.node.listen_port;
-        *current_fingerprint = None;
+        *tunnel_state.current_listen_port = config.node.listen_port;
+        *tunnel_state.current_fingerprint = None;
         return Ok(());
     }
 
-    let fingerprint = tunnel_fingerprint(config, *current_listen_port, &planned);
-    if current_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+    let fingerprint = tunnel_fingerprint(config, *tunnel_state.current_listen_port, &planned);
+    if tunnel_state.current_fingerprint.as_deref() == Some(fingerprint.as_str()) {
         eprintln!("android-session: planned peers unchanged; keeping existing tunnel");
         return Ok(());
     }
 
-    if let Some(tunnel) = current_tunnel.take() {
+    if let Some(tunnel) = tunnel_state.current_tunnel.take() {
         eprintln!("android-session: restarting tunnel for updated peer plan");
         stop_tunnel_task(app_handle, tunnel).await;
     }
@@ -388,11 +400,21 @@ async fn reconcile_tunnel(
             .join("; "),
     );
     let tunnel = start_tunnel_task(app_handle, planned.clone(), config).await?;
-    *current_listen_port = tunnel.listen_port;
-    *current_fingerprint = Some(tunnel_fingerprint(config, *current_listen_port, &planned));
-    *current_tunnel = Some(tunnel);
+    *tunnel_state.current_listen_port = tunnel.listen_port;
+    *tunnel_state.current_fingerprint = Some(tunnel_fingerprint(
+        config,
+        *tunnel_state.current_listen_port,
+        &planned,
+    ));
+    *tunnel_state.current_tunnel = Some(tunnel);
 
-    publish_private_announce_best_effort(client, config, *current_listen_port, recipients).await;
+    publish_private_announce_best_effort(
+        client,
+        config,
+        *tunnel_state.current_listen_port,
+        session.recipients,
+    )
+    .await;
 
     Ok(())
 }
@@ -1042,10 +1064,10 @@ fn local_signal_endpoint(config: &AppConfig, listen_port: u16) -> String {
 
 fn runtime_local_signal_endpoint(endpoint: &str, listen_port: u16) -> String {
     let value = endpoint.trim();
-    if value.is_empty() || matches!(value, "127.0.0.1:51820" | "127.0.0.1" | "0.0.0.0") {
-        if let Some(ip) = detect_runtime_primary_ipv4() {
-            return format!("{ip}:{listen_port}");
-        }
+    if (value.is_empty() || matches!(value, "127.0.0.1:51820" | "127.0.0.1" | "0.0.0.0"))
+        && let Some(ip) = detect_runtime_primary_ipv4()
+    {
+        return format!("{ip}:{listen_port}");
     }
 
     endpoint
