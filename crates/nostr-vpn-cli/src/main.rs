@@ -4856,6 +4856,18 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             }
                         }
                     }
+                    let _ = persist_daemon_runtime_state(
+                        &state_file,
+                        &app,
+                        session_enabled,
+                        expected_peers,
+                        &presence,
+                        &tunnel_runtime,
+                        &session_status,
+                        relay_connected,
+                        &network_snapshot.summary(network_changed_at, captive_portal),
+                        &port_mapping_runtime.status(),
+                    );
                 }
                 if daemon_session_active(session_enabled, expected_peers) {
                     let now = unix_timestamp();
@@ -4935,19 +4947,17 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 ) {
                     eprintln!("daemon: failed to persist peer cache: {error}");
                 }
-                let _ = write_daemon_state(
+                let _ = persist_daemon_runtime_state(
                     &state_file,
-                    &build_daemon_runtime_state(
-                        &app,
-                        daemon_session_active(session_enabled, expected_peers),
-                        expected_peers,
-                        &presence,
-                        &tunnel_runtime,
-                        &session_status,
-                        relay_connected,
-                        &network_snapshot.summary(network_changed_at, captive_portal),
-                        &port_mapping_runtime.status(),
-                    ),
+                    &app,
+                    session_enabled,
+                    expected_peers,
+                    &presence,
+                    &tunnel_runtime,
+                    &session_status,
+                    relay_connected,
+                    &network_snapshot.summary(network_changed_at, captive_portal),
+                    &port_mapping_runtime.status(),
                 );
             }
             message = async {
@@ -5194,6 +5204,35 @@ fn build_daemon_runtime_state(
         port_mapping: port_mapping.clone(),
         peers,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_daemon_runtime_state(
+    path: &Path,
+    app: &AppConfig,
+    session_enabled: bool,
+    expected_peers: usize,
+    presence: &PeerPresenceBook,
+    tunnel_runtime: &CliTunnelRuntime,
+    session_status: &str,
+    relay_connected: bool,
+    network: &NetworkSummary,
+    port_mapping: &PortMappingStatus,
+) -> Result<()> {
+    write_daemon_state(
+        path,
+        &build_daemon_runtime_state(
+            app,
+            daemon_session_active(session_enabled, expected_peers),
+            expected_peers,
+            presence,
+            tunnel_runtime,
+            session_status,
+            relay_connected,
+            network,
+            port_mapping,
+        ),
+    )
 }
 
 async fn start_session(args: StartArgs) -> Result<()> {
@@ -8379,12 +8418,12 @@ mod tests {
         pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
         persisted_peer_cache_timeout_secs, planned_tunnel_peers, public_endpoint_for_listen_port,
         public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
-        read_daemon_peer_cache, record_successful_runtime_paths, relay_connection_action,
-        request_daemon_reload, request_daemon_stop, restore_daemon_peer_cache,
-        route_targets_for_tunnel_peers, route_targets_require_endpoint_bypass,
-        runtime_local_signal_endpoint, take_daemon_control_request, uninstall_cli,
-        utun_interface_candidates, windows_service_status_from_query_output,
-        write_daemon_peer_cache,
+        read_daemon_peer_cache, read_daemon_state, record_successful_runtime_paths,
+        relay_connection_action, request_daemon_reload, request_daemon_stop,
+        restore_daemon_peer_cache, route_targets_for_tunnel_peers,
+        route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
+        take_daemon_control_request, uninstall_cli, utun_interface_candidates,
+        windows_service_status_from_query_output, write_daemon_peer_cache,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -9926,6 +9965,45 @@ mod tests {
 
         assert_eq!(parsed.peers.len(), 1);
         assert!(parsed.peers[0].advertised_routes.is_empty());
+    }
+
+    #[test]
+    fn persist_daemon_runtime_state_marks_resuming_cached_mesh_as_active() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-daemon-state-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let state_path = dir.join("daemon.state.json");
+
+        let mut config = AppConfig::generated();
+        config.networks[0].participants = vec!["11".repeat(32)];
+        let presence = PeerPresenceBook::default();
+        let tunnel_runtime = super::CliTunnelRuntime::new("utun100");
+
+        super::persist_daemon_runtime_state(
+            &state_path,
+            &config,
+            true,
+            1,
+            &presence,
+            &tunnel_runtime,
+            "Resuming with cached mesh",
+            false,
+            &nostr_vpn_core::diagnostics::NetworkSummary::default(),
+            &nostr_vpn_core::diagnostics::PortMappingStatus::default(),
+        )
+        .expect("persist daemon runtime state");
+
+        let state = read_daemon_state(&state_path)
+            .expect("read daemon state")
+            .expect("daemon state should exist");
+        assert!(state.session_active);
+        assert_eq!(state.session_status, "Resuming with cached mesh");
+        assert!(!state.relay_connected);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
