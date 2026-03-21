@@ -6,7 +6,7 @@
 - `boringtun` for userspace WireGuard-compatible tunnel handling
 - a CLI daemon and a Tauri desktop app that operate on the same config/runtime model
 
-This repo is not just one binary. It currently ships:
+It currently ships:
 
 | Component | Purpose |
 | --- | --- |
@@ -18,15 +18,9 @@ This repo is not just one binary. It currently ships:
 
 ## Downloads
 
-See the latest release notes and current assets:
-
 - [Latest release](https://github.com/mmalmi/nostr-vpn/releases/latest)
 
-Most people on macOS want the Apple Silicon desktop app from that page. Headless users can grab the Apple Silicon macOS or Linux CLI tarballs there.
-
-Prebuilt Intel macOS release artifacts have been sunset. Intel Mac users should build from source or use an older release.
-
-The CLI release installer and auto-detect command are intended for Apple Silicon macOS and Linux. GitHub Releases currently publish CLI tarballs for macOS Apple Silicon, Linux x86_64, and Linux ARM64. The desktop GUI release is Apple Silicon macOS only.
+Apple Silicon macOS: desktop app. Headless use: CLI tarballs. Intel macOS: build from source or use an older release.
 
 ## What the project does today
 
@@ -42,7 +36,7 @@ The CLI release installer and auto-detect command are intended for Apple Silicon
 
 ## Default relays
 
-These are compiled into `nostr-vpn-core` and used when a config does not specify its own relay list:
+Used when a config does not specify its own relay list:
 
 - `wss://temp.iris.to`
 - `wss://relay.damus.io`
@@ -92,7 +86,7 @@ cargo clippy --workspace --exclude nostr-vpn-gui --all-targets -- -D warnings
 cargo test --workspace --exclude nostr-vpn-gui
 ```
 
-Useful extra local validation when touching the Tauri shell:
+If you touch the Tauri shell:
 
 ```bash
 cargo check -p nostr-vpn-gui
@@ -125,7 +119,7 @@ esac
 curl -fsSL "https://github.com/mmalmi/nostr-vpn/releases/latest/download/${ASSET}" | tar -xz && cd nvpn && ./install.sh
 ```
 
-That auto-detect command is valid on Apple Silicon macOS and Linux. On Intel macOS it exits with a clear message instead of fetching a missing artifact. The bundled installer creates the target directory when needed and defaults to `/opt/homebrew/bin` on Apple Silicon macOS when that location is present or already in `PATH`; otherwise it uses `/usr/local/bin`.
+That command supports Apple Silicon macOS and Linux. On Intel macOS it exits with a clear message. The installer creates the target directory when needed and defaults to `/opt/homebrew/bin` on Apple Silicon macOS when that location exists or is already in `PATH`; otherwise it uses `/usr/local/bin`.
 
 From source:
 
@@ -133,17 +127,15 @@ From source:
 cargo install --path crates/nostr-vpn-cli --bin nvpn
 ```
 
-That source install path is the supported route on Intel macOS.
+This is the supported route on Intel macOS.
 
-If you already have a packaged CLI release artifact, extract it and run:
+If you already have a release tarball, extract it and run:
 
 ```bash
 ./install.sh
 ```
 
-You can also pass a custom destination directory to the bundled installer, for example `./install.sh ~/.local/bin`.
-
-If you want the desktop app instead of the headless CLI flow, use the direct macOS download in the Downloads section above.
+You can also pass a custom destination directory, for example `./install.sh ~/.local/bin`.
 
 ## CLI quickstart
 
@@ -170,14 +162,14 @@ Run a full foreground session:
 nvpn connect
 ```
 
-If you only want to publish presence or bring the node down without running the full long-lived session, use:
+Shorter lifecycle commands:
 
 ```bash
 nvpn up
 nvpn down
 ```
 
-Or run the daemonized flow the GUI also uses:
+Daemonized flow used by the GUI:
 
 ```bash
 nvpn start --daemon --connect
@@ -186,7 +178,7 @@ nvpn resume
 nvpn stop
 ```
 
-If you want persistent privileged startup without repeated prompts, install the system service once:
+For persistent privileged startup:
 
 ```bash
 sudo nvpn service install
@@ -231,7 +223,7 @@ Clear exit-node selection:
 nvpn set --exit-node off
 ```
 
-Low-level helper commands are also available when you want to work below the daemon/session layer:
+Lower-level commands:
 
 - `announce`
 - `listen`
@@ -246,7 +238,7 @@ Low-level helper commands are also available when you want to work below the dae
 
 ## Desktop GUI
 
-The GUI lives in [`crates/nostr-vpn-gui`](crates/nostr-vpn-gui) and is a Tauri app backed by the same config and daemon used by `nvpn`.
+The GUI lives in [`crates/nostr-vpn-gui`](crates/nostr-vpn-gui). It is a Tauri app backed by the same config and daemon used by `nvpn`.
 
 <p align="center">
   <img src="docs/images/desktop-gui-overview.png" alt="Nostr VPN desktop app showing a connected network, device identity, status badges, and join controls." width="900">
@@ -266,7 +258,7 @@ Build a packaged app:
 pnpm --dir crates/nostr-vpn-gui tauri:build
 ```
 
-Important behavior:
+Notes:
 
 - `tauri:dev` and `tauri:build` automatically prepare an `nvpn` sidecar binary
 - the frontend does not run the VPN runtime itself; it shells out to `nvpn`
@@ -277,7 +269,7 @@ You can override which CLI binary the GUI uses with `NVPN_CLI_PATH`.
 
 ## Local relay and NAT test binaries
 
-For local integration testing without public infrastructure:
+For local integration testing:
 
 Run a websocket relay:
 
@@ -291,11 +283,11 @@ Run a UDP reflector:
 cargo run -p nostr-vpn-relay --bin nvpn-reflector -- --bind 127.0.0.1:3478
 ```
 
-The reflector is what `nvpn nat-discover` and `nvpn hole-punch` are designed to test against in local and Docker e2e setups.
+The reflector is used by `nvpn nat-discover` and `nvpn hole-punch` in local and Docker e2e setups.
 
 ## Docker end-to-end coverage
 
-The repo includes several real integration paths under [`scripts/`](scripts):
+Docker e2e scripts under [`scripts/`](scripts):
 
 - `./scripts/e2e-docker.sh`
   Verifies relay connectivity, `announce`/`listen`, manual `tunnel-up`, and ping across two containers.
@@ -312,7 +304,7 @@ The repo includes several real integration paths under [`scripts/`](scripts):
 - `./scripts/e2e-tauri-driver-docker.sh`
   Builds the GUI in a Linux container, runs a Tauri-driver smoke test, and writes a screenshot to `artifacts/screenshots/tauri-driver-e2e.png`.
 
-The Docker e2e flows are Linux-oriented because they require real tunnel devices and container networking privileges.
+These flows are Linux-oriented because they require real tunnel devices and container networking privileges.
 
 ## Workspace layout
 
@@ -325,7 +317,7 @@ The Docker e2e flows are Linux-oriented because they require real tunnel devices
 
 ## Release workflow notes
 
-The release workflow in [`.github/workflows/release.yml`](.github/workflows/release.yml):
+Release workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
 
 - runs on pushed `v*` tags or manual dispatch
 - verifies frontend build, formatting, clippy, and tests before publishing artifacts
