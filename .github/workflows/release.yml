@@ -469,24 +469,20 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: ''
+          packages: >-
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+            ndk;28.2.13676358
 
-      - name: Install Android SDK packages
+      - name: Export Android SDK environment
         shell: bash
         run: |
-          mkdir -p "${GITHUB_WORKSPACE}/android-sdk"
-          sdkmanager \
-            --sdk_root="${GITHUB_WORKSPACE}/android-sdk" \
-            "platform-tools" \
-            "platforms;android-${ANDROID_SDK_API_LEVEL}" \
-            "build-tools;${ANDROID_BUILD_TOOLS}" \
-            "ndk;${ANDROID_NDK_VERSION}"
-
           {
-            printf 'ANDROID_HOME=%s\n' "${GITHUB_WORKSPACE}/android-sdk"
-            printf 'ANDROID_SDK_ROOT=%s\n' "${GITHUB_WORKSPACE}/android-sdk"
-            printf 'ANDROID_NDK_HOME=%s\n' "${GITHUB_WORKSPACE}/android-sdk/ndk/${ANDROID_NDK_VERSION}"
-            printf 'NDK_HOME=%s\n' "${GITHUB_WORKSPACE}/android-sdk/ndk/${ANDROID_NDK_VERSION}"
+            printf 'ANDROID_HOME=%s\n' "${ANDROID_SDK_ROOT}"
+            printf 'ANDROID_SDK_ROOT=%s\n' "${ANDROID_SDK_ROOT}"
+            printf 'ANDROID_NDK_HOME=%s\n' "${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+            printf 'NDK_HOME=%s\n' "${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           } >> "${GITHUB_ENV}"
 
       - name: Install GUI dependencies
