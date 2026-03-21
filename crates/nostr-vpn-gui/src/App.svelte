@@ -5,6 +5,12 @@
 
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
   import {
+    canonicalizeMeshIdInput,
+    formatMeshIdForDisplay,
+    meshIdUsesCompatPrefix,
+    validateMeshIdInput,
+  } from './lib/mesh-id.js'
+  import {
     addNetwork,
     addParticipant,
     addRelay,
@@ -65,6 +71,7 @@
 
   let networkNameDrafts: Record<string, string> = {}
   let networkIdDrafts: Record<string, string> = {}
+  let networkIdErrors: Record<string, string> = {}
   let participantInputDrafts: Record<string, string> = {}
   let participantAddAliasDrafts: Record<string, string> = {}
   let participantAliasDrafts: Record<string, string> = {}
@@ -84,6 +91,8 @@
   let cliInstallSupported = false
   let startupSettingsSupported = false
   let trayBehaviorSupported = false
+
+  const NETWORK_MESH_ID_IDLE_COMMIT_MS = 5000
 
   $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
   $: serviceEnableRecommended =
@@ -510,6 +519,7 @@
     if (!state) {
       networkNameDrafts = {}
       networkIdDrafts = {}
+      networkIdErrors = {}
       participantAliasDrafts = {}
       return
     }
@@ -526,9 +536,9 @@
       nextNetworkNames[network.id] = debouncers.has(nameDebounceKey)
         ? (networkNameDrafts[network.id] ?? network.name)
         : network.name
-      nextNetworkIds[network.id] = debouncers.has(meshIdDebounceKey)
-        ? (networkIdDrafts[network.id] ?? network.networkId)
-        : network.networkId
+      nextNetworkIds[network.id] = debouncers.has(meshIdDebounceKey) || !!networkIdErrors[network.id]
+        ? (networkIdDrafts[network.id] ?? formatMeshIdForDisplay(network.networkId))
+        : formatMeshIdForDisplay(network.networkId)
 
       nextParticipantInput[network.id] = participantInputDrafts[network.id] ?? ''
       nextParticipantAddAlias[network.id] = participantAddAliasDrafts[network.id] ?? ''
@@ -559,11 +569,16 @@
     }
   }
 
-  function debounce(key: string, fn: () => Promise<void>, delay = 450) {
+  function clearDebounce(key: string) {
     const existing = debouncers.get(key)
     if (existing) {
       window.clearTimeout(existing)
+      debouncers.delete(key)
     }
+  }
+
+  function debounce(key: string, fn: () => Promise<void>, delay = 450) {
+    clearDebounce(key)
 
     const timer = window.setTimeout(async () => {
       debouncers.delete(key)
@@ -571,6 +586,86 @@
     }, delay)
 
     debouncers.set(key, timer)
+  }
+
+  function networkMeshIdDebounceKey(networkId: string) {
+    return `network-id-${networkId}`
+  }
+
+  function currentNetworkMeshId(networkId: string) {
+    return state?.networks.find((network) => network.id === networkId)?.networkId ?? null
+  }
+
+  function setNetworkMeshIdError(networkId: string, message: string) {
+    if (message) {
+      networkIdErrors = {
+        ...networkIdErrors,
+        [networkId]: message,
+      }
+      return
+    }
+
+    if (!(networkId in networkIdErrors)) {
+      return
+    }
+
+    const nextErrors = { ...networkIdErrors }
+    delete nextErrors[networkId]
+    networkIdErrors = nextErrors
+  }
+
+  function meshIdDraftError(networkId: string) {
+    return networkIdErrors[networkId] ?? ''
+  }
+
+  function meshIdHelperText(networkId: string, currentMeshId: string) {
+    const errorMessage = meshIdDraftError(networkId)
+    if (errorMessage) {
+      return errorMessage
+    }
+    if (meshIdUsesCompatPrefix(currentMeshId)) {
+      return 'Shown without the internal nostr-vpn: prefix. Copy actions keep the full mesh ID.'
+    }
+    return 'Best for new IDs: letters or numbers in 4-character groups, like abcd-efgh-ijkl.'
+  }
+
+  async function commitNetworkMeshId(networkId: string, value: string) {
+    const debounceKey = networkMeshIdDebounceKey(networkId)
+    clearDebounce(debounceKey)
+
+    const currentMeshId = currentNetworkMeshId(networkId)
+    if (!currentMeshId) {
+      return
+    }
+
+    const trimmed = value.trim()
+    if (!trimmed) {
+      setNetworkMeshIdError(networkId, '')
+      networkIdDrafts = {
+        ...networkIdDrafts,
+        [networkId]: formatMeshIdForDisplay(currentMeshId),
+      }
+      return
+    }
+
+    const validationError = validateMeshIdInput(trimmed, currentMeshId)
+    if (validationError) {
+      setNetworkMeshIdError(networkId, validationError)
+      return
+    }
+
+    const normalized = canonicalizeMeshIdInput(trimmed, currentMeshId)
+    if (normalized === currentMeshId) {
+      setNetworkMeshIdError(networkId, '')
+      networkIdDrafts = {
+        ...networkIdDrafts,
+        [networkId]: formatMeshIdForDisplay(currentMeshId),
+      }
+      return
+    }
+
+    setNetworkMeshIdError(networkId, '')
+    await runAction(() => setNetworkMeshId(networkId, normalized))
   }
 
   async function runAction(action: () => Promise<UiState>) {
@@ -708,9 +803,28 @@
       [networkId]: value,
     }
 
-    debounce(`network-id-${networkId}`, async () => {
-      await runAction(() => setNetworkMeshId(networkId, value))
-    }, 500)
+    const currentMeshId = currentNetworkMeshId(networkId)
+    if (!currentMeshId) {
+      return
+    }
+
+    const normalized = value.trim()
+    const debounceKey = networkMeshIdDebounceKey(networkId)
+    const validationError = validateMeshIdInput(normalized, currentMeshId)
+    setNetworkMeshIdError(networkId, validationError)
+
+    if (validationError) {
+      clearDebounce(debounceKey)
+      return
+    }
+
+    const canonical = canonicalizeMeshIdInput(normalized, currentMeshId)
+    if (!canonical || canonical === currentMeshId) {
+      clearDebounce(debounceKey)
+      return
+    }
+
+    debounce(debounceKey, () => commitNetworkMeshId(networkId, value), NETWORK_MESH_ID_IDLE_COMMIT_MS)
   }
 
   async function onAddParticipant(networkId: string) {
@@ -861,8 +975,11 @@
     }
 
     const network = activeNetwork(state)
-    const visibleMeshId = networkIdDrafts[network.id]?.trim() || network.networkId
-    await copyText(visibleMeshId, 'meshId')
+    const draftMeshId = networkIdDrafts[network.id] ?? formatMeshIdForDisplay(network.networkId)
+    const rawMeshId = meshIdDraftError(network.id)
+      ? network.networkId
+      : canonicalizeMeshIdInput(draftMeshId, network.networkId)
+    await copyText(rawMeshId, 'meshId')
   }
 
   async function copyInvite() {
@@ -1108,11 +1225,16 @@
             <div class="inline-copy-field">
               <input
                 id={`active-network-mesh-${activeNetworkView.id}`}
-                class="text-input network-mesh-id-input"
+                class={`text-input network-mesh-id-input ${meshIdDraftError(activeNetworkView.id) ? 'text-input-invalid' : ''}`}
                 data-testid="active-network-mesh-id-input"
-                value={networkIdDrafts[activeNetworkView.id] ?? activeNetworkView.networkId}
+                value={networkIdDrafts[activeNetworkView.id] ?? formatMeshIdForDisplay(activeNetworkView.networkId)}
                 on:input={(event) =>
                   onNetworkMeshIdInput(activeNetworkView.id, (event.currentTarget as HTMLInputElement).value)}
+                on:blur={(event) =>
+                  commitNetworkMeshId(activeNetworkView.id, (event.currentTarget as HTMLInputElement).value)}
+                on:keydown={(event) =>
+                  event.key === 'Enter' &&
+                  commitNetworkMeshId(activeNetworkView.id, (event.currentTarget as HTMLInputElement).value)}
               />
               <button class="btn copy-btn" data-testid="copy-mesh-id" on:click={copyMeshId}>
                 <span class="copy-icon" aria-hidden="true">
@@ -1124,6 +1246,9 @@
                 </span>
                 <span>{copiedValue === 'meshId' ? 'Copied' : 'Copy Mesh ID'}</span>
               </button>
+            </div>
+            <div class={`config-path ${meshIdDraftError(activeNetworkView.id) ? 'mesh-id-note-error' : ''}`}>
+              {meshIdHelperText(activeNetworkView.id, activeNetworkView.networkId)}
             </div>
           </div>
           <div class="config-path">{networkPeerSummary(activeNetworkView)}</div>
@@ -1455,7 +1580,9 @@
                       <div class="item-title">{network.name}</div>
                       <span class="badge muted">Saved</span>
                     </div>
-                    <div class="config-path" data-testid="network-mesh-id">Mesh ID: {network.networkId}</div>
+                    <div class="config-path" data-testid="network-mesh-id">
+                      Mesh ID: {formatMeshIdForDisplay(network.networkId)}
+                    </div>
                     <div class="config-path">{networkPeerSummary(network)}</div>
                   </div>
 
@@ -1497,12 +1624,20 @@
                       <label class="field-label" for={`saved-network-mesh-${network.id}`}>Mesh ID</label>
                       <input
                         id={`saved-network-mesh-${network.id}`}
-                        class="text-input network-mesh-id-input"
+                        class={`text-input network-mesh-id-input ${meshIdDraftError(network.id) ? 'text-input-invalid' : ''}`}
                         data-testid="saved-network-mesh-id-input"
-                        value={networkIdDrafts[network.id] ?? network.networkId}
+                        value={networkIdDrafts[network.id] ?? formatMeshIdForDisplay(network.networkId)}
                         on:input={(event) =>
                           onNetworkMeshIdInput(network.id, (event.currentTarget as HTMLInputElement).value)}
+                        on:blur={(event) =>
+                          commitNetworkMeshId(network.id, (event.currentTarget as HTMLInputElement).value)}
+                        on:keydown={(event) =>
+                          event.key === 'Enter' &&
+                          commitNetworkMeshId(network.id, (event.currentTarget as HTMLInputElement).value)}
                       />
+                    </div>
+                    <div class={`config-path ${meshIdDraftError(network.id) ? 'mesh-id-note-error' : ''}`}>
+                      {meshIdHelperText(network.id, network.networkId)}
                     </div>
                     <div class="config-path saved-network-note">
                       Activate this saved network when you want to switch the current mesh to it.

@@ -548,6 +548,12 @@ body {
   box-shadow: 0 0 0 1px var(--focus-ring);
 }
 
+.text-input-invalid,
+.text-input-invalid:focus {
+  border-color: var(--red);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 45%, transparent);
+}
+
 .btn {
   border: 1px solid var(--button-border);
   background: var(--button-bg);
@@ -804,6 +810,10 @@ body {
 
 .saved-network-note {
   margin-top: 8px;
+}
+
+.mesh-id-note-error {
+  color: var(--red);
 }
 
 .network-profile-editor {
