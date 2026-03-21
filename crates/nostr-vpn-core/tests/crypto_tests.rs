@@ -1,8 +1,8 @@
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use nostr_vpn_core::crypto::simulate_boringtun_handshake;
 use nostr_vpn_core::crypto::{
     decode_private_key, decode_public_key, generate_keypair, public_key_from_private_key,
 };
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use nostr_vpn_core::crypto::simulate_boringtun_handshake;
 
 #[test]
 fn key_generation_round_trips_through_base64() {

@@ -432,8 +432,6 @@ jobs:
       ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-      ANDROID_NDK_HOME: ${{ github.workspace }}/android-sdk/ndk/${{ env.ANDROID_NDK_VERSION }}
-      NDK_HOME: ${{ github.workspace }}/android-sdk/ndk/${{ env.ANDROID_NDK_VERSION }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -487,6 +485,8 @@ jobs:
           {
             printf 'ANDROID_HOME=%s\n' "${GITHUB_WORKSPACE}/android-sdk"
             printf 'ANDROID_SDK_ROOT=%s\n' "${GITHUB_WORKSPACE}/android-sdk"
+            printf 'ANDROID_NDK_HOME=%s\n' "${GITHUB_WORKSPACE}/android-sdk/ndk/${ANDROID_NDK_VERSION}"
+            printf 'NDK_HOME=%s\n' "${GITHUB_WORKSPACE}/android-sdk/ndk/${ANDROID_NDK_VERSION}"
           } >> "${GITHUB_ENV}"
 
       - name: Install GUI dependencies

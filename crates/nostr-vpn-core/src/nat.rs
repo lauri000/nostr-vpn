@@ -1,6 +1,6 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::net::ToSocketAddrs;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -72,49 +72,49 @@ pub fn discover_public_udp_endpoint_via_stun(
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-    let server_addr = resolve_stun_server_addr(server)?;
-    let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port));
-    let socket = UdpSocket::bind(bind_addr)
-        .with_context(|| format!("failed to bind udp stun socket on {bind_addr}"))?;
-    socket
-        .set_read_timeout(Some(timeout))
-        .context("failed to set udp stun read timeout")?;
-    socket
-        .set_write_timeout(Some(timeout))
-        .context("failed to set udp stun write timeout")?;
+        let server_addr = resolve_stun_server_addr(server)?;
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port));
+        let socket = UdpSocket::bind(bind_addr)
+            .with_context(|| format!("failed to bind udp stun socket on {bind_addr}"))?;
+        socket
+            .set_read_timeout(Some(timeout))
+            .context("failed to set udp stun read timeout")?;
+        socket
+            .set_write_timeout(Some(timeout))
+            .context("failed to set udp stun write timeout")?;
 
-    let mut request = Message::new();
-    request.typ = BINDING_REQUEST;
-    request
-        .new_transaction_id()
-        .context("failed to generate stun transaction id")?;
-    request.encode();
+        let mut request = Message::new();
+        request.typ = BINDING_REQUEST;
+        request
+            .new_transaction_id()
+            .context("failed to generate stun transaction id")?;
+        request.encode();
 
-    socket
-        .send_to(&request.raw, server_addr)
-        .with_context(|| format!("failed to send stun binding request to {server_addr}"))?;
+        socket
+            .send_to(&request.raw, server_addr)
+            .with_context(|| format!("failed to send stun binding request to {server_addr}"))?;
 
-    let mut buf = [0u8; 1500];
-    let (read, _) = socket
-        .recv_from(&mut buf)
-        .context("failed to receive stun binding response")?;
+        let mut buf = [0u8; 1500];
+        let (read, _) = socket
+            .recv_from(&mut buf)
+            .context("failed to receive stun binding response")?;
 
-    let mut response = Message::new();
-    response.raw = buf[..read].to_vec();
-    response
-        .decode()
-        .context("failed to decode stun binding response")?;
+        let mut response = Message::new();
+        response.raw = buf[..read].to_vec();
+        response
+            .decode()
+            .context("failed to decode stun binding response")?;
 
-    if response.transaction_id != request.transaction_id {
-        return Err(anyhow!("stun binding response transaction id mismatch"));
-    }
+        if response.transaction_id != request.transaction_id {
+            return Err(anyhow!("stun binding response transaction id mismatch"));
+        }
 
-    let mut xor_addr = XORMappedAddress::default();
-    xor_addr
-        .get_from(&response)
-        .context("stun response missing XOR-MAPPED-ADDRESS")?;
+        let mut xor_addr = XORMappedAddress::default();
+        xor_addr
+            .get_from(&response)
+            .context("stun response missing XOR-MAPPED-ADDRESS")?;
 
-    Ok(SocketAddr::new(xor_addr.ip, xor_addr.port).to_string())
+        Ok(SocketAddr::new(xor_addr.ip, xor_addr.port).to_string())
     }
 }
 
