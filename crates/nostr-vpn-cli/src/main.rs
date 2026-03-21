@@ -5866,6 +5866,7 @@ fn spawn_daemon_process(args: &ConnectArgs, config_path: &Path) -> Result<u32> {
     Ok(pid)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn stop_existing_daemons_before_service_install(config_path: &Path) -> Result<()> {
     stop_daemon(StopArgs {
         config: Some(config_path.to_path_buf()),

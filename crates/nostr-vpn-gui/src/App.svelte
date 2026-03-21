@@ -3,6 +3,7 @@
   import { Check, Copy, Trash2 } from 'lucide-svelte'
   import QRCode from 'qrcode'
 
+  import { dispatchBootReady, waitForNextPaint } from './lib/boot.js'
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
   import {
     canonicalizeMeshIdInput,
@@ -91,6 +92,8 @@
   let cliInstallSupported = false
   let startupSettingsSupported = false
   let trayBehaviorSupported = false
+  let bootReadyDispatched = false
+  let appDisposed = false
 
   const NETWORK_MESH_ID_IDLE_COMMIT_MS = 5000
 
@@ -497,6 +500,15 @@
     } finally {
       refreshInFlight = false
     }
+  }
+
+  function markBootReady() {
+    if (bootReadyDispatched) {
+      return
+    }
+
+    bootReadyDispatched = true
+    dispatchBootReady(window)
   }
 
   function initializeDraftsOnce() {
@@ -990,13 +1002,30 @@
     await copyText(state.activeNetworkInvite, 'invite')
   }
 
-  onMount(async () => {
-    await refresh()
-    await refreshAutostart()
-    pollHandle = window.setInterval(refresh, 1500)
+  onMount(() => {
+    void (async () => {
+      await waitForNextPaint(window)
+      if (appDisposed) {
+        return
+      }
+
+      await refresh()
+      if (appDisposed) {
+        return
+      }
+
+      markBootReady()
+      await refreshAutostart()
+      if (appDisposed) {
+        return
+      }
+
+      pollHandle = window.setInterval(refresh, 1500)
+    })()
   })
 
   onDestroy(() => {
+    appDisposed = true
     if (pollHandle) {
       window.clearInterval(pollHandle)
     }

@@ -4,7 +4,11 @@
 mod android_session;
 #[cfg(any(target_os = "android", test))]
 mod android_vpn;
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+mod ios_packet_tunnel;
+#[cfg(target_os = "ios")]
+mod ios_vpn;
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 mod mobile_wg;
 
 use std::collections::{HashMap, HashSet};
@@ -66,6 +70,8 @@ const GUI_SERVICE_SETUP_REQUIRED_STATUS: &str =
 const GUI_SERVICE_SETUP_REQUIRED_AUTOCONNECT_STATUS: &str =
     "Install background service to enable app auto-connect";
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(test)]
+const IOS_TAURI_ORIGIN: &str = "tauri://localhost";
 const NETWORK_INVITE_PREFIX: &str = "nvpn://invite/";
 const NETWORK_INVITE_VERSION: u8 = 1;
 
@@ -164,7 +170,7 @@ struct CliDaemonStatus {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DaemonRuntimeState {
     updated_at: u64,
     session_active: bool,
@@ -183,7 +189,7 @@ struct DaemonRuntimeState {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DaemonPeerState {
     participant_pubkey: String,
     node_id: String,
@@ -449,11 +455,11 @@ const fn runtime_capabilities_for_platform(platform: RuntimePlatform) -> Runtime
         RuntimePlatform::Ios => RuntimeCapabilities {
             platform: "ios",
             mobile: true,
-            vpn_session_control_supported: false,
+            vpn_session_control_supported: true,
             cli_install_supported: false,
             startup_settings_supported: false,
             tray_behavior_supported: false,
-            runtime_status_detail: "Mobile VPN service integration is not wired up yet. Network editing works, but tunnel control is disabled.",
+            runtime_status_detail: "iOS Packet Tunnel integration is available; desktop service management is unavailable.",
         },
     }
 }
@@ -481,6 +487,7 @@ struct NvpnBackend {
     service_running: bool,
     service_status_detail: String,
     daemon_state: Option<DaemonRuntimeState>,
+    launch_start_pending: bool,
 
     relay_status: HashMap<String, RelayStatus>,
     peer_status: HashMap<String, PeerLinkStatus>,
@@ -499,10 +506,14 @@ impl NvpnBackend {
         config_path: PathBuf,
         launched_from_autostart: bool,
     ) -> Result<Self> {
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: new entry");
         #[cfg(not(target_os = "android"))]
         let _ = &app_handle;
 
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: runtime ready");
         #[cfg(target_os = "android")]
         let android_session =
             android_session::AndroidSessionManager::new(app_handle, runtime.handle().clone());
@@ -516,9 +527,13 @@ impl NvpnBackend {
                 .context("failed to persist generated config")?;
             generated
         };
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: config loaded");
 
         config.ensure_defaults();
         maybe_autoconfigure_node(&mut config);
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: config normalized");
 
         let relay_status = config
             .nostr
@@ -542,6 +557,8 @@ impl NvpnBackend {
             .collect::<HashMap<_, _>>();
 
         let nvpn_bin = resolve_nvpn_cli_path().ok();
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: cli path resolved");
 
         let mut backend = Self {
             runtime,
@@ -565,6 +582,7 @@ impl NvpnBackend {
             service_running: false,
             service_status_detail: String::new(),
             daemon_state: None,
+            launch_start_pending: false,
             relay_status,
             peer_status,
             lan_discovery_running: false,
@@ -573,30 +591,58 @@ impl NvpnBackend {
             lan_peers: HashMap::new(),
             magic_dns_status: "DNS disabled (VPN off)".to_string(),
         };
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: state allocated");
 
         backend.ensure_relay_status_entries();
         backend.ensure_peer_status_entries();
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: status entries ensured");
         backend.maybe_refresh_lan_discovery();
-        backend.sync_daemon_state();
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: lan refresh complete");
+        #[cfg(target_os = "ios")]
+        {
+            backend.sync_service_state();
+            write_ios_probe("backend: initial daemon sync deferred");
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            backend.sync_daemon_state();
+        }
+        #[cfg(not(target_os = "ios"))]
+        let _ = ();
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: daemon sync complete");
 
         let wants_autoconnect =
             backend.config.autoconnect && !backend.config.participant_pubkeys_hex().is_empty();
+        let should_start_on_launch = should_start_gui_daemon_on_launch(
+            backend.config.autoconnect,
+            !backend.config.participant_pubkeys_hex().is_empty(),
+            backend.gui_requires_service_action(),
+        );
         let defer_to_installed_service = should_defer_gui_daemon_start_to_service_on_autostart(
             launched_from_autostart,
             backend.service_installed,
             backend.service_disabled,
         );
-        if should_start_gui_daemon_on_launch(
-            backend.config.autoconnect,
-            !backend.config.participant_pubkeys_hex().is_empty(),
-            backend.gui_requires_service_action(),
-        ) && !backend.daemon_running
-            && !defer_to_installed_service
-        {
+        if should_defer_gui_daemon_start_until_first_tick(
+            current_runtime_platform(),
+            should_start_on_launch,
+            defer_to_installed_service,
+        ) {
+            backend.launch_start_pending = true;
+            backend.session_status = "Waiting for initial VPN start".to_string();
+        } else if should_start_on_launch && !backend.daemon_running && !defer_to_installed_service {
+            #[cfg(target_os = "ios")]
+            write_ios_probe("backend: starting daemon on launch");
             if let Err(error) = backend.start_daemon_process() {
                 backend.session_status = format!("Daemon start failed: {error}");
             }
             backend.sync_daemon_state();
+            #[cfg(target_os = "ios")]
+            write_ios_probe("backend: launch daemon sync complete");
         } else if wants_autoconnect && defer_to_installed_service && !backend.daemon_running {
             backend.session_status = "Waiting for background service to start".to_string();
         } else if wants_autoconnect && backend.gui_requires_service_install() {
@@ -605,6 +651,8 @@ impl NvpnBackend {
             backend.session_status = gui_service_enable_status_text(true).to_string();
         }
 
+        #[cfg(target_os = "ios")]
+        write_ios_probe("backend: new complete");
         Ok(backend)
     }
 
@@ -997,6 +1045,24 @@ impl NvpnBackend {
         self.android_session.start(self.config.clone())
     }
 
+    #[cfg(target_os = "ios")]
+    fn start_daemon_process(&mut self) -> Result<()> {
+        let mut config = self.config.clone();
+        config.ensure_defaults();
+        maybe_autoconfigure_node(&mut config);
+        ios_vpn::prepare()?;
+        let _ = ios_vpn::start(&ios_vpn::StartVpnArgs {
+            session_name: config.effective_network_id(),
+            config_json: serde_json::to_string(&config)
+                .context("failed to serialize iOS VPN config")?,
+            local_address: ios_vpn::local_address_for_tunnel(&config.node.tunnel_ip),
+            dns_servers: Vec::new(),
+            search_domains: Vec::new(),
+            mtu: ios_vpn::IOS_TUN_MTU,
+        })?;
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     fn start_daemon_process(&mut self) -> Result<()> {
         let args = self.daemon_start_args()?;
@@ -1014,7 +1080,11 @@ impl NvpnBackend {
         }
     }
 
-    #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(target_os = "android"),
+        not(target_os = "ios")
+    ))]
     fn start_daemon_process(&mut self) -> Result<()> {
         let args = self.daemon_start_args()?;
         let output = self.run_nvpn_command(args)?;
@@ -1053,7 +1123,13 @@ impl NvpnBackend {
         self.android_session.reload(self.config.clone())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    fn reload_daemon_process(&mut self) -> Result<()> {
+        let _ = ios_vpn::stop();
+        self.start_daemon_process()
+    }
+
+    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
     fn reload_daemon_process(&mut self) -> Result<()> {
         let args = [
             "reload",
@@ -1088,7 +1164,13 @@ impl NvpnBackend {
         self.android_session.stop()
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    fn pause_daemon_process(&mut self) -> Result<()> {
+        let _ = ios_vpn::stop()?;
+        Ok(())
+    }
+
+    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
     fn pause_daemon_process(&mut self) -> Result<()> {
         let args = [
             "pause",
@@ -1122,7 +1204,12 @@ impl NvpnBackend {
         self.android_session.start(self.config.clone())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    fn resume_daemon_process(&mut self) -> Result<()> {
+        self.start_daemon_process()
+    }
+
+    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
     fn resume_daemon_process(&mut self) -> Result<()> {
         let args = [
             "resume",
@@ -1382,7 +1469,18 @@ impl NvpnBackend {
         })
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    fn fetch_cli_status(&self) -> Result<CliStatusResponse> {
+        let status = ios_vpn::status()?;
+        Ok(CliStatusResponse {
+            daemon: CliDaemonStatus {
+                running: status.active,
+                state: status.state,
+            },
+        })
+    }
+
+    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
     fn fetch_cli_status(&self) -> Result<CliStatusResponse> {
         let output = self.run_nvpn_command([
             "status",
@@ -1426,7 +1524,21 @@ impl NvpnBackend {
         })
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    fn fetch_cli_service_status(&self) -> Result<CliServiceStatusResponse> {
+        Ok(CliServiceStatusResponse {
+            supported: false,
+            installed: false,
+            disabled: false,
+            loaded: false,
+            running: false,
+            pid: None,
+            label: "ios-packet-tunnel".to_string(),
+            plist_path: String::new(),
+        })
+    }
+
+    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
     fn fetch_cli_service_status(&self) -> Result<CliServiceStatusResponse> {
         let output = self.run_nvpn_command([
             "service",
@@ -1690,7 +1802,16 @@ impl NvpnBackend {
             };
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            self.magic_dns_status = if self.session_active {
+                "iOS tunnel is active; MagicDNS is not wired yet".to_string()
+            } else {
+                "DNS unchanged (VPN off)".to_string()
+            };
+        }
+
+        #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
         {
             self.magic_dns_status = if self.session_active {
                 let suffix = self
@@ -2179,7 +2300,19 @@ impl NvpnBackend {
         self.maybe_refresh_lan_discovery();
         self.handle_lan_discovery_events();
         self.prune_lan_peers();
+        self.maybe_start_pending_launch_daemon();
         self.sync_daemon_state();
+    }
+
+    fn maybe_start_pending_launch_daemon(&mut self) {
+        if !self.launch_start_pending {
+            return;
+        }
+
+        self.launch_start_pending = false;
+        if let Err(error) = self.start_daemon_process() {
+            self.session_status = format!("Daemon start failed: {error}");
+        }
     }
 
     fn lan_discovery_should_run(&self) -> bool {
@@ -2735,6 +2868,14 @@ fn should_defer_gui_daemon_start_to_service_on_autostart(
     service_disabled: bool,
 ) -> bool {
     cfg!(target_os = "macos") && launched_from_autostart && service_installed && !service_disabled
+}
+
+fn should_defer_gui_daemon_start_until_first_tick(
+    platform: RuntimePlatform,
+    should_start_on_launch: bool,
+    defer_to_installed_service: bool,
+) -> bool {
+    platform == RuntimePlatform::Ios && should_start_on_launch && !defer_to_installed_service
 }
 
 fn gui_service_setup_status_text(autoconnect: bool) -> &'static str {
@@ -4133,10 +4274,51 @@ fn update_settings(
     Ok(ui)
 }
 
+#[cfg(test)]
+fn tauri_protocol_request_path(uri: &tauri::http::Uri, origin: &str) -> String {
+    let request_uri = uri.to_string();
+    let request_path = request_uri
+        .split(&['?', '#'][..])
+        .next()
+        .unwrap_or_default()
+        .strip_prefix(origin)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+
+    if request_path.is_empty() {
+        "index.html".to_string()
+    } else {
+        request_path.to_string()
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn write_ios_probe(message: impl AsRef<str>) {
+    let log_path = std::env::temp_dir().join("nvpn-ios-probe.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = writeln!(file, "{}", message.as_ref());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    #[cfg(target_os = "ios")]
+    write_ios_probe("run: entry");
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        #[cfg(target_os = "ios")]
+        {
+            tracing_subscriber::EnvFilter::new("info,wry=trace,tauri=trace")
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            tracing_subscriber::EnvFilter::new("warn")
+        }
+    });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .try_init();
@@ -4162,15 +4344,49 @@ pub fn run() {
     let builder = builder.plugin(android_vpn::Builder::new().build());
     let builder = builder.plugin(tauri_plugin_deep_link::init());
     let app = builder
+        .on_page_load(|webview, payload| {
+            #[cfg(not(target_os = "ios"))]
+            let _ = (&webview, &payload);
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!(
+                    "gui: page load event={:?} label={} url={}",
+                    payload.event(),
+                    webview.label(),
+                    payload.url()
+                );
+                write_ios_probe(format!(
+                    "page_load: event={:?} label={} url={}",
+                    payload.event(),
+                    webview.label(),
+                    payload.url()
+                ));
+            }
+        })
         .setup(move |app| {
             #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
             let _ = app;
 
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!("gui: setup begin");
+                write_ios_probe("setup: begin");
+            }
             let config_path = resolve_backend_config_path(app.handle())
                 .context("failed to resolve GUI config path")?;
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!("gui: setup resolved config path={}", config_path.display());
+                write_ios_probe(format!("setup: config_path={}", config_path.display()));
+            }
             let backend =
                 NvpnBackend::new(app.handle().clone(), config_path, launched_from_autostart)
                     .context("failed to initialize GUI backend state")?;
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!("gui: setup backend initialized");
+                write_ios_probe("setup: backend initialized");
+            }
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             let launch_on_startup_default = backend.config.launch_on_startup;
             let initial_tray_state = backend.tray_runtime_state();
@@ -4182,10 +4398,20 @@ pub fn run() {
             }) {
                 return Err(anyhow!("application state already initialized").into());
             }
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!("gui: setup state managed");
+                write_ios_probe("setup: state managed");
+            }
 
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
             app.deep_link().register_all()?;
 
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!("gui: setup querying deep links");
+                write_ios_probe("setup: querying deep links");
+            }
             if let Some(urls) = app.deep_link().get_current()?
                 && let Err(error) = import_network_invites_from_deep_links(
                     app.handle(),
@@ -4204,6 +4430,11 @@ pub fn run() {
                     eprintln!("deep-link: failed to import open URL: {error:#}");
                 }
             });
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!("gui: setup deep-link handlers ready");
+                write_ios_probe("setup: deep-link handlers ready");
+            }
 
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             app.handle().plugin(tauri_plugin_autostart::init(
@@ -4361,6 +4592,11 @@ pub fn run() {
                 }
             }
 
+            #[cfg(target_os = "ios")]
+            {
+                eprintln!("gui: setup complete");
+                write_ios_probe("setup: complete");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4408,8 +4644,8 @@ pub fn run() {
 mod tests {
     use super::{
         ConfiguredPeerStatus, DaemonPeerState, DaemonRuntimeState, GuiLaunchDisposition,
-        NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend, ParticipantView,
-        PeerPresenceStatus, RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID,
+        IOS_TAURI_ORIGIN, NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend,
+        ParticipantView, PeerPresenceStatus, RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID,
         TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState,
         active_network_invite_code, apply_network_invite_to_active_network,
         cli_binary_installed_at, config_path_from_roots, expected_peer_count,
@@ -4419,11 +4655,13 @@ mod tests {
         parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
         parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
         peer_state_label, runtime_capabilities_for_platform,
-        should_defer_gui_daemon_start_to_service_on_autostart, should_start_gui_daemon_on_launch,
-        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
-        tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
-        tray_status_text, tray_vpn_status_menu_text, tray_vpn_toggle_text, validate_nvpn_binary,
-        within_peer_online_grace, within_peer_presence_grace,
+        should_defer_gui_daemon_start_to_service_on_autostart,
+        should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
+        should_surface_existing_instance_args, started_from_autostart_args,
+        tauri_protocol_request_path, to_npub, tray_exit_node_entries, tray_identity_text,
+        tray_menu_spec, tray_network_groups, tray_status_text, tray_vpn_status_menu_text,
+        tray_vpn_toggle_text, validate_nvpn_binary, within_peer_online_grace,
+        within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
@@ -4451,6 +4689,7 @@ mod tests {
             service_running: false,
             service_status_detail: String::new(),
             daemon_state: None,
+            launch_start_pending: false,
             relay_status: HashMap::new(),
             peer_status: HashMap::new(),
             lan_discovery_running: false,
@@ -5284,6 +5523,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ios_launch_autoconnect_defers_until_first_tick() {
+        assert!(should_defer_gui_daemon_start_until_first_tick(
+            RuntimePlatform::Ios,
+            true,
+            false
+        ));
+        assert!(!should_defer_gui_daemon_start_until_first_tick(
+            RuntimePlatform::Desktop,
+            true,
+            false
+        ));
+        assert!(!should_defer_gui_daemon_start_until_first_tick(
+            RuntimePlatform::Ios,
+            false,
+            false
+        ));
+        assert!(!should_defer_gui_daemon_start_until_first_tick(
+            RuntimePlatform::Ios,
+            true,
+            true
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn validate_nvpn_binary_rejects_world_writable() {
@@ -5346,6 +5609,23 @@ mod tests {
     }
 
     #[test]
+    fn ios_runtime_capabilities_enable_mobile_vpn_control() {
+        let capabilities = runtime_capabilities_for_platform(RuntimePlatform::Ios);
+
+        assert_eq!(capabilities.platform, "ios");
+        assert!(capabilities.mobile);
+        assert!(capabilities.vpn_session_control_supported);
+        assert!(!capabilities.cli_install_supported);
+        assert!(!capabilities.startup_settings_supported);
+        assert!(!capabilities.tray_behavior_supported);
+        assert!(
+            capabilities
+                .runtime_status_detail
+                .contains("iOS Packet Tunnel integration")
+        );
+    }
+
+    #[test]
     fn desktop_runtime_capabilities_keep_existing_management_features() {
         let capabilities = runtime_capabilities_for_platform(RuntimePlatform::Desktop);
 
@@ -5385,5 +5665,37 @@ mod tests {
         let path = config_path_from_roots(None, Some(std::path::Path::new("/home/test/.config")));
 
         assert_eq!(path, PathBuf::from("/home/test/.config/nvpn/config.toml"));
+    }
+
+    #[test]
+    fn tauri_protocol_request_path_defaults_root_to_index_html() {
+        let uri: tauri::http::Uri = "tauri://localhost".parse().expect("uri");
+
+        assert_eq!(
+            tauri_protocol_request_path(&uri, IOS_TAURI_ORIGIN),
+            "index.html"
+        );
+    }
+
+    #[test]
+    fn tauri_protocol_request_path_strips_query_and_fragment() {
+        let uri: tauri::http::Uri = "tauri://localhost/assets/index.js?v=42#boot"
+            .parse()
+            .expect("uri");
+
+        assert_eq!(
+            tauri_protocol_request_path(&uri, IOS_TAURI_ORIGIN),
+            "assets/index.js"
+        );
+    }
+
+    #[test]
+    fn tauri_protocol_request_path_trims_leading_slashes() {
+        let uri: tauri::http::Uri = "tauri://localhost//nested/path.css".parse().expect("uri");
+
+        assert_eq!(
+            tauri_protocol_request_path(&uri, IOS_TAURI_ORIGIN),
+            "nested/path.css"
+        );
     }
 }
