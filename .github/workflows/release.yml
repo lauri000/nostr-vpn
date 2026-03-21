@@ -365,6 +365,7 @@ jobs:
         shell: bash
         run: |
           RELEASE_VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          MACOS_ZIP="nostr-vpn-${RELEASE_VERSION}-macos-arm64.zip"
           mkdir -p dist
           APP_PATH="$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
           if [ -z "${APP_PATH}" ]; then
@@ -372,17 +373,18 @@ jobs:
             exit 1
           fi
 
-          ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "dist/nostr-vpn-macos-arm64.zip"
-          cp "dist/nostr-vpn-macos-arm64.zip" "dist/nostr-vpn-${RELEASE_VERSION}-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "dist/${MACOS_ZIP}"
 
       - name: Verify packaged macOS artifact
         shell: bash
         run: |
+          RELEASE_VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          MACOS_ZIP="dist/nostr-vpn-${RELEASE_VERSION}-macos-arm64.zip"
           VERIFY_DIR="$RUNNER_TEMP/macos-package-verify"
           rm -rf "${VERIFY_DIR}"
           mkdir -p "${VERIFY_DIR}"
 
-          ditto -x -k "dist/nostr-vpn-macos-arm64.zip" "${VERIFY_DIR}"
+          ditto -x -k "${MACOS_ZIP}" "${VERIFY_DIR}"
 
           APP_PATH="$(find "${VERIFY_DIR}" -maxdepth 1 -name '*.app' -print -quit)"
           if [ -z "${APP_PATH}" ]; then
@@ -397,9 +399,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: |
-            dist/nostr-vpn-macos-arm64.zip
-            dist/nostr-vpn-${{ github.event.inputs.tag || github.ref_name }}-macos-arm64.zip
+          path: dist/nostr-vpn-${{ github.event.inputs.tag || github.ref_name }}-macos-arm64.zip
           retention-days: 7
 
       - name: Cleanup macOS signing keychain
@@ -571,7 +571,7 @@ jobs:
 
             ### Most people
 
-            - [Nostr VPN for macOS (Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/nostr-vpn-macos-arm64.zip)
+            - [Nostr VPN for macOS (Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/nostr-vpn-${{ github.event.inputs.tag || github.ref_name }}-macos-arm64.zip)
             - [Nostr VPN for Android](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/nostr-vpn-${{ github.event.inputs.tag || github.ref_name }}-android-arm64.apk)
 
             Prebuilt Intel macOS release artifacts have been sunset. Intel Mac users should build from source or use an older release.
