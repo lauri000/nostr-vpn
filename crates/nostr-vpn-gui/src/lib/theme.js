@@ -1,5 +1,3 @@
-import { getCurrentWindow } from '@tauri-apps/api/window'
-
 export const DARK_THEME_COLOR = '#0f0f0f'
 export const LIGHT_THEME_COLOR = '#f4f5f7'
 
@@ -13,9 +11,13 @@ function defaultMetaTheme() {
     : document.querySelector('meta[name="theme-color"]')
 }
 
-function safeCurrentWindow() {
+async function safeCurrentWindow(loadCurrentWindow) {
+  if (typeof loadCurrentWindow !== 'function') {
+    return null
+  }
+
   try {
-    return getCurrentWindow()
+    return await loadCurrentWindow()
   } catch {
     return null
   }
@@ -63,7 +65,9 @@ export async function startSystemThemeSync(options = {}) {
   const root = options.root ?? defaultRoot()
   const metaTheme =
     'metaTheme' in options ? options.metaTheme : defaultMetaTheme()
-  const currentWindow = options.currentWindow ?? safeCurrentWindow()
+  const currentWindow =
+    options.currentWindow ??
+    (await safeCurrentWindow(options.loadCurrentWindow))
   const mediaQuery = options.mediaQuery ?? safeMediaQuery()
   const cleanups = []
 

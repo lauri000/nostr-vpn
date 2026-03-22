@@ -105,3 +105,35 @@ test('startSystemThemeSync falls back to light when Tauri returns null', async (
 
   await stop()
 })
+
+test('startSystemThemeSync falls back to browser theme when loading the Tauri window API fails', async () => {
+  const root = {
+    dataset: {},
+    style: {
+      colorScheme: '',
+    },
+  }
+
+  let loadAttempts = 0
+  const mediaQuery = {
+    matches: true,
+    addEventListener() {},
+    removeEventListener() {},
+  }
+
+  const stop = await startSystemThemeSync({
+    loadCurrentWindow: async () => {
+      loadAttempts += 1
+      throw new Error('window api is not available on mobile')
+    },
+    mediaQuery,
+    root,
+    metaTheme: null,
+  })
+
+  assert.equal(loadAttempts, 1)
+  assert.equal(root.dataset.theme, 'dark')
+  assert.equal(root.style.colorScheme, 'dark')
+
+  await stop()
+})
