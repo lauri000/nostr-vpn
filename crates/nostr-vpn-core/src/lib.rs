@@ -2,6 +2,7 @@ pub mod config;
 pub mod control;
 pub mod crypto;
 pub mod diagnostics;
+pub mod iroh_signaling;
 pub mod magic_dns;
 pub mod nat;
 pub mod paths;

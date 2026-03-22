@@ -1,4 +1,6 @@
 mod diagnostics;
+#[cfg(test)]
+mod iroh_wg_transport;
 #[cfg(any(target_os = "windows", test))]
 mod userspace_wg;
 #[cfg(any(target_os = "windows", test))]
@@ -26,8 +28,13 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 #[cfg(unix)]
 use boringtun::device::{DeviceConfig, DeviceHandle};
+use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use hex::encode as encode_hex;
+use iroh::{
+    Endpoint as IrohEndpoint, RelayMode as IrohRelayMode, RelayUrl as IrohRelayUrl,
+    SecretKey as IrohSecretKey, endpoint::presets as iroh_presets,
+};
 use netdev::get_interfaces;
 use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, maybe_autoconfigure_node, normalize_advertised_route,
@@ -111,6 +118,7 @@ const MIN_PERSISTED_PATH_CACHE_TIMEOUT_SECS: u64 = 1_800;
 const PERSISTED_PATH_CACHE_TIMEOUT_MULTIPLIER: u64 = 90;
 const MESH_READY_RELAYS_PAUSED_STATUS: &str = "Mesh ready (relays paused)";
 const WAITING_FOR_PARTICIPANTS_STATUS: &str = "Waiting for participants";
+const IROH_RELAY_PROBE_ALPN: &[u8] = b"nostr-vpn/iroh-relay-probe/1";
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
@@ -251,6 +259,8 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Measure relay-only iroh datagram throughput between two local endpoints.
+    ProbeIrohRelay(ProbeIrohRelayArgs),
     /// Render a WireGuard config from local values and peer tuples.
     RenderWg {
         #[arg(long)]
@@ -649,6 +659,16 @@ struct HolePunchArgs {
     recv_timeout_ms: u64,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProbeIrohRelayArgs {
+    #[arg(long)]
+    relay_url: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    duration_secs: u64,
+    #[arg(long, default_value_t = 1024)]
+    datagram_bytes: usize,
 }
 
 #[tokio::main]
@@ -1170,6 +1190,9 @@ async fn main() -> Result<()> {
 
             client.disconnect().await;
         }
+        Command::ProbeIrohRelay(args) => {
+            probe_iroh_relay(args).await?;
+        }
         Command::NatDiscover(args) => {
             let reflector: SocketAddr = args
                 .reflector
@@ -1565,6 +1588,128 @@ async fn discover_peers(
     let mut values: Vec<PeerAnnouncement> = peers.into_values().collect();
     values.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(values)
+}
+
+async fn probe_iroh_relay(args: ProbeIrohRelayArgs) -> Result<()> {
+    if args.duration_secs == 0 {
+        return Err(anyhow!("--duration-secs must be greater than zero"));
+    }
+    if args.datagram_bytes == 0 {
+        return Err(anyhow!("--datagram-bytes must be greater than zero"));
+    }
+
+    let relay_mode = match args.relay_url.as_deref() {
+        Some(url) => {
+            let relay_url = url
+                .parse::<IrohRelayUrl>()
+                .with_context(|| format!("invalid relay url {url}"))?;
+            IrohRelayMode::custom([relay_url])
+        }
+        None => IrohRelayMode::Default,
+    };
+
+    let sender = IrohEndpoint::builder(iroh_presets::N0)
+        .secret_key(IrohSecretKey::generate(&mut rand::rng()))
+        .alpns(vec![IROH_RELAY_PROBE_ALPN.to_vec()])
+        .clear_ip_transports()
+        .relay_mode(relay_mode.clone())
+        .bind()
+        .await
+        .context("failed to bind iroh sender endpoint")?;
+    let receiver = IrohEndpoint::builder(iroh_presets::N0)
+        .secret_key(IrohSecretKey::generate(&mut rand::rng()))
+        .alpns(vec![IROH_RELAY_PROBE_ALPN.to_vec()])
+        .clear_ip_transports()
+        .relay_mode(relay_mode)
+        .bind()
+        .await
+        .context("failed to bind iroh receiver endpoint")?;
+
+    tokio::time::timeout(Duration::from_secs(30), sender.online())
+        .await
+        .context("timed out waiting for sender relay connectivity")?;
+    tokio::time::timeout(Duration::from_secs(30), receiver.online())
+        .await
+        .context("timed out waiting for receiver relay connectivity")?;
+
+    let receiver_addr = receiver.addr();
+    let relay_url = receiver_addr
+        .relay_urls()
+        .next()
+        .cloned()
+        .map(|url| url.to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    let duration_secs = args.duration_secs;
+    let receiver_task = tokio::spawn(async move {
+        let incoming = receiver
+            .accept()
+            .await
+            .ok_or_else(|| anyhow!("receiver endpoint closed before probe connection"))?;
+        let connection = incoming
+            .await
+            .context("failed to accept probe connection")?;
+        let deadline = Instant::now() + Duration::from_secs(duration_secs);
+        let mut received_bytes = 0_u64;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(deadline - now, connection.read_datagram()).await {
+                Ok(Ok(payload)) => {
+                    received_bytes = received_bytes.saturating_add(payload.len() as u64);
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        receiver.close().await;
+        Ok::<u64, anyhow::Error>(received_bytes)
+    });
+
+    let connection = sender
+        .connect(receiver_addr, IROH_RELAY_PROBE_ALPN)
+        .await
+        .context("failed to establish relay-only iroh probe connection")?;
+    let max_datagram_size = connection
+        .max_datagram_size()
+        .ok_or_else(|| anyhow!("probe connection does not support datagrams"))?;
+    let payload_len = args.datagram_bytes.min(max_datagram_size);
+    let payload = Bytes::from(vec![0x5a; payload_len]);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(duration_secs);
+    let mut sent_bytes = 0_u64;
+    while Instant::now() < deadline {
+        connection
+            .send_datagram_wait(payload.clone())
+            .await
+            .context("failed while sending probe datagram")?;
+        sent_bytes = sent_bytes.saturating_add(payload_len as u64);
+    }
+    connection.close(0u32.into(), b"probe complete");
+
+    let received_bytes = receiver_task
+        .await
+        .context("receiver probe task join failed")??;
+    let elapsed_secs = started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "relay_url": relay_url,
+            "duration_secs": elapsed_secs,
+            "payload_bytes": payload_len,
+            "max_datagram_size": max_datagram_size,
+            "sent_bytes": sent_bytes,
+            "received_bytes": received_bytes,
+            "sent_mbps": (sent_bytes as f64 * 8.0) / elapsed_secs / 1_000_000.0,
+            "received_mbps": (received_bytes as f64 * 8.0) / elapsed_secs / 1_000_000.0,
+            "sender_endpoint_id": sender.id().to_string(),
+            "receiver_endpoint_id": connection.remote_id().to_string(),
+        }))?
+    );
+
+    sender.close().await;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
