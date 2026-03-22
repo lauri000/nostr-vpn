@@ -17,6 +17,8 @@ use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,6 +78,8 @@ const GUI_SERVICE_SETUP_REQUIRED_STATUS: &str =
     "Install background service to turn VPN on from the app";
 const GUI_SERVICE_SETUP_REQUIRED_AUTOCONNECT_STATUS: &str =
     "Install background service to enable app auto-connect";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(test)]
 const IOS_TAURI_ORIGIN: &str = "tauri://localhost";
@@ -1668,7 +1672,8 @@ impl NvpnBackend {
             ));
         };
 
-        ProcessCommand::new(nvpn_bin)
+        let mut command = ProcessCommand::new(nvpn_bin);
+        apply_windows_subprocess_flags(&mut command)
             .args(args)
             .output()
             .with_context(|| {
@@ -3364,7 +3369,8 @@ fn windows_program_data_dir() -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn windows_installed_service_config_path() -> Option<PathBuf> {
-    let output = ProcessCommand::new("sc.exe")
+    let mut command = ProcessCommand::new("sc.exe");
+    let output = apply_windows_subprocess_flags(&mut command)
         .args(["qc", "NvpnService"])
         .output()
         .ok()?;
@@ -3515,8 +3521,8 @@ async fn run_lan_discovery_loop(
 }
 
 struct AppState {
-    backend: Mutex<NvpnBackend>,
-    last_tray_runtime_state: Mutex<TrayRuntimeState>,
+    backend: Arc<Mutex<NvpnBackend>>,
+    last_tray_runtime_state: Arc<Mutex<TrayRuntimeState>>,
 }
 
 fn with_backend<T>(
@@ -3528,6 +3534,42 @@ fn with_backend<T>(
         .lock()
         .map_err(|_| "backend lock poisoned".to_string())?;
     f(&mut backend).map_err(|error| error.to_string())
+}
+
+async fn run_blocking_mutex_action<S, T, F>(
+    state: Arc<Mutex<S>>,
+    state_name: &'static str,
+    action: F,
+) -> Result<T, String>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&mut S) -> Result<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| format!("{state_name} lock poisoned"))?;
+        action(&mut state).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("failed to join {state_name} action task: {error}"))?
+}
+
+async fn with_backend_async<T, F>(state: State<'_, AppState>, action: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut NvpnBackend) -> Result<T> + Send + 'static,
+{
+    run_blocking_mutex_action(state.backend.clone(), "backend", action).await
+}
+
+fn apply_windows_subprocess_flags(command: &mut ProcessCommand) -> &mut ProcessCommand {
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 fn should_close_to_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
@@ -3807,7 +3849,8 @@ fn copy_text_to_clipboard(text: &str) -> Result<()> {
 }
 
 fn copy_text_with_command(program: &str, args: &[&str], text: &str) -> Result<()> {
-    let mut child = ProcessCommand::new(program)
+    let mut command = ProcessCommand::new(program);
+    let mut child = apply_windows_subprocess_flags(&mut command)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -4257,57 +4300,61 @@ fn uninstall_cli(state: State<'_, AppState>) -> Result<UiState, String> {
 }
 
 #[tauri::command]
-fn install_system_service(
+async fn install_system_service(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, |backend| {
         backend.install_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn uninstall_system_service(
+async fn uninstall_system_service(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, |backend| {
         backend.uninstall_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn enable_system_service(
+async fn enable_system_service(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, |backend| {
         backend.enable_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn disable_system_service(
+async fn disable_system_service(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, |backend| {
         backend.disable_system_service()?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
@@ -4628,8 +4675,8 @@ pub fn run() {
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             let setup_tray_state = initial_tray_state.clone();
             if !app.manage(AppState {
-                backend: Mutex::new(backend),
-                last_tray_runtime_state: Mutex::new(initial_tray_state),
+                backend: Arc::new(Mutex::new(backend)),
+                last_tray_runtime_state: Arc::new(Mutex::new(initial_tray_state)),
             }) {
                 return Err(anyhow!("application state already initialized").into());
             }
@@ -4891,8 +4938,8 @@ mod tests {
         is_not_running_message, network_device_count, network_online_device_count,
         parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
         parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
-        peer_state_label, pending_launch_action, runtime_capabilities_for_platform,
-        should_defer_gui_daemon_start_to_service_on_autostart,
+        peer_state_label, pending_launch_action, run_blocking_mutex_action,
+        runtime_capabilities_for_platform, should_defer_gui_daemon_start_to_service_on_autostart,
         should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args,
         tauri_protocol_request_path, to_npub, tray_exit_node_entries, tray_identity_text,
@@ -4903,6 +4950,7 @@ mod tests {
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
     use tokio::runtime::Runtime;
 
@@ -5718,6 +5766,29 @@ mod tests {
             "/Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn",
             "--autostart",
         ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_mutex_action_keeps_async_runtime_responsive() {
+        let state = Arc::new(Mutex::new(0usize));
+        let worker = tokio::spawn({
+            let state = state.clone();
+            async move {
+                run_blocking_mutex_action(state, "test", |_value| {
+                    std::thread::sleep(Duration::from_millis(150));
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(75), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        })
+        .await
+        .expect("runtime should remain responsive during blocking backend work");
+
+        worker.await.expect("join").expect("blocking action");
     }
 
     #[test]
