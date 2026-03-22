@@ -1,5 +1,14 @@
 {
   "bundle": {
+    "targets": [
+      "nsis"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "startMenuFolder": "Nostr VPN"
+      }
+    },
     "resources": [
       "binaries/wintun.dll"
     ]

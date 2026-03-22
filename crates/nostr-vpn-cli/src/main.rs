@@ -6339,11 +6339,8 @@ fn read_daemon_log_tail(path: &Path, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+#[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    if cfg!(not(unix)) {
-        return false;
-    }
-
     ProcessCommand::new("ps")
         .arg("-p")
         .arg(pid.to_string())
@@ -6356,6 +6353,7 @@ fn is_process_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn daemon_process_matches(pid: u32, config_path: &Path) -> bool {
     if !is_process_running(pid) {
         return false;
@@ -6374,22 +6372,25 @@ fn daemon_process_matches(pid: u32, config_path: &Path) -> bool {
         return false;
     }
 
-    let command = String::from_utf8_lossy(&output.stdout);
-    let config_text = config_path.display().to_string();
-    command.contains(" daemon ")
-        && command.contains("--config")
-        && command.contains(config_text.as_str())
+    daemon_command_matches_config(&String::from_utf8_lossy(&output.stdout), config_path)
+}
+
+#[cfg(windows)]
+fn daemon_process_matches(pid: u32, config_path: &Path) -> bool {
+    find_daemon_pids_by_config(config_path).contains(&pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn daemon_process_matches(_pid: u32, _config_path: &Path) -> bool {
+    false
 }
 
 fn find_daemon_pid_by_config(config_path: &Path) -> Option<u32> {
     find_daemon_pids_by_config(config_path).into_iter().next()
 }
 
+#[cfg(unix)]
 fn find_daemon_pids_by_config(config_path: &Path) -> Vec<u32> {
-    if cfg!(not(unix)) {
-        return Vec::new();
-    }
-
     let output = ProcessCommand::new("ps")
         .arg("ax")
         .arg("-o")
@@ -6405,8 +6406,33 @@ fn find_daemon_pids_by_config(config_path: &Path) -> Vec<u32> {
     daemon_pids_from_ps_output(&String::from_utf8_lossy(&output.stdout), config_path)
 }
 
+#[cfg(windows)]
+fn find_daemon_pids_by_config(config_path: &Path) -> Vec<u32> {
+    let output = ProcessCommand::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name LIKE 'nvpn%.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    daemon_pids_from_windows_cim_json(&String::from_utf8_lossy(&output.stdout), config_path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn find_daemon_pids_by_config(_config_path: &Path) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(any(unix, test))]
 fn daemon_pids_from_ps_output(ps_output: &str, config_path: &Path) -> Vec<u32> {
-    let config_text = config_path.display().to_string();
     let mut pids = Vec::new();
 
     for line in ps_output.lines() {
@@ -6426,10 +6452,54 @@ fn daemon_pids_from_ps_output(ps_output: &str, config_path: &Path) -> Vec<u32> {
             continue;
         };
 
-        if command.contains(" daemon ")
-            && command.contains("--config")
-            && command.contains(config_text.as_str())
-        {
+        if daemon_command_matches_config(command, config_path) {
+            pids.push(pid);
+        }
+    }
+
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn daemon_command_matches_config(command: &str, config_path: &Path) -> bool {
+    let config_text = config_path.display().to_string();
+    command.contains(" daemon ")
+        && command.contains("--config")
+        && command.contains(config_text.as_str())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn daemon_pids_from_windows_cim_json(cim_json: &str, config_path: &Path) -> Vec<u32> {
+    let trimmed = cim_json.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Vec::new();
+    }
+
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+
+    let entries = match parsed {
+        serde_json::Value::Array(entries) => entries,
+        serde_json::Value::Object(entry) => vec![serde_json::Value::Object(entry)],
+        _ => return Vec::new(),
+    };
+
+    let mut pids = Vec::new();
+    for entry in entries {
+        let Some(command) = entry.get("CommandLine").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(pid) = entry
+            .get("ProcessId")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            continue;
+        };
+
+        if daemon_command_matches_config(command, config_path) {
             pids.push(pid);
         }
     }
@@ -10835,6 +10905,22 @@ mod tests {
                   55555 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /tmp/other.toml --iface utun100\n";
         let pids = daemon_pids_from_ps_output(ps, config_path);
         assert_eq!(pids, vec![42063, 97597]);
+    }
+
+    #[test]
+    fn windows_daemon_pid_scan_matches_processes_for_config() {
+        let config_path = Path::new("C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml");
+        let cim_json = r#"[{"ProcessId":42063,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\" --iface NostrVPN"},{"ProcessId":97597,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\" --iface NostrVPN"},{"ProcessId":55555,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\temp\\other.toml\" --iface NostrVPN"}]"#;
+        let pids = super::daemon_pids_from_windows_cim_json(cim_json, config_path);
+        assert_eq!(pids, vec![42063, 97597]);
+    }
+
+    #[test]
+    fn windows_daemon_pid_scan_accepts_single_process_object() {
+        let config_path = Path::new("C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml");
+        let cim_json = r#"{"ProcessId":42063,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\" --iface NostrVPN"}"#;
+        let pids = super::daemon_pids_from_windows_cim_json(cim_json, config_path);
+        assert_eq!(pids, vec![42063]);
     }
 
     #[test]
