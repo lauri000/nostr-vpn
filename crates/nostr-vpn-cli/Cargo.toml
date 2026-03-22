@@ -30,6 +30,7 @@ boringtun = { workspace = true, features = ["device"] }
 boringtun.workspace = true
 nostr-vpn-wintun = { path = "../nostr-vpn-wintun" }
 wintun = "0.5.1"
+windows-service = "0.8"
 
 [[bin]]
 name = "nvpn"

@@ -5,8 +5,9 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser",
-        "startMenuFolder": "Nostr VPN"
+        "installMode": "perMachine",
+        "startMenuFolder": "Nostr VPN",
+        "installerHooks": "windows/installer-hooks.nsh"
       }
     },
     "resources": [

@@ -5,6 +5,8 @@ mod userspace_wg;
 mod windows_tunnel;
 
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
 #[cfg(unix)]
@@ -18,6 +20,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,6 +57,16 @@ use nostr_vpn_core::signaling::{
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(target_os = "windows")]
+use windows_service::define_windows_service;
+#[cfg(target_os = "windows")]
+use windows_service::service::{
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+};
+#[cfg(target_os = "windows")]
+use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+#[cfg(target_os = "windows")]
+use windows_service::service_dispatcher;
 
 use crate::diagnostics::{
     PortMappingRuntime, build_health_issues, capture_network_snapshot, detect_captive_portal,
@@ -119,6 +133,14 @@ const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 const LINUX_SERVICE_UNIT_NAME: &str = "nvpn.service";
 #[cfg(target_os = "windows")]
 const WINDOWS_SERVICE_NAME: &str = "NvpnService";
+#[cfg(target_os = "windows")]
+const WINDOWS_SERVICE_DISPLAY_NAME: &str = "Nostr VPN";
+#[cfg(target_os = "windows")]
+const WINDOWS_SERVICE_DESCRIPTION: &str = "Nostr VPN background mesh and tunnel service";
+#[cfg(target_os = "windows")]
+static WINDOWS_SERVICE_DAEMON_ARGS: OnceLock<DaemonArgs> = OnceLock::new();
+#[cfg(target_os = "windows")]
+define_windows_service!(ffi_windows_service_main, windows_service_main);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonControlRequest {
@@ -406,7 +428,7 @@ struct ConnectArgs {
     announce_interval_secs: u64,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 struct DaemonArgs {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -420,6 +442,8 @@ struct DaemonArgs {
     iface: String,
     #[arg(long, default_value_t = 20)]
     announce_interval_secs: u64,
+    #[arg(long, hide = true, default_value_t = false)]
+    service: bool,
 }
 
 #[derive(Debug, Args)]
@@ -651,15 +675,31 @@ struct HolePunchArgs {
     json: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cli = Cli::parse();
+    run_cli(cli)
+}
 
+fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
+        #[cfg(target_os = "windows")]
+        Command::Daemon(args) if args.service => run_windows_service_dispatcher(args),
+        command => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            runtime.block_on(run_command(command))
+        }
+    }
+}
+
+async fn run_command(command: Command) -> Result<()> {
+    match command {
         Command::Init {
             config,
             force,
@@ -5460,6 +5500,100 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn run_windows_service_dispatcher(args: DaemonArgs) -> Result<()> {
+    WINDOWS_SERVICE_DAEMON_ARGS
+        .set(args)
+        .map_err(|_| anyhow!("windows service daemon arguments already initialized"))?;
+    service_dispatcher::start(WINDOWS_SERVICE_NAME, ffi_windows_service_main)
+        .context("failed to start Windows service dispatcher")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_main(_arguments: Vec<OsString>) {
+    if let Err(error) = run_windows_service() {
+        eprintln!("windows service failed: {error:?}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_service() -> Result<()> {
+    let args = WINDOWS_SERVICE_DAEMON_ARGS
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow!("windows service launched without daemon arguments"))?;
+    let config_path = args.config.clone().unwrap_or_else(default_config_path);
+    let status_handle = service_control_handler::register(WINDOWS_SERVICE_NAME, {
+        let config_path = config_path.clone();
+        move |control_event| match control_event {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                let _ = request_daemon_stop(&config_path);
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    })
+    .context("failed to register Windows service control handler")?;
+
+    set_windows_service_status(
+        &status_handle,
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::Win32(0),
+        Duration::from_secs(10),
+    )?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for Windows service")?;
+
+    set_windows_service_status(
+        &status_handle,
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        ServiceExitCode::Win32(0),
+        Duration::default(),
+    )?;
+
+    let result = runtime.block_on(daemon_session(args));
+    let exit_code = if result.is_ok() {
+        ServiceExitCode::Win32(0)
+    } else {
+        ServiceExitCode::Win32(1)
+    };
+    set_windows_service_status(
+        &status_handle,
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        exit_code,
+        Duration::default(),
+    )?;
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_service_status(
+    status_handle: &service_control_handler::ServiceStatusHandle,
+    state: ServiceState,
+    controls_accepted: ServiceControlAccept,
+    exit_code: ServiceExitCode,
+    wait_hint: Duration,
+) -> Result<()> {
+    status_handle
+        .set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted,
+            exit_code,
+            checkpoint: 0,
+            wait_hint,
+            process_id: None,
+        })
+        .with_context(|| format!("failed to update Windows service status to {state:?}"))
+}
+
 fn daemon_reconnect_backoff_delay(attempt: u32) -> Duration {
     match attempt {
         0 | 1 => Duration::from_secs(1),
@@ -7639,16 +7773,54 @@ fn windows_install_service(
     announce_interval_secs: u64,
     force: bool,
 ) -> Result<()> {
-    let _ = (
+    stop_daemon(StopArgs {
+        config: Some(config_path.to_path_buf()),
+        timeout_secs: 5,
+        force: true,
+    })?;
+
+    if force {
+        windows_stop_service(true)?;
+        windows_delete_service(true)?;
+    } else if windows_service_query()?.is_some() {
+        return Err(anyhow!(
+            "system service already installed (pass --force to reinstall)"
+        ));
+    }
+
+    let bin_path = windows_service_bin_path(
         executable,
         config_path,
         iface,
-        announce_interval_secs,
-        force,
+        announce_interval_secs.max(1),
     );
-    Err(anyhow!(
-        "Windows system service installation is not implemented yet. The current Windows background process can run as an elevated daemon, but it is not a real SCM service entrypoint and times out with ERROR_SERVICE_REQUEST_TIMEOUT (1053)."
-    ))
+    run_sc_checked(
+        &[
+            "create",
+            WINDOWS_SERVICE_NAME,
+            "type=",
+            "own",
+            "start=",
+            "auto",
+            "binPath=",
+            &bin_path,
+            "DisplayName=",
+            WINDOWS_SERVICE_DISPLAY_NAME,
+        ],
+        "create service",
+    )?;
+    run_sc_checked(
+        &[
+            "description",
+            WINDOWS_SERVICE_NAME,
+            WINDOWS_SERVICE_DESCRIPTION,
+        ],
+        "set service description",
+    )?;
+    windows_start_service(false)?;
+    windows_wait_for_service_running(Duration::from_secs(10))?;
+    println!("installed system service: {}", WINDOWS_SERVICE_NAME);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -7661,10 +7833,10 @@ fn windows_uninstall_service() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn windows_query_service_status() -> Result<ServiceStatusView> {
-    let output = windows_service_query()?;
-    let Some(output) = output else {
+    let query = windows_service_query()?;
+    let Some(query) = query else {
         return Ok(ServiceStatusView {
-            supported: false,
+            supported: true,
             installed: false,
             disabled: false,
             loaded: false,
@@ -7675,13 +7847,17 @@ fn windows_query_service_status() -> Result<ServiceStatusView> {
         });
     };
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let (running, pid) = windows_service_status_from_query_output(&text);
+    let config = windows_service_config_query()?
+        .ok_or_else(|| anyhow!("service query succeeded but service config lookup failed"))?;
+    let query_text = String::from_utf8_lossy(&query.stdout);
+    let config_text = String::from_utf8_lossy(&config.stdout);
+    let (running, pid) = windows_service_status_from_query_output(&query_text);
+    let disabled = windows_service_disabled_from_qc_output(&config_text);
     Ok(ServiceStatusView {
-        supported: false,
+        supported: true,
         installed: true,
-        disabled: false,
-        loaded: true,
+        disabled,
+        loaded: !disabled,
         running,
         pid,
         label: WINDOWS_SERVICE_NAME.to_string(),
@@ -7711,6 +7887,62 @@ fn windows_service_query() -> Result<Option<std::process::Output>> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_service_config_query() -> Result<Option<std::process::Output>> {
+    let output = run_sc_raw(&["qc", WINDOWS_SERVICE_NAME], "query service config")?;
+    if output.status.success() {
+        return Ok(Some(output));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = format!("{}\n{}", stdout.trim(), stderr.trim());
+    if windows_service_missing_message(&details) {
+        return Ok(None);
+    }
+
+    Err(anyhow!(
+        "sc qc failed\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_start_service(ignore_already_running: bool) -> Result<()> {
+    let output = run_sc_raw(&["start", WINDOWS_SERVICE_NAME], "start service")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = format!("{}\n{}", stdout.trim(), stderr.trim());
+    if ignore_already_running && windows_service_already_running_message(&details) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "sc start failed\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_wait_for_service_running(timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if windows_query_service_status()?.running {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    Err(anyhow!(
+        "system service did not reach running state within {}s",
+        timeout.as_secs()
+    ))
+}
+
+#[cfg(target_os = "windows")]
 fn windows_stop_service(ignore_missing: bool) -> Result<()> {
     let output = run_sc_raw(&["stop", WINDOWS_SERVICE_NAME], "stop service")?;
     if output.status.success() {
@@ -7719,7 +7951,10 @@ fn windows_stop_service(ignore_missing: bool) -> Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let details = format!("{}\n{}", stdout.trim(), stderr.trim());
-    if ignore_missing && windows_service_missing_message(&details) {
+    if ignore_missing
+        && (windows_service_missing_message(&details)
+            || windows_service_not_active_message(&details))
+    {
         return Ok(());
     }
     Err(anyhow!(
@@ -7749,6 +7984,22 @@ fn windows_delete_service(ignore_missing: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+fn run_sc_checked(args: &[&str], context: &str) -> Result<std::process::Output> {
+    let output = run_sc_raw(args, context)?;
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(anyhow!(
+        "sc {context} failed\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "windows")]
 fn run_sc_raw(args: &[&str], context: &str) -> Result<std::process::Output> {
     ProcessCommand::new("sc.exe")
         .args(args)
@@ -7760,6 +8011,19 @@ fn run_sc_raw(args: &[&str], context: &str) -> Result<std::process::Output> {
 fn windows_service_missing_message(details: &str) -> bool {
     let lowered = details.to_ascii_lowercase();
     lowered.contains("failed 1060") || lowered.contains("does not exist as an installed service")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_not_active_message(details: &str) -> bool {
+    let lowered = details.to_ascii_lowercase();
+    lowered.contains("failed 1062") || lowered.contains("service has not been started")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_already_running_message(details: &str) -> bool {
+    let lowered = details.to_ascii_lowercase();
+    lowered.contains("failed 1056")
+        || lowered.contains("instance of the service is already running")
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -7778,6 +8042,64 @@ fn windows_service_status_from_query_output(output: &str) -> (bool, Option<u32>)
     }
 
     (running, pid)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_disabled_from_qc_output(output: &str) -> bool {
+    output.lines().map(str::trim).any(|line| {
+        line.to_ascii_uppercase().contains("START_TYPE")
+            && line.to_ascii_uppercase().contains("DISABLED")
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_bin_path(
+    executable: &Path,
+    config_path: &Path,
+    iface: &str,
+    announce_interval_secs: u64,
+) -> String {
+    [
+        windows_command_line_quote(&executable.display().to_string()),
+        "daemon".to_string(),
+        "--service".to_string(),
+        "--config".to_string(),
+        windows_command_line_quote(&config_path.display().to_string()),
+        "--iface".to_string(),
+        windows_command_line_quote(iface),
+        "--announce-interval-secs".to_string(),
+        announce_interval_secs.max(1).to_string(),
+    ]
+    .join(" ")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_command_line_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0_usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => backslashes = backslashes.saturating_add(1),
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes.saturating_mul(2).saturating_add(1)));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                quoted.push(ch);
+            }
+        }
+    }
+    if backslashes > 0 {
+        quoted.push_str(&"\\".repeat(backslashes.saturating_mul(2)));
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
@@ -9047,6 +9369,7 @@ mod tests {
         restore_daemon_peer_cache, route_targets_for_tunnel_peers,
         route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
         take_daemon_control_request, uninstall_cli, utun_interface_candidates,
+        windows_service_bin_path, windows_service_disabled_from_qc_output,
         windows_service_status_from_query_output, write_daemon_peer_cache,
     };
     use std::collections::HashMap;
@@ -9228,6 +9551,15 @@ mod tests {
         let (running, pid) = windows_service_status_from_query_output(query);
         assert!(running);
         assert_eq!(pid, Some(1234));
+    }
+
+    #[test]
+    fn windows_service_config_parser_extracts_disabled_state() {
+        let query = "SERVICE_NAME: NvpnService\n        TYPE               : 10  WIN32_OWN_PROCESS\n        START_TYPE         : 4   DISABLED\n        ERROR_CONTROL      : 1   NORMAL\n        BINARY_PATH_NAME   : \"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --service --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\"\n";
+        assert!(windows_service_disabled_from_qc_output(query));
+
+        let auto_start = "SERVICE_NAME: NvpnService\n        TYPE               : 10  WIN32_OWN_PROCESS\n        START_TYPE         : 2   AUTO_START\n";
+        assert!(!windows_service_disabled_from_qc_output(auto_start));
     }
 
     #[test]
@@ -10857,6 +11189,22 @@ mod tests {
         let cim_json = r#"{"ProcessId":42063,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\" --iface NostrVPN"}"#;
         let pids = super::daemon_pids_from_windows_cim_json(cim_json, config_path);
         assert_eq!(pids, vec![42063]);
+    }
+
+    #[test]
+    fn windows_service_bin_path_runs_hidden_service_daemon_with_same_config() {
+        let executable = Path::new("C:\\Program Files\\Nostr VPN\\nvpn.exe");
+        let config_path = Path::new("C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml");
+
+        let command = windows_service_bin_path(executable, config_path, "nvpn", 20);
+
+        assert!(command.starts_with("\"C:\\Program Files\\Nostr VPN\\nvpn.exe\""));
+        assert!(command.contains(" daemon "));
+        assert!(command.contains(" --service "));
+        assert!(command.contains(" --config "));
+        assert!(command.contains("\"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\""));
+        assert!(command.contains(" --iface \"nvpn\""));
+        assert!(command.contains(" --announce-interval-secs 20"));
     }
 
     #[test]
