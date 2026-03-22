@@ -321,6 +321,18 @@ listen_port = 51820
 }
 
 #[test]
+fn save_omits_legacy_lan_discovery_flag() {
+    let path = unique_temp_config_path("omit-legacy-lan-discovery");
+    let config = AppConfig::generated();
+
+    config.save(&path).expect("save config");
+    let raw = fs::read_to_string(&path).expect("read saved config");
+    let _ = fs::remove_file(&path);
+
+    assert!(!raw.contains("lan_discovery_enabled"));
+}
+
+#[test]
 fn close_to_tray_defaults_true_when_missing_from_toml() {
     let raw = r#"
 network_id = "nostr-vpn"
