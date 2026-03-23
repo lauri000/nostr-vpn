@@ -494,9 +494,9 @@
     return `${minutes}:${seconds.toString().padStart(2, '0')}`
   }
 
-  const lanPairingStatusText = (state: UiState) =>
+  const lanPairingHelpText = (state: UiState) =>
     state.lanPairingActive
-      ? `Broadcasting this invite on the local network for ${formatCountdown(state.lanPairingRemainingSecs)} more.`
+      ? 'Nearby devices can join this mesh directly while pairing is active.'
       : 'Broadcast this invite on the local network for 15 minutes so nearby devices can join.'
 
   async function refresh() {
@@ -1330,8 +1330,13 @@
             >
               {state.lanPairingActive ? 'Stop LAN Pairing' : 'Start LAN Pairing'}
             </button>
+            {#if state.lanPairingActive}
+              <span class="badge warn lan-pairing-timer">
+                {formatCountdown(state.lanPairingRemainingSecs)} left
+              </span>
+            {/if}
           </div>
-          <div class="config-path">{lanPairingStatusText(state)}</div>
+          <div class="config-path">{lanPairingHelpText(state)}</div>
           {#if inviteQrDataUrl}
             <div class="invite-qr-wrap">
               <img class="invite-qr" src={inviteQrDataUrl} alt={`Invite QR for ${activeNetworkView.name}`} />
