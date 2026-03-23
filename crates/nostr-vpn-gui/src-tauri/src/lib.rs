@@ -37,10 +37,11 @@ use nostr_vpn_core::config::{
 use nostr_vpn_core::diagnostics::{HealthIssue, NetworkSummary, PortMappingStatus};
 #[cfg(any(target_os = "windows", test))]
 use nostr_vpn_core::platform_paths::windows_default_config_path_for_state;
+#[cfg(any(target_os = "windows", test))]
+use nostr_vpn_core::platform_paths::windows_machine_config_path_from_program_data_dir;
 #[cfg(target_os = "windows")]
 use nostr_vpn_core::platform_paths::{
-    legacy_config_path_from_dirs_config_dir, windows_machine_config_path_from_program_data_dir,
-    windows_service_config_path_from_sc_qc_output,
+    legacy_config_path_from_dirs_config_dir, windows_service_config_path_from_sc_qc_output,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -117,6 +118,19 @@ struct PeerLinkStatus {
     last_signal_seen_at: Option<SystemTime>,
     advertised_routes: Vec<String>,
     offers_exit_node: bool,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistConfigOutcome {
+    SavedLocally,
+    ReloadedRunningDaemon,
+}
+
+impl PersistConfigOutcome {
+    fn needs_explicit_daemon_reload(self) -> bool {
+        matches!(self, Self::SavedLocally)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,7 +748,7 @@ impl NvpnBackend {
             self.session_status = runtime.runtime_status_detail.to_string();
             return Err(anyhow!(self.session_status.clone()));
         }
-        self.persist_config()?;
+        let _ = self.persist_config()?;
         self.sync_daemon_state();
         if self.daemon_running {
             self.resume_daemon_process()?;
@@ -768,10 +782,12 @@ impl NvpnBackend {
         self.config.add_network(name);
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -779,7 +795,7 @@ impl NvpnBackend {
 
     fn rename_network(&mut self, network_id: &str, name: &str) -> Result<()> {
         self.config.rename_network(network_id, name)?;
-        self.persist_config()?;
+        let _ = self.persist_config()?;
         self.sync_daemon_state();
         Ok(())
     }
@@ -794,11 +810,13 @@ impl NvpnBackend {
         self.config.set_network_mesh_id(network_id, mesh_id)?;
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         if is_active_network {
             self.ensure_peer_status_entries();
-            self.reload_daemon_if_running()?;
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_if_running()?;
+            }
             if self.daemon_running {
                 self.session_status = "Mesh ID updated and applied.".to_string();
             }
@@ -812,10 +830,12 @@ impl NvpnBackend {
         self.config.remove_network(network_id)?;
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -825,9 +845,11 @@ impl NvpnBackend {
         self.config.set_network_enabled(network_id, enabled)?;
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
         Ok(())
     }
@@ -852,11 +874,13 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
         if self.daemon_running {
-            self.reload_daemon_process()?;
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_process()?;
+            }
             self.session_status = "Participant saved and applied.".to_string();
         }
         self.sync_daemon_state();
@@ -872,11 +896,13 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
         self.ensure_relay_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
         self.session_status = if self.daemon_running {
             format!("Invite imported and applied for {}.", invite.network_name)
@@ -895,11 +921,13 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
         if self.daemon_running {
-            self.reload_daemon_process()?;
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_process()?;
+            }
             self.session_status = "Participant removed and applied.".to_string();
         }
         self.sync_daemon_state();
@@ -972,10 +1000,12 @@ impl NvpnBackend {
         self.config.nostr.relays.push(relay.to_string());
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_relay_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -995,10 +1025,12 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_relay_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -1072,9 +1104,9 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
-        if restart_required {
+        if restart_required && persist_outcome.needs_explicit_daemon_reload() {
             self.reload_daemon_if_running()?;
         }
 
@@ -1084,19 +1116,44 @@ impl NvpnBackend {
 
     fn set_participant_alias(&mut self, npub: &str, alias: &str) -> Result<()> {
         self.config.set_peer_alias(npub, alias)?;
-        self.persist_config()?;
-        self.reload_daemon_if_running()?;
+        let persist_outcome = self.persist_config()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
         Ok(())
     }
 
-    fn persist_config(&mut self) -> Result<()> {
+    fn persist_config(&mut self) -> Result<PersistConfigOutcome> {
         if self.config.nostr.relays.is_empty() {
             return Err(anyhow!("at least one relay is required"));
         }
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
+
+        #[cfg(target_os = "windows")]
+        {
+            if windows_should_use_daemon_owned_config_apply(
+                &self.config_path,
+                windows_program_data_dir().as_deref(),
+                self.daemon_running,
+            ) {
+                match self.persist_config_via_running_daemon() {
+                    Ok(()) => {
+                        self.ensure_relay_status_entries();
+                        self.ensure_peer_status_entries();
+                        return Ok(PersistConfigOutcome::ReloadedRunningDaemon);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "gui: daemon-backed config apply failed, falling back to direct save: {error}"
+                        );
+                    }
+                }
+            }
+        }
+
         if let Err(error) = self.config.save(&self.config_path) {
             #[cfg(target_os = "windows")]
             {
@@ -1114,7 +1171,45 @@ impl NvpnBackend {
         }
         self.ensure_relay_status_entries();
         self.ensure_peer_status_entries();
-        Ok(())
+        Ok(PersistConfigOutcome::SavedLocally)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn persist_config_via_running_daemon(&self) -> Result<()> {
+        let temp_path = windows_temp_config_import_path();
+        self.config.save(&temp_path).with_context(|| {
+            format!(
+                "failed to stage config for daemon import {}",
+                temp_path.display()
+            )
+        })?;
+
+        let result = (|| {
+            let source = temp_path
+                .to_str()
+                .ok_or_else(|| anyhow!("temp config path is not valid UTF-8"))?;
+            let target = self
+                .config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?;
+            let output =
+                self.run_nvpn_command(windows_daemon_config_import_args(source, target))?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Err(anyhow!(
+                "nvpn apply-config-daemon failed\nstdout: {}\nstderr: {}",
+                stdout.trim(),
+                stderr.trim()
+            ))
+        })();
+
+        let _ = fs::remove_file(&temp_path);
+        result
     }
 
     #[cfg(target_os = "windows")]
@@ -3308,6 +3403,17 @@ fn windows_elevated_config_import_args<'a>(source: &'a str, target: &'a str) -> 
     ["apply-config", "--source", source, "--config", target]
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_daemon_config_import_args<'a>(source: &'a str, target: &'a str) -> [&'a str; 5] {
+    [
+        "apply-config-daemon",
+        "--source",
+        source,
+        "--config",
+        target,
+    ]
+}
+
 #[cfg(target_os = "windows")]
 fn normalize_windows_elevated_args<const N: usize>(args: [&str; N]) -> Vec<OsString> {
     args.into_iter()
@@ -3318,6 +3424,28 @@ fn normalize_windows_elevated_args<const N: usize>(args: [&str; N]) -> Vec<OsStr
 #[cfg(any(target_os = "windows", test))]
 fn strip_windows_verbatim_prefix(value: &str) -> &str {
     value.strip_prefix(r"\\?\").unwrap_or(value)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_should_use_daemon_owned_config_apply(
+    config_path: &Path,
+    windows_program_data_dir: Option<&std::path::Path>,
+    daemon_running: bool,
+) -> bool {
+    if !daemon_running {
+        return false;
+    }
+
+    let Some(machine_config_path) =
+        windows_machine_config_path_from_program_data_dir(windows_program_data_dir)
+    else {
+        return false;
+    };
+
+    let current = config_path.display().to_string();
+    let machine = machine_config_path.display().to_string();
+    strip_windows_verbatim_prefix(&current)
+        .eq_ignore_ascii_case(strip_windows_verbatim_prefix(&machine))
 }
 
 #[cfg(target_os = "windows")]
@@ -5138,7 +5266,9 @@ mod tests {
         strip_windows_verbatim_prefix, tauri_protocol_request_path, to_npub,
         tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
         tray_status_text, tray_vpn_status_menu_text, tray_vpn_toggle_text, validate_nvpn_binary,
-        windows_elevated_config_import_args, within_peer_online_grace, within_peer_presence_grace,
+        windows_daemon_config_import_args, windows_elevated_config_import_args,
+        windows_should_use_daemon_owned_config_apply, within_peer_online_grace,
+        within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
@@ -6402,6 +6532,49 @@ mod tests {
                 r"C:\ProgramData\Nostr VPN\config.toml",
             ]
         );
+    }
+
+    #[test]
+    fn windows_daemon_config_import_command_uses_source_and_target_paths() {
+        let args = windows_daemon_config_import_args(
+            r"C:\Users\sirius\AppData\Local\Temp\nvpn-import.toml",
+            r"C:\ProgramData\Nostr VPN\config.toml",
+        );
+
+        assert_eq!(
+            args,
+            [
+                "apply-config-daemon",
+                "--source",
+                r"C:\Users\sirius\AppData\Local\Temp\nvpn-import.toml",
+                "--config",
+                r"C:\ProgramData\Nostr VPN\config.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_daemon_owned_config_apply_only_targets_machine_config_with_running_daemon() {
+        assert!(windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"C:\ProgramData\Nostr VPN\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            true,
+        ));
+        assert!(windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"\\?\C:\ProgramData\Nostr VPN\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            true,
+        ));
+        assert!(!windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"C:\Users\sirius\AppData\Roaming\nvpn\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            true,
+        ));
+        assert!(!windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"C:\ProgramData\Nostr VPN\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            false,
+        ));
     }
 
     #[test]
