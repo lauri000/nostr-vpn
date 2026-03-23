@@ -4038,6 +4038,28 @@ fn maybe_log_presence_mesh_count(
     }
 }
 
+fn render_connect_startup_lines(
+    network_id: &str,
+    relay_count: usize,
+    expected_peers: usize,
+    hello_error: Option<&str>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "connect: network {network_id} on {relay_count} relays"
+    )];
+    if let Some(error) = hello_error {
+        lines.push(format!("connect: hello publish failed: {error}"));
+        lines.push(format!(
+            "connect: waiting for {expected_peers} configured peer(s)"
+        ));
+    } else {
+        lines.push(format!(
+            "connect: hello published; waiting for {expected_peers} configured peer(s)"
+        ));
+    }
+    lines
+}
+
 fn tunnel_fingerprint(
     iface: &str,
     private_key: &str,
@@ -4119,13 +4141,16 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
         &mut public_signal_endpoint,
     )
     .await;
-    let _ = client.publish(SignalPayload::Hello).await;
-
-    println!(
-        "connect: network {} on {} relays; waiting for {expected_peers} configured peer(s)",
-        network_id,
-        relays.len()
-    );
+    let initial_hello_error = client.publish(SignalPayload::Hello).await.err();
+    let initial_hello_error_text = initial_hello_error.as_ref().map(|error| error.to_string());
+    for line in render_connect_startup_lines(
+        &network_id,
+        relays.len(),
+        expected_peers,
+        initial_hello_error_text.as_deref(),
+    ) {
+        println!("{line}");
+    }
 
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
@@ -9481,6 +9506,7 @@ mod tests {
         persisted_peer_cache_timeout_secs, planned_tunnel_peers,
         planned_tunnel_peers_for_local_endpoints, public_endpoint_for_listen_port,
         public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
+        render_connect_startup_lines,
         read_daemon_peer_cache, read_daemon_state, record_successful_runtime_paths,
         relay_connection_action, request_daemon_reload, request_daemon_stop,
         restore_daemon_peer_cache, route_targets_for_tunnel_peers,
@@ -9512,6 +9538,33 @@ mod tests {
             advertised_routes: Vec::new(),
             timestamp: 1,
         }
+    }
+
+    #[test]
+    fn connect_startup_lines_report_hello_publish_success() {
+        let lines = render_connect_startup_lines("mesh-home", 3, 1, None);
+
+        assert_eq!(
+            lines,
+            vec![
+                "connect: network mesh-home on 3 relays".to_string(),
+                "connect: hello published; waiting for 1 configured peer(s)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn connect_startup_lines_report_hello_publish_failure() {
+        let lines = render_connect_startup_lines("mesh-home", 3, 1, Some("relay not connected"));
+
+        assert_eq!(
+            lines,
+            vec![
+                "connect: network mesh-home on 3 relays".to_string(),
+                "connect: hello publish failed: relay not connected".to_string(),
+                "connect: waiting for 1 configured peer(s)".to_string(),
+            ]
+        );
     }
 
     fn local_endpoints(values: &[&str]) -> Vec<String> {
