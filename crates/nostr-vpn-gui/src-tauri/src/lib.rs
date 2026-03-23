@@ -13,6 +13,8 @@ mod mobile_wg;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -1864,8 +1866,9 @@ impl NvpnBackend {
 
         #[cfg(target_os = "windows")]
         {
+            let normalized_args = normalize_windows_elevated_args(args);
             let status = runas::Command::new(nvpn_bin)
-                .args(&args)
+                .args(&normalized_args)
                 .status()
                 .context("failed to execute elevated nvpn command via Windows UAC prompt")?;
 
@@ -3303,6 +3306,18 @@ fn service_state_refresh_due(
 #[cfg(any(target_os = "windows", test))]
 fn windows_elevated_config_import_args<'a>(source: &'a str, target: &'a str) -> [&'a str; 5] {
     ["apply-config", "--source", source, "--config", target]
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_elevated_args<const N: usize>(args: [&str; N]) -> Vec<OsString> {
+    args.into_iter()
+        .map(|arg| OsString::from(strip_windows_verbatim_prefix(arg)))
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn strip_windows_verbatim_prefix(value: &str) -> &str {
+    value.strip_prefix(r"\\?\").unwrap_or(value)
 }
 
 #[cfg(target_os = "windows")]
@@ -5120,10 +5135,10 @@ mod tests {
         should_defer_gui_daemon_start_to_service_on_autostart,
         should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args,
-        tauri_protocol_request_path, to_npub, tray_exit_node_entries, tray_identity_text,
-        tray_menu_spec, tray_network_groups, tray_status_text, tray_vpn_status_menu_text,
-        tray_vpn_toggle_text, validate_nvpn_binary, windows_elevated_config_import_args,
-        within_peer_online_grace, within_peer_presence_grace,
+        strip_windows_verbatim_prefix, tauri_protocol_request_path, to_npub,
+        tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
+        tray_status_text, tray_vpn_status_menu_text, tray_vpn_toggle_text, validate_nvpn_binary,
+        windows_elevated_config_import_args, within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
@@ -6386,6 +6401,22 @@ mod tests {
                 "--config",
                 r"C:\ProgramData\Nostr VPN\config.toml",
             ]
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_keeps_non_verbatim_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"C:\ProgramData\Nostr VPN\config.toml"),
+            r"C:\ProgramData\Nostr VPN\config.toml"
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_removes_local_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\ProgramData\Nostr VPN\config.toml"),
+            r"C:\ProgramData\Nostr VPN\config.toml"
         );
     }
 
