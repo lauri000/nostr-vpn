@@ -1,5 +1,7 @@
 # nostr-vpn
 
+> Main development is on [decentralized git](https://git.iris.to/#/npub1xdhnr9mrv47kkrn95k6cwecearydeh8e895990n3acntwvmgk2dsdeeycm/nostr-vpn): `htree://npub1xdhnr9mrv47kkrn95k6cwecearydeh8e895990n3acntwvmgk2dsdeeycm/nostr-vpn`
+
 ## Downloads
 
 - [Latest release](https://github.com/mmalmi/nostr-vpn/releases/latest)
