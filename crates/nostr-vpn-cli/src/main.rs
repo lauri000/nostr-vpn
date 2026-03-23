@@ -63,6 +63,7 @@ use nostr_vpn_core::signaling::{
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::{debug, info};
 #[cfg(target_os = "windows")]
 use windows_service::define_windows_service;
 #[cfg(target_os = "windows")]
@@ -3217,21 +3218,60 @@ fn daemon_session_idle_status(session_enabled: bool, expected_peers: usize) -> &
     }
 }
 
-fn mesh_ready_for_tunnel_runtime(
+#[derive(Debug, Clone, Copy)]
+struct ConnectMeshPolicySnapshot {
+    active_presence_count: usize,
+    connected_runtime_count: usize,
+    expected_peers: usize,
+    mesh_ready_for_runtime: bool,
+    should_pause_relays: bool,
+}
+
+fn connect_mesh_policy_snapshot(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     expected_peers: usize,
     presence: &PeerPresenceBook,
     tunnel_runtime: &CliTunnelRuntime,
     now: u64,
-) -> bool {
-    if expected_peers == 0 {
-        return false;
-    }
-
+) -> ConnectMeshPolicySnapshot {
+    let active_presence_count = presence_peer_count(app, own_pubkey, presence.active());
     let runtime_peers = tunnel_runtime.peer_status().ok();
-    connected_peer_count_for_runtime(app, own_pubkey, presence, runtime_peers.as_ref(), now)
-        >= expected_peers
+    let connected_runtime_count =
+        connected_peer_count_for_runtime(app, own_pubkey, presence, runtime_peers.as_ref(), now);
+    let mesh_ready_for_runtime =
+        expected_peers > 0 && connected_runtime_count >= expected_peers;
+    let should_pause_relays =
+        app.auto_disconnect_relays_when_mesh_ready && mesh_ready_for_runtime;
+
+    ConnectMeshPolicySnapshot {
+        active_presence_count,
+        connected_runtime_count,
+        expected_peers,
+        mesh_ready_for_runtime,
+        should_pause_relays,
+    }
+}
+
+fn trace_connect_mesh_policy(
+    phase: &str,
+    app: &AppConfig,
+    relay_connected: bool,
+    relays_paused_for_mesh: bool,
+    snapshot: ConnectMeshPolicySnapshot,
+) {
+    debug!(
+        phase,
+        expected_peers = snapshot.expected_peers,
+        active_presence_count = snapshot.active_presence_count,
+        connected_runtime_count = snapshot.connected_runtime_count,
+        relay_connected,
+        relays_paused_for_mesh,
+        auto_disconnect_relays_when_mesh_ready = app.auto_disconnect_relays_when_mesh_ready,
+        mesh_ready_for_runtime = snapshot.mesh_ready_for_runtime,
+        should_pause_relays = snapshot.should_pause_relays,
+        "connect: evaluated mesh policy"
+    );
 }
 
 fn should_pause_relays_for_mesh(
@@ -3242,15 +3282,15 @@ fn should_pause_relays_for_mesh(
     tunnel_runtime: &CliTunnelRuntime,
     now: u64,
 ) -> bool {
-    app.auto_disconnect_relays_when_mesh_ready
-        && mesh_ready_for_tunnel_runtime(
-            app,
-            own_pubkey,
-            expected_peers,
-            presence,
-            tunnel_runtime,
-            now,
-        )
+    connect_mesh_policy_snapshot(
+        app,
+        own_pubkey,
+        expected_peers,
+        presence,
+        tunnel_runtime,
+        now,
+    )
+    .should_pause_relays
 }
 
 fn build_daemon_peer_cache_state(
@@ -4177,7 +4217,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     continue;
                 }
 
-                let mesh_ready = should_pause_relays_for_mesh(
+                let mesh_policy = connect_mesh_policy_snapshot(
                     &app,
                     own_pubkey.as_deref(),
                     expected_peers,
@@ -4185,15 +4225,31 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &tunnel_runtime,
                     unix_timestamp(),
                 );
+                trace_connect_mesh_policy(
+                    "reconnect_tick",
+                    &app,
+                    relay_connected,
+                    relays_paused_for_mesh,
+                    mesh_policy,
+                );
                 match relay_connection_action(
                     app.auto_disconnect_relays_when_mesh_ready,
                     relay_connected,
-                    mesh_ready,
+                    mesh_policy.should_pause_relays,
                 ) {
                     RelayConnectionAction::StayPausedForMesh => {
                         reconnect_attempt = 0;
                         reconnect_due = Instant::now();
                         if !relays_paused_for_mesh {
+                            info!(
+                                phase = "reconnect_tick",
+                                reason = "mesh_ready",
+                                expected_peers = mesh_policy.expected_peers,
+                                active_presence_count = mesh_policy.active_presence_count,
+                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                relay_connected_before = relay_connected,
+                                "connect: relays remain paused because mesh is ready"
+                            );
                             println!("connect: {MESH_READY_RELAYS_PAUSED_STATUS}");
                             relays_paused_for_mesh = true;
                         }
@@ -4201,6 +4257,15 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     }
                     RelayConnectionAction::ReconnectWhenDue => {
                         if relays_paused_for_mesh {
+                            info!(
+                                phase = "reconnect_tick",
+                                reason = "mesh_degraded",
+                                expected_peers = mesh_policy.expected_peers,
+                                active_presence_count = mesh_policy.active_presence_count,
+                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                relay_connected_before = relay_connected,
+                                "connect: reconnecting relays because mesh is degraded"
+                            );
                             println!("connect: mesh degraded; reconnecting relays");
                             relays_paused_for_mesh = false;
                         }
@@ -4384,10 +4449,8 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
             }
             _ = announce_interval.tick() => {
                 let now = unix_timestamp();
-                let removed = presence.prune_stale(
-                    now,
-                    peer_signal_timeout_secs(args.announce_interval_secs),
-                );
+                let signal_timeout_secs = peer_signal_timeout_secs(args.announce_interval_secs);
+                let removed = presence.prune_stale(now, signal_timeout_secs);
                 for participant in &removed {
                     outbound_announces.forget(participant);
                 }
@@ -4396,9 +4459,19 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 let recent = recently_seen_participants(
                     &presence,
                     now,
-                    peer_signal_timeout_secs(args.announce_interval_secs),
+                    signal_timeout_secs,
                 );
                 outbound_announces.retain_participants(&recent);
+                if !removed.is_empty() {
+                    info!(
+                        phase = "announce_interval",
+                        removed_count = removed.len(),
+                        removed_participants = ?removed,
+                        signal_timeout_secs,
+                        relays_paused_for_mesh,
+                        "connect: pruned stale peers before mesh evaluation"
+                    );
+                }
                 if !removed.is_empty() || paths_pruned {
                     last_nat_punch_attempt = None;
                     apply_presence_runtime_update(
@@ -4419,7 +4492,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                         &mut last_mesh_count,
                     );
                 }
-                let mesh_ready = should_pause_relays_for_mesh(
+                let mesh_policy = connect_mesh_policy_snapshot(
                     &app,
                     own_pubkey.as_deref(),
                     expected_peers,
@@ -4427,10 +4500,17 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &tunnel_runtime,
                     now,
                 );
+                trace_connect_mesh_policy(
+                    "announce_interval",
+                    &app,
+                    relay_connected,
+                    relays_paused_for_mesh,
+                    mesh_policy,
+                );
                 match relay_connection_action(
                     app.auto_disconnect_relays_when_mesh_ready,
                     relay_connected,
-                    mesh_ready,
+                    mesh_policy.should_pause_relays,
                 ) {
                     RelayConnectionAction::PauseForMesh => {
                         client.disconnect().await;
@@ -4438,12 +4518,31 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                         reconnect_attempt = 0;
                         reconnect_due = Instant::now();
                         if !relays_paused_for_mesh {
+                            info!(
+                                phase = "announce_interval",
+                                reason = "mesh_ready",
+                                expected_peers = mesh_policy.expected_peers,
+                                active_presence_count = mesh_policy.active_presence_count,
+                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                relay_connected_before = true,
+                                "connect: pausing relays because mesh is ready"
+                            );
                             println!("connect: {MESH_READY_RELAYS_PAUSED_STATUS}");
                             relays_paused_for_mesh = true;
                         }
                     }
                     RelayConnectionAction::ReconnectWhenDue => {
                         if relays_paused_for_mesh {
+                            info!(
+                                phase = "announce_interval",
+                                reason = "mesh_degraded",
+                                expected_peers = mesh_policy.expected_peers,
+                                active_presence_count = mesh_policy.active_presence_count,
+                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                relay_connected_before = relay_connected,
+                                recently_pruned_peer_count = removed.len(),
+                                "connect: reconnecting relays because mesh is degraded"
+                            );
                             println!("connect: mesh degraded; reconnecting relays");
                             relays_paused_for_mesh = false;
                             reconnect_due = Instant::now();

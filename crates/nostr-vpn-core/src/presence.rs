@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::control::PeerAnnouncement;
-use crate::signaling::SignalPayload;
+use crate::signaling::{SignalPayload, signal_payload_kind};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Default)]
 pub struct PeerPresenceBook {
@@ -21,8 +22,18 @@ impl PeerPresenceBook {
         self.last_seen_at.insert(sender_pubkey.clone(), seen_at);
 
         match payload {
-            SignalPayload::Hello => false,
+            SignalPayload::Hello => {
+                debug!(
+                    sender_pubkey = %sender_pubkey,
+                    seen_at,
+                    payload_kind = %signal_payload_kind(&SignalPayload::Hello),
+                    "presence: observed hello without active peer state change"
+                );
+                false
+            }
             SignalPayload::Announce(announcement) => {
+                let node_id = announcement.node_id.clone();
+                let timestamp = announcement.timestamp;
                 let should_update_known = self
                     .known
                     .get(&sender_pubkey)
@@ -37,15 +48,48 @@ impl PeerPresenceBook {
                     .get(&sender_pubkey)
                     .is_none_or(|existing| existing.timestamp <= announcement.timestamp);
                 if should_update_active {
-                    self.active.insert(sender_pubkey, announcement);
-                    true
-                } else {
-                    false
+                    self.active.insert(sender_pubkey.clone(), announcement);
                 }
+
+                if should_update_known || should_update_active {
+                    info!(
+                        sender_pubkey = %sender_pubkey,
+                        node_id = %node_id,
+                        timestamp,
+                        known_updated = should_update_known,
+                        active_updated = should_update_active,
+                        "presence: announce updated peer state"
+                    );
+                } else {
+                    debug!(
+                        sender_pubkey = %sender_pubkey,
+                        node_id = %node_id,
+                        timestamp,
+                        reason = "stale_announcement_timestamp",
+                        "presence: announce did not update peer state"
+                    );
+                }
+                should_update_active
             }
-            SignalPayload::Disconnect { .. } => {
+            SignalPayload::Disconnect { node_id } => {
                 let active_removed = self.active.remove(&sender_pubkey).is_some();
                 let known_removed = self.known.remove(&sender_pubkey).is_some();
+                if active_removed || known_removed {
+                    info!(
+                        sender_pubkey = %sender_pubkey,
+                        node_id = %node_id,
+                        active_removed,
+                        known_removed,
+                        "presence: removed peer state on disconnect"
+                    );
+                } else {
+                    debug!(
+                        sender_pubkey = %sender_pubkey,
+                        node_id = %node_id,
+                        reason = "peer_not_present",
+                        "presence: disconnect did not remove peer state"
+                    );
+                }
                 active_removed || known_removed
             }
         }
@@ -105,6 +149,15 @@ impl PeerPresenceBook {
             keep
         });
         removed.sort();
+        if !removed.is_empty() {
+            info!(
+                removed_count = removed.len(),
+                removed_participants = ?removed,
+                cutoff,
+                stale_after_secs,
+                "presence: pruned stale peers"
+            );
+        }
         removed
     }
 
