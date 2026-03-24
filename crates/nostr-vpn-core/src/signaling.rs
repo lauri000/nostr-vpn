@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
+use tracing::{debug, info, warn};
 
 use crate::config::normalize_nostr_pubkey;
 use crate::control::PeerAnnouncement;
@@ -23,6 +24,14 @@ pub enum SignalPayload {
     Hello,
     Announce(PeerAnnouncement),
     Disconnect { node_id: String },
+}
+
+pub(crate) fn signal_payload_kind(payload: &SignalPayload) -> &'static str {
+    match payload {
+        SignalPayload::Hello => "hello",
+        SignalPayload::Announce(_) => "announce",
+        SignalPayload::Disconnect { .. } => "disconnect",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +140,13 @@ impl NostrSignalingClient {
     }
 
     pub async fn connect(&self, relays: &[String]) -> Result<()> {
+        debug!(
+            own_pubkey = %self.own_pubkey,
+            relay_count = relays.len(),
+            participant_count = self.participant_pubkeys.len(),
+            network_count = self.networks.len(),
+            "signaling: connecting client"
+        );
         for relay in relays {
             self.client
                 .add_relay(relay)
@@ -177,6 +193,14 @@ impl NostrSignalingClient {
 
         self.start_event_forwarder();
         self.connected.store(true, Ordering::Relaxed);
+        info!(
+            own_pubkey = %self.own_pubkey,
+            relay_count = relays.len(),
+            participant_count = self.participant_pubkeys.len(),
+            network_count = self.networks.len(),
+            hello_author_count = hello_authors.len(),
+            "signaling: client connected and subscribed"
+        );
 
         Ok(())
     }
@@ -227,6 +251,7 @@ impl NostrSignalingClient {
             return Err(anyhow!("client not connected"));
         }
 
+        debug!(own_pubkey = %self.own_pubkey, "signaling: publishing hello");
         let expiration = Timestamp::now() + Duration::from_secs(SIGNAL_EXPIRATION_SECS);
         let tags = vec![
             Tag::identifier(SIGNAL_HELLO_IDENTIFIER),
@@ -240,9 +265,32 @@ impl NostrSignalingClient {
             .to_event(&self.keys)
             .context("failed to sign public hello event")?;
         match self.client.send_event(event).await {
-            Ok(output) if !output.success.is_empty() => Ok(()),
-            Ok(_) => Err(anyhow!("public hello event rejected by all relays")),
-            Err(error) => Err(anyhow!(error).context("failed to publish public hello event")),
+            Ok(output) if !output.success.is_empty() => {
+                info!(
+                    own_pubkey = %self.own_pubkey,
+                    delivered_relays = output.success.len(),
+                    failed_relays = output.failed.len(),
+                    "signaling: published hello"
+                );
+                Ok(())
+            }
+            Ok(output) => {
+                warn!(
+                    own_pubkey = %self.own_pubkey,
+                    delivered_relays = output.success.len(),
+                    failed_relays = output.failed.len(),
+                    "signaling: hello rejected by all relays"
+                );
+                Err(anyhow!("public hello event rejected by all relays"))
+            }
+            Err(error) => {
+                warn!(
+                    own_pubkey = %self.own_pubkey,
+                    error = %error,
+                    "signaling: hello publish failed"
+                );
+                Err(anyhow!(error).context("failed to publish public hello event"))
+            }
         }
     }
 
@@ -251,6 +299,7 @@ impl NostrSignalingClient {
         payload: SignalPayload,
         recipients: &[String],
     ) -> Result<()> {
+        let payload_kind = signal_payload_kind(&payload);
         let recipients: HashSet<String> = recipients
             .iter()
             .filter(|participant| participant.as_str() != self.own_pubkey)
@@ -258,11 +307,23 @@ impl NostrSignalingClient {
             .cloned()
             .collect();
         if recipients.is_empty() {
+            warn!(
+                own_pubkey = %self.own_pubkey,
+                payload_kind,
+                "signaling: no configured recipients for private signal"
+            );
             return Err(anyhow!(
                 "no configured participants to send private signaling message to"
             ));
         }
 
+        debug!(
+            own_pubkey = %self.own_pubkey,
+            payload_kind = %payload_kind,
+            recipient_count = recipients.len(),
+            network_count = self.networks.len(),
+            "signaling: publishing private signal"
+        );
         let mut delivered = HashSet::new();
         let mut first_error = None;
 
@@ -273,6 +334,12 @@ impl NostrSignalingClient {
                 .cloned()
                 .collect::<Vec<_>>();
             if network_recipients.is_empty() {
+                debug!(
+                    own_pubkey = %self.own_pubkey,
+                    payload_kind = %payload_kind,
+                    network_id = %network.network_id,
+                    "signaling: skipped network without matching recipients"
+                );
                 continue;
             }
 
@@ -284,8 +351,24 @@ impl NostrSignalingClient {
                 )
                 .await
             {
-                Ok(sent) => delivered.extend(sent),
+                Ok(sent) => {
+                    info!(
+                        own_pubkey = %self.own_pubkey,
+                        payload_kind = %payload_kind,
+                        network_id = %network.network_id,
+                        delivered_recipient_count = sent.len(),
+                        "signaling: published private signal to network recipients"
+                    );
+                    delivered.extend(sent);
+                }
                 Err(error) => {
+                    warn!(
+                        own_pubkey = %self.own_pubkey,
+                        payload_kind = %payload_kind,
+                        network_id = %network.network_id,
+                        error = %error,
+                        "signaling: private signal publish failed for network"
+                    );
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -310,6 +393,7 @@ impl NostrSignalingClient {
         network_id: &str,
         recipients: &[String],
     ) -> Result<HashSet<String>> {
+        let payload_kind = signal_payload_kind(&payload);
         let envelope = SignalEnvelope {
             network_id: network_id.to_string(),
             sender_pubkey: self.own_pubkey.clone(),
@@ -320,6 +404,13 @@ impl NostrSignalingClient {
 
         let mut delivered = HashSet::new();
         let expiration = Timestamp::now() + Duration::from_secs(SIGNAL_EXPIRATION_SECS);
+        debug!(
+            own_pubkey = %self.own_pubkey,
+            payload_kind = %payload_kind,
+            network_id = %network_id,
+            recipient_count = recipients.len(),
+            "signaling: publishing private signal to network"
+        );
         for recipient in recipients {
             let recipient_pubkey = PublicKey::from_hex(recipient)
                 .with_context(|| format!("invalid recipient pubkey {recipient}"))?;
@@ -343,17 +434,51 @@ impl NostrSignalingClient {
 
             match self.client.send_event(event).await {
                 Ok(output) if !output.success.is_empty() => {
+                    debug!(
+                        own_pubkey = %self.own_pubkey,
+                        payload_kind = %payload_kind,
+                        network_id = %network_id,
+                        recipient = %recipient,
+                        delivered_relays = output.success.len(),
+                        failed_relays = output.failed.len(),
+                        "signaling: delivered private signal to recipient"
+                    );
                     delivered.insert(recipient.clone());
                     continue;
                 }
-                Ok(_) => {}
+                Ok(output) => {
+                    debug!(
+                        own_pubkey = %self.own_pubkey,
+                        payload_kind = %payload_kind,
+                        network_id = %network_id,
+                        recipient = %recipient,
+                        delivered_relays = output.success.len(),
+                        failed_relays = output.failed.len(),
+                        "signaling: private signal rejected by all relays for recipient"
+                    );
+                }
                 Err(error) => {
+                    warn!(
+                        own_pubkey = %self.own_pubkey,
+                        payload_kind = %payload_kind,
+                        network_id = %network_id,
+                        recipient = %recipient,
+                        error = %error,
+                        "signaling: failed to publish private nostr event"
+                    );
                     return Err(anyhow!(error).context("failed to publish private nostr event"));
                 }
             }
         }
 
         if delivered.is_empty() {
+            warn!(
+                own_pubkey = %self.own_pubkey,
+                payload_kind = %payload_kind,
+                network_id = %network_id,
+                recipient_count = recipients.len(),
+                "signaling: private signal rejected by all relays for all recipients"
+            );
             return Err(anyhow!("private signaling event rejected by all relays"));
         }
 
@@ -397,12 +522,22 @@ impl NostrSignalingClient {
                     if first_tag_value(&event, "l").as_deref() == Some(SIGNAL_HELLO_TAG) {
                         let sender_pubkey = event.pubkey.to_hex();
                         if sender_pubkey == own_pubkey {
+                            debug!(
+                                sender_pubkey = %sender_pubkey,
+                                reason = "sender_is_self",
+                                "signaling: ignored hello"
+                            );
                             continue;
                         }
 
                         if !participant_pubkeys.is_empty()
                             && !participant_pubkeys.contains(&sender_pubkey)
                         {
+                            debug!(
+                                sender_pubkey = %sender_pubkey,
+                                reason = "sender_not_configured_participant",
+                                "signaling: ignored hello"
+                            );
                             continue;
                         }
 
@@ -416,6 +551,12 @@ impl NostrSignalingClient {
                             .collect::<Vec<_>>();
 
                         if matched_network_ids.is_empty() {
+                            debug!(
+                                sender_pubkey = %sender_pubkey,
+                                network_id = %default_network_id,
+                                reason = "no_matching_networks_using_default",
+                                "signaling: accepted hello"
+                            );
                             let _ = recv_tx.send(SignalEnvelope {
                                 network_id: default_network_id.clone(),
                                 sender_pubkey,
@@ -424,6 +565,11 @@ impl NostrSignalingClient {
                             continue;
                         }
 
+                        info!(
+                            sender_pubkey = %sender_pubkey,
+                            matched_network_ids = ?matched_network_ids,
+                            "signaling: accepted hello"
+                        );
                         for network_id in matched_network_ids {
                             let _ = recv_tx.send(SignalEnvelope {
                                 network_id,
@@ -435,27 +581,62 @@ impl NostrSignalingClient {
                     }
 
                     if event.pubkey.to_hex() == own_pubkey {
+                        debug!(
+                            sender_pubkey = %event.pubkey.to_hex(),
+                            reason = "sender_is_self",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     }
 
                     let Some(recipient_pubkey) = first_tag_value(&event, "p") else {
+                        debug!(reason = "missing_recipient_tag", "signaling: ignored private signal event");
                         continue;
                     };
                     if recipient_pubkey != own_pubkey {
+                        debug!(
+                            recipient_pubkey = %recipient_pubkey,
+                            own_pubkey = %own_pubkey,
+                            reason = "recipient_not_self",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     }
 
                     let plaintext =
                         match nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content) {
                             Ok(plaintext) => plaintext,
-                            Err(_) => continue,
+                            Err(error) => {
+                                debug!(
+                                    sender_pubkey = %event.pubkey.to_hex(),
+                                    error = %error,
+                                    reason = "decrypt_failed",
+                                    "signaling: ignored private signal event"
+                                );
+                                continue;
+                            }
                         };
 
-                    let Ok(envelope) = serde_json::from_str::<SignalEnvelope>(&plaintext) else {
-                        continue;
+                    let envelope = match serde_json::from_str::<SignalEnvelope>(&plaintext) {
+                        Ok(envelope) => envelope,
+                        Err(error) => {
+                            debug!(
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                error = %error,
+                                reason = "invalid_signal_envelope",
+                                "signaling: ignored private signal event"
+                            );
+                            continue;
+                        }
                     };
 
                     if !network_ids.contains(&envelope.network_id) {
+                        debug!(
+                            sender_pubkey = %envelope.sender_pubkey,
+                            network_id = %envelope.network_id,
+                            reason = "unknown_network_id",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     }
 
@@ -463,29 +644,64 @@ impl NostrSignalingClient {
                         .iter()
                         .find(|network| network.network_id == envelope.network_id)
                     else {
+                        debug!(
+                            sender_pubkey = %envelope.sender_pubkey,
+                            network_id = %envelope.network_id,
+                            reason = "network_not_configured",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     };
 
                     if envelope.sender_pubkey == own_pubkey {
+                        debug!(
+                            sender_pubkey = %envelope.sender_pubkey,
+                            reason = "envelope_sender_is_self",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     }
 
                     if envelope.sender_pubkey != event.pubkey.to_hex() {
+                        debug!(
+                            sender_pubkey = %envelope.sender_pubkey,
+                            event_pubkey = %event.pubkey.to_hex(),
+                            reason = "sender_pubkey_mismatch",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     }
 
                     if !network.participants.is_empty()
                         && !network.participants.contains(&envelope.sender_pubkey)
                     {
+                        debug!(
+                            sender_pubkey = %envelope.sender_pubkey,
+                            network_id = %envelope.network_id,
+                            reason = "sender_not_in_network_participants",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     }
 
                     if !participant_pubkeys.is_empty()
                         && !participant_pubkeys.contains(&envelope.sender_pubkey)
                     {
+                        debug!(
+                            sender_pubkey = %envelope.sender_pubkey,
+                            network_id = %envelope.network_id,
+                            reason = "sender_not_in_configured_participants",
+                            "signaling: ignored private signal event"
+                        );
                         continue;
                     }
 
+                    info!(
+                        sender_pubkey = %envelope.sender_pubkey,
+                        network_id = %envelope.network_id,
+                        payload_kind = signal_payload_kind(&envelope.payload),
+                        "signaling: accepted private signal"
+                    );
                     let _ = recv_tx.send(envelope);
                 }
             }
