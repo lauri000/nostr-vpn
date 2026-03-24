@@ -1026,6 +1026,7 @@ impl NvpnBackend {
             network_id: normalize_runtime_network_id(&network.network_id),
             requester_node_name: self.config.node_name.trim().to_string(),
         };
+        let should_connect_session = !self.session_active;
         self.runtime.block_on(publish_join_request(
             keys,
             &relays,
@@ -1040,15 +1041,29 @@ impl NvpnBackend {
             });
         }
         self.persist_config_without_daemon_reload()?;
-        self.session_status = format!(
-            "Join request sent to {}.",
-            shorten_middle(&to_npub(&recipient), 18, 12)
-        );
+
+        let connect_error = if should_connect_session {
+            self.connect_session().err().map(|error| error.to_string())
+        } else {
+            None
+        };
+
+        let recipient_npub = shorten_middle(&to_npub(&recipient), 18, 12);
+        self.session_status = match connect_error {
+            Some(error) => {
+                format!("Join request sent to {recipient_npub}, but VPN start failed: {error}")
+            }
+            None if should_connect_session => {
+                format!("Join request sent to {recipient_npub} and VPN started.")
+            }
+            None => format!("Join request sent to {recipient_npub}."),
+        };
         Ok(())
     }
 
     fn accept_join_request(&mut self, network_id: &str, requester_npub: &str) -> Result<()> {
         let requester = normalize_nostr_pubkey(requester_npub)?;
+        let should_connect_session = !self.session_active;
         self.config
             .add_participant_to_network(network_id, &requester)?;
         if let Some(network) = self.config.network_by_id_mut(network_id) {
@@ -1067,11 +1082,27 @@ impl NvpnBackend {
             if persist_outcome.needs_explicit_daemon_reload() {
                 self.reload_daemon_process()?;
             }
-            self.session_status = "Join request accepted and applied.".to_string();
-        } else {
-            self.session_status = "Join request accepted.".to_string();
         }
         self.sync_daemon_state();
+
+        let connect_error = if should_connect_session {
+            self.connect_session().err().map(|error| error.to_string())
+        } else {
+            None
+        };
+
+        self.session_status = match connect_error {
+            Some(error) => format!("Join request accepted, but VPN start failed: {error}"),
+            None if should_connect_session => {
+                if self.daemon_running {
+                    "Join request accepted, applied, and VPN started.".to_string()
+                } else {
+                    "Join request accepted and VPN started.".to_string()
+                }
+            }
+            None if self.daemon_running => "Join request accepted and applied.".to_string(),
+            None => "Join request accepted.".to_string(),
+        };
 
         Ok(())
     }
@@ -6822,6 +6853,42 @@ mod tests {
         });
 
         assert!(backend.config.networks[0].inbound_join_requests.is_empty());
+    }
+
+    #[test]
+    fn accept_join_request_persists_acceptance_even_when_vpn_start_fails() {
+        let owner = AppConfig::generated()
+            .own_nostr_pubkey_hex()
+            .expect("owner pubkey");
+        let requester = AppConfig::generated()
+            .own_nostr_pubkey_hex()
+            .expect("requester pubkey");
+        let mut backend = test_backend(&owner);
+        backend.service_supported = true;
+        backend.service_enablement_supported = true;
+        backend.service_installed = false;
+        backend.config.networks[0].inbound_join_requests = vec![PendingInboundJoinRequest {
+            requester: requester.clone(),
+            requester_node_name: "alice-phone".to_string(),
+            requested_at: 1_726_000_000,
+        }];
+
+        backend
+            .accept_join_request(&backend.config.networks[0].id.clone(), &to_npub(&requester))
+            .expect("accept join request");
+
+        assert!(
+            backend.config.networks[0]
+                .participants
+                .iter()
+                .any(|participant| participant == &requester)
+        );
+        assert!(backend.config.networks[0].inbound_join_requests.is_empty());
+        assert!(
+            backend
+                .session_status
+                .contains("Join request accepted, but VPN start failed:")
+        );
     }
 
     #[test]

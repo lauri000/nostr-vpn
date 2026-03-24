@@ -12,6 +12,10 @@
     remainingSecsFromDeadline,
   } from './lib/countdown.js'
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
+  import {
+    buildInviteScanConstraintCandidates,
+    openInviteScanStream,
+  } from './lib/invite-scan.js'
   import { parseAppDeepLink } from './lib/deep-link-actions.js'
   import { decodeInvitePayload, determineInviteImportTarget } from './lib/invite-code.js'
   import {
@@ -573,10 +577,13 @@
     }
 
     try {
-      inviteScanStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' } },
-        audio: false,
+      const cameraCandidates = buildInviteScanConstraintCandidates({
+        mobile: Boolean(state?.mobile),
       })
+      inviteScanStream = await openInviteScanStream(
+        navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices),
+        cameraCandidates,
+      )
       inviteScanVideo.srcObject = inviteScanStream
       await inviteScanVideo.play()
       inviteScanBusy = true
