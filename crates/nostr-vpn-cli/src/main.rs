@@ -3120,6 +3120,61 @@ fn peer_has_recent_handshake(runtime_peer: &WireGuardPeerStatus) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DataPlanePeerState {
+    endpoint: Option<String>,
+    last_handshake_at: Option<u64>,
+    has_recent_handshake: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DataPlanePeerBook {
+    peers: HashMap<String, DataPlanePeerState>,
+}
+
+fn collect_data_plane_peer_book(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    presence: &PeerPresenceBook,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    now: u64,
+) -> DataPlanePeerBook {
+    let peers = app
+        .participant_pubkeys_hex()
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+        .filter_map(|participant| {
+            let announcement = presence.control_plane_announcement_for(participant)?;
+            let runtime_peer = peer_runtime_lookup(announcement, runtime_peers);
+            Some((
+                participant.clone(),
+                DataPlanePeerState {
+                    endpoint: runtime_peer.and_then(|peer| peer.endpoint.clone()),
+                    last_handshake_at: runtime_peer.and_then(|peer| peer.last_handshake_at(now)),
+                    has_recent_handshake: runtime_peer.is_some_and(peer_has_recent_handshake),
+                },
+            ))
+        })
+        .collect();
+
+    DataPlanePeerBook { peers }
+}
+
+fn data_plane_peer_state_for<'a>(
+    data_plane_peer_book: &'a DataPlanePeerBook,
+    participant: &str,
+) -> Option<&'a DataPlanePeerState> {
+    data_plane_peer_book.peers.get(participant)
+}
+
+fn data_plane_live_peer_count(data_plane_peer_book: &DataPlanePeerBook) -> usize {
+    data_plane_peer_book
+        .peers
+        .values()
+        .filter(|state| state.has_recent_handshake)
+        .count()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DaemonPeerTransportState {
     reachable: bool,
     last_handshake_at: Option<u64>,
@@ -3128,9 +3183,8 @@ struct DaemonPeerTransportState {
 
 fn daemon_peer_transport_state(
     announcement: Option<&PeerAnnouncement>,
-    signal_active: bool,
-    runtime_peer: Option<&WireGuardPeerStatus>,
-    now: u64,
+    control_plane_fresh: bool,
+    data_plane_state: Option<&DataPlanePeerState>,
 ) -> DaemonPeerTransportState {
     let Some(announcement) = announcement else {
         return DaemonPeerTransportState {
@@ -3140,12 +3194,12 @@ fn daemon_peer_transport_state(
         };
     };
 
-    let reachable = runtime_peer.is_some_and(peer_has_recent_handshake);
+    let reachable = data_plane_state.is_some_and(|state| state.has_recent_handshake);
     let error = if key_b64_to_hex(&announcement.public_key).is_err() {
         Some("invalid peer key".to_string())
-    } else if !signal_active && !reachable {
-        Some("signal stale".to_string())
-    } else if runtime_peer.is_none() {
+    } else if !control_plane_fresh && !reachable {
+        Some("control-plane stale".to_string())
+    } else if data_plane_state.is_none() {
         Some("peer not in tunnel runtime".to_string())
     } else if !reachable {
         Some("awaiting handshake".to_string())
@@ -3155,26 +3209,21 @@ fn daemon_peer_transport_state(
 
     DaemonPeerTransportState {
         reachable,
-        last_handshake_at: runtime_peer.and_then(|peer| peer.last_handshake_at(now)),
+        last_handshake_at: data_plane_state.and_then(|state| state.last_handshake_at),
         error,
     }
 }
 
-fn connected_peer_count_for_runtime(
+fn data_plane_live_peer_count_for_runtime(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     presence: &PeerPresenceBook,
     runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
-    _now: u64,
+    now: u64,
 ) -> usize {
-    app.participant_pubkeys_hex()
-        .iter()
-        .filter(|participant| Some(participant.as_str()) != own_pubkey)
-        .filter_map(|participant| presence.announcement_for(participant))
-        .filter(|announcement| {
-            peer_runtime_lookup(announcement, runtime_peers).is_some_and(peer_has_recent_handshake)
-        })
-        .count()
+    let data_plane_peer_book =
+        collect_data_plane_peer_book(app, own_pubkey, presence, runtime_peers, now);
+    data_plane_live_peer_count(&data_plane_peer_book)
 }
 
 fn direct_peer_announcements(
@@ -3182,24 +3231,24 @@ fn direct_peer_announcements(
     relay_connected: bool,
 ) -> &HashMap<String, PeerAnnouncement> {
     if relay_connected {
-        presence.active()
+        presence.fresh_control_plane_announcements()
     } else {
-        presence.known()
+        presence.known_control_plane_announcements()
     }
 }
 
 fn relay_connection_action(
     auto_disconnect_relays_when_mesh_ready: bool,
     relay_connected: bool,
-    mesh_ready: bool,
+    mesh_healthy: bool,
 ) -> RelayConnectionAction {
     if relay_connected {
-        if auto_disconnect_relays_when_mesh_ready && mesh_ready {
+        if auto_disconnect_relays_when_mesh_ready && mesh_healthy {
             RelayConnectionAction::PauseForMesh
         } else {
             RelayConnectionAction::KeepConnected
         }
-    } else if auto_disconnect_relays_when_mesh_ready && mesh_ready {
+    } else if auto_disconnect_relays_when_mesh_ready && mesh_healthy {
         RelayConnectionAction::StayPausedForMesh
     } else {
         RelayConnectionAction::ReconnectWhenDue
@@ -3219,37 +3268,50 @@ fn daemon_session_idle_status(session_enabled: bool, expected_peers: usize) -> &
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ConnectMeshPolicySnapshot {
-    active_presence_count: usize,
-    connected_runtime_count: usize,
+struct MeshHealthSnapshot {
+    control_plane_fresh_peer_count: usize,
+    control_plane_known_peer_count: usize,
+    data_plane_live_peer_count: usize,
     expected_peers: usize,
-    mesh_ready_for_runtime: bool,
+    mesh_healthy: bool,
     should_pause_relays: bool,
+    should_reconnect_relays: bool,
 }
 
-fn connect_mesh_policy_snapshot(
+fn mesh_health_snapshot(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     expected_peers: usize,
     presence: &PeerPresenceBook,
     tunnel_runtime: &CliTunnelRuntime,
     now: u64,
-) -> ConnectMeshPolicySnapshot {
-    let active_presence_count = presence_peer_count(app, own_pubkey, presence.active());
+) -> MeshHealthSnapshot {
+    let control_plane_fresh_peer_count = presence_peer_count(
+        app,
+        own_pubkey,
+        presence.fresh_control_plane_announcements(),
+    );
+    let control_plane_known_peer_count = presence_peer_count(
+        app,
+        own_pubkey,
+        presence.known_control_plane_announcements(),
+    );
     let runtime_peers = tunnel_runtime.peer_status().ok();
-    let connected_runtime_count =
-        connected_peer_count_for_runtime(app, own_pubkey, presence, runtime_peers.as_ref(), now);
-    let mesh_ready_for_runtime =
-        expected_peers > 0 && connected_runtime_count >= expected_peers;
+    let data_plane_peer_book =
+        collect_data_plane_peer_book(app, own_pubkey, presence, runtime_peers.as_ref(), now);
+    let data_plane_live_peer_count = data_plane_live_peer_count(&data_plane_peer_book);
+    let mesh_healthy = expected_peers > 0 && data_plane_live_peer_count >= expected_peers;
     let should_pause_relays =
-        app.auto_disconnect_relays_when_mesh_ready && mesh_ready_for_runtime;
+        app.auto_disconnect_relays_when_mesh_ready && mesh_healthy;
 
-    ConnectMeshPolicySnapshot {
-        active_presence_count,
-        connected_runtime_count,
+    MeshHealthSnapshot {
+        control_plane_fresh_peer_count,
+        control_plane_known_peer_count,
+        data_plane_live_peer_count,
         expected_peers,
-        mesh_ready_for_runtime,
+        mesh_healthy,
         should_pause_relays,
+        should_reconnect_relays: !mesh_healthy,
     }
 }
 
@@ -3258,39 +3320,22 @@ fn trace_connect_mesh_policy(
     app: &AppConfig,
     relay_connected: bool,
     relays_paused_for_mesh: bool,
-    snapshot: ConnectMeshPolicySnapshot,
+    snapshot: MeshHealthSnapshot,
 ) {
     debug!(
         phase,
         expected_peers = snapshot.expected_peers,
-        active_presence_count = snapshot.active_presence_count,
-        connected_runtime_count = snapshot.connected_runtime_count,
+        control_plane_fresh_peer_count = snapshot.control_plane_fresh_peer_count,
+        control_plane_known_peer_count = snapshot.control_plane_known_peer_count,
+        data_plane_live_peer_count = snapshot.data_plane_live_peer_count,
         relay_connected,
         relays_paused_for_mesh,
         auto_disconnect_relays_when_mesh_ready = app.auto_disconnect_relays_when_mesh_ready,
-        mesh_ready_for_runtime = snapshot.mesh_ready_for_runtime,
+        mesh_healthy = snapshot.mesh_healthy,
         should_pause_relays = snapshot.should_pause_relays,
-        "connect: evaluated mesh policy"
+        should_reconnect_relays = snapshot.should_reconnect_relays,
+        "connect: evaluated mesh health"
     );
-}
-
-fn should_pause_relays_for_mesh(
-    app: &AppConfig,
-    own_pubkey: Option<&str>,
-    expected_peers: usize,
-    presence: &PeerPresenceBook,
-    tunnel_runtime: &CliTunnelRuntime,
-    now: u64,
-) -> bool {
-    connect_mesh_policy_snapshot(
-        app,
-        own_pubkey,
-        expected_peers,
-        presence,
-        tunnel_runtime,
-        now,
-    )
-    .should_pause_relays
 }
 
 fn build_daemon_peer_cache_state(
@@ -3303,20 +3348,20 @@ fn build_daemon_peer_cache_state(
 ) -> Option<DaemonPeerCacheState> {
     let runtime_peers = tunnel_runtime.peer_status().ok();
     let mut peers = presence
-        .known()
+        .known_control_plane_announcements()
         .iter()
         .map(|(participant, announcement)| {
             let handshake_at = peer_runtime_lookup(announcement, runtime_peers.as_ref())
                 .and_then(|peer| peer.last_handshake_at(now));
             let cached_at = presence
-                .last_seen_at(participant)
+                .last_signal_seen_at(participant)
                 .unwrap_or(announcement.timestamp)
                 .max(handshake_at.unwrap_or(0))
                 .max(announcement.timestamp);
             DaemonPeerCacheEntry {
                 participant_pubkey: participant.clone(),
                 announcement: announcement.clone(),
-                last_signal_seen_at: presence.last_seen_at(participant),
+                last_signal_seen_at: presence.last_signal_seen_at(participant),
                 cached_at,
             }
         })
@@ -3496,7 +3541,11 @@ async fn publish_private_announce_to_active_peers(
         .participant_pubkeys_hex()
         .into_iter()
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
-        .filter(|participant| presence.active().contains_key(participant))
+        .filter(|participant| {
+            presence
+                .fresh_control_plane_announcements()
+                .contains_key(participant)
+        })
         .collect::<Vec<_>>();
 
     publish_private_announce_to_participants(
@@ -3506,7 +3555,7 @@ async fn publish_private_announce_to_active_peers(
         public_signal_endpoint,
         outbound_announces,
         &participants,
-        Some(presence.active()),
+        Some(presence.fresh_control_plane_announcements()),
     )
     .await
 }
@@ -3522,7 +3571,7 @@ fn recently_seen_participants(
 
     let cutoff = now.saturating_sub(stale_after_secs);
     presence
-        .last_seen()
+        .last_signal_seen()
         .iter()
         .filter(|(_, last_seen)| **last_seen > cutoff)
         .map(|(participant, _)| participant.clone())
@@ -4045,9 +4094,15 @@ fn apply_presence_runtime_update(
     tunnel_runtime: &mut CliTunnelRuntime,
     magic_dns_runtime: Option<&ConnectMagicDnsRuntime>,
 ) -> Result<()> {
-    tunnel_runtime.apply(app, own_pubkey, presence.known(), path_book, now)?;
+    tunnel_runtime.apply(
+        app,
+        own_pubkey,
+        presence.known_control_plane_announcements(),
+        path_book,
+        now,
+    )?;
     if let Some(runtime) = magic_dns_runtime {
-        runtime.refresh_records(app, presence.known());
+        runtime.refresh_records(app, presence.known_control_plane_announcements());
     }
     Ok(())
 }
@@ -4064,7 +4119,7 @@ fn presence_peer_count(
         .count()
 }
 
-fn maybe_log_presence_mesh_count(
+fn maybe_log_control_plane_mesh_count(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
@@ -4073,7 +4128,7 @@ fn maybe_log_presence_mesh_count(
 ) {
     let connected = presence_peer_count(app, own_pubkey, peer_announcements);
     if connected != *last_mesh_count {
-        println!("mesh: {connected}/{expected_peers} peers with presence");
+        println!("mesh: {connected}/{expected_peers} peers with control-plane freshness");
         *last_mesh_count = connected;
     }
 }
@@ -4217,7 +4272,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     continue;
                 }
 
-                let mesh_policy = connect_mesh_policy_snapshot(
+                let mesh_policy = mesh_health_snapshot(
                     &app,
                     own_pubkey.as_deref(),
                     expected_peers,
@@ -4245,8 +4300,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                                 phase = "reconnect_tick",
                                 reason = "mesh_ready",
                                 expected_peers = mesh_policy.expected_peers,
-                                active_presence_count = mesh_policy.active_presence_count,
-                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                control_plane_fresh_peer_count = mesh_policy.control_plane_fresh_peer_count,
+                                control_plane_known_peer_count = mesh_policy.control_plane_known_peer_count,
+                                data_plane_live_peer_count = mesh_policy.data_plane_live_peer_count,
                                 relay_connected_before = relay_connected,
                                 "connect: relays remain paused because mesh is ready"
                             );
@@ -4261,8 +4317,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                                 phase = "reconnect_tick",
                                 reason = "mesh_degraded",
                                 expected_peers = mesh_policy.expected_peers,
-                                active_presence_count = mesh_policy.active_presence_count,
-                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                control_plane_fresh_peer_count = mesh_policy.control_plane_fresh_peer_count,
+                                control_plane_known_peer_count = mesh_policy.control_plane_known_peer_count,
+                                data_plane_live_peer_count = mesh_policy.data_plane_live_peer_count,
                                 relay_connected_before = relay_connected,
                                 "connect: reconnecting relays because mesh is degraded"
                             );
@@ -4450,7 +4507,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
             _ = announce_interval.tick() => {
                 let now = unix_timestamp();
                 let signal_timeout_secs = peer_signal_timeout_secs(args.announce_interval_secs);
-                let removed = presence.prune_stale(now, signal_timeout_secs);
+                let removed = presence.prune_stale_control_plane_state(now, signal_timeout_secs);
                 for participant in &removed {
                     outbound_announces.forget(participant);
                 }
@@ -4469,11 +4526,13 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                         removed_participants = ?removed,
                         signal_timeout_secs,
                         relays_paused_for_mesh,
-                        "connect: pruned stale peers before mesh evaluation"
+                        "connect: pruned stale control-plane freshness before mesh evaluation"
                     );
                 }
                 if !removed.is_empty() || paths_pruned {
                     last_nat_punch_attempt = None;
+                }
+                if paths_pruned {
                     apply_presence_runtime_update(
                         &app,
                         own_pubkey.as_deref(),
@@ -4483,16 +4542,18 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                         &mut tunnel_runtime,
                         magic_dns_runtime.as_ref(),
                     )
-                    .context("failed to apply tunnel update after stale peer expiry")?;
-                    maybe_log_presence_mesh_count(
+                    .context("failed to apply tunnel update after path cache expiry")?;
+                }
+                if !removed.is_empty() || paths_pruned {
+                    maybe_log_control_plane_mesh_count(
                         &app,
                         own_pubkey.as_deref(),
-                        presence.active(),
+                        presence.fresh_control_plane_announcements(),
                         expected_peers,
                         &mut last_mesh_count,
                     );
                 }
-                let mesh_policy = connect_mesh_policy_snapshot(
+                let mesh_policy = mesh_health_snapshot(
                     &app,
                     own_pubkey.as_deref(),
                     expected_peers,
@@ -4522,8 +4583,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                                 phase = "announce_interval",
                                 reason = "mesh_ready",
                                 expected_peers = mesh_policy.expected_peers,
-                                active_presence_count = mesh_policy.active_presence_count,
-                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                control_plane_fresh_peer_count = mesh_policy.control_plane_fresh_peer_count,
+                                control_plane_known_peer_count = mesh_policy.control_plane_known_peer_count,
+                                data_plane_live_peer_count = mesh_policy.data_plane_live_peer_count,
                                 relay_connected_before = true,
                                 "connect: pausing relays because mesh is ready"
                             );
@@ -4537,8 +4599,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                                 phase = "announce_interval",
                                 reason = "mesh_degraded",
                                 expected_peers = mesh_policy.expected_peers,
-                                active_presence_count = mesh_policy.active_presence_count,
-                                connected_runtime_count = mesh_policy.connected_runtime_count,
+                                control_plane_fresh_peer_count = mesh_policy.control_plane_fresh_peer_count,
+                                control_plane_known_peer_count = mesh_policy.control_plane_known_peer_count,
+                                data_plane_live_peer_count = mesh_policy.data_plane_live_peer_count,
                                 relay_connected_before = relay_connected,
                                 recently_pruned_peer_count = removed.len(),
                                 "connect: reconnecting relays because mesh is degraded"
@@ -4557,7 +4620,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 if let Err(error) = maybe_run_nat_punch(
                     &app,
                     own_pubkey.as_deref(),
-                    presence.active(),
+                    presence.fresh_control_plane_announcements(),
                     &mut path_book,
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
@@ -4631,7 +4694,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                             public_signal_endpoint.as_ref(),
                             &mut outbound_announces,
                             std::slice::from_ref(&sender_pubkey),
-                            Some(presence.known()),
+                            Some(presence.known_control_plane_announcements()),
                         )
                         .await
                     {
@@ -4653,7 +4716,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 if let Err(error) = maybe_run_nat_punch(
                     &app,
                     own_pubkey.as_deref(),
-                    presence.active(),
+                    presence.fresh_control_plane_announcements(),
                     &mut path_book,
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
@@ -4664,7 +4727,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 if let Err(error) = heartbeat_pending_tunnel_peers(
                     &app,
                     own_pubkey.as_deref(),
-                    presence.active(),
+                    presence.fresh_control_plane_announcements(),
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
@@ -4677,17 +4740,17 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                         public_signal_endpoint.as_ref(),
                         &mut outbound_announces,
                         std::slice::from_ref(&sender_pubkey),
-                        Some(presence.known()),
+                        Some(presence.known_control_plane_announcements()),
                     )
                     .await
                 {
                     eprintln!("signal: targeted private announce failed: {error}");
                 }
 
-                maybe_log_presence_mesh_count(
+                maybe_log_control_plane_mesh_count(
                     &app,
                     own_pubkey.as_deref(),
-                    presence.active(),
+                    presence.fresh_control_plane_announcements(),
                     expected_peers,
                     &mut last_mesh_count,
                 );
@@ -4858,6 +4921,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         };
     let mut last_mesh_count = 0_usize;
     let mut last_nat_punch_attempt: Option<(String, Instant)> = None;
+    let mut relays_paused_for_mesh =
+        restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready;
     write_daemon_state(
         &state_file,
         &build_daemon_runtime_state(
@@ -4889,7 +4954,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     continue;
                 }
 
-                let mesh_ready = should_pause_relays_for_mesh(
+                let mesh_policy = mesh_health_snapshot(
                     &app,
                     own_pubkey.as_deref(),
                     expected_peers,
@@ -4897,18 +4962,28 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &tunnel_runtime,
                     unix_timestamp(),
                 );
+                trace_connect_mesh_policy(
+                    "daemon_reconnect_tick",
+                    &app,
+                    relay_connected,
+                    relays_paused_for_mesh,
+                    mesh_policy,
+                );
                 match relay_connection_action(
                     app.auto_disconnect_relays_when_mesh_ready,
                     relay_connected,
-                    mesh_ready,
+                    mesh_policy.mesh_healthy,
                 ) {
                     RelayConnectionAction::StayPausedForMesh => {
                         reconnect_attempt = 0;
                         reconnect_due = Instant::now();
                         session_status = MESH_READY_RELAYS_PAUSED_STATUS.to_string();
+                        relays_paused_for_mesh = true;
                         continue;
                     }
-                    RelayConnectionAction::ReconnectWhenDue => {}
+                    RelayConnectionAction::ReconnectWhenDue => {
+                        relays_paused_for_mesh = false;
+                    }
                     RelayConnectionAction::KeepConnected | RelayConnectionAction::PauseForMesh => {
                         continue;
                     }
@@ -4923,6 +4998,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 match client.connect(&relays).await {
                     Ok(()) => {
                         relay_connected = true;
+                        relays_paused_for_mesh = false;
                         reconnect_attempt = 0;
                         session_status = "Connected".to_string();
                         outbound_announces.clear();
@@ -4970,7 +5046,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 if let Err(error) = maybe_run_nat_punch(
                     &app,
                     own_pubkey.as_deref(),
-                    presence.active(),
+                    presence.fresh_control_plane_announcements(),
                     &mut path_book,
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
@@ -5414,7 +5490,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
                 if daemon_session_active(session_enabled, expected_peers) {
                     let now = unix_timestamp();
-                    let removed = presence.prune_stale(
+                    let removed = presence.prune_stale_control_plane_state(
                         now,
                         peer_signal_timeout_secs(args.announce_interval_secs),
                     );
@@ -5431,6 +5507,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     outbound_announces.retain_participants(&recent);
                     if !removed.is_empty() || paths_pruned {
                         last_nat_punch_attempt = None;
+                    }
+                    if paths_pruned {
                         if let Err(error) = apply_presence_runtime_update(
                             &app,
                             own_pubkey.as_deref(),
@@ -5440,19 +5518,20 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             &mut tunnel_runtime,
                             magic_dns_runtime.as_ref(),
                         ) {
-                            session_status = format!("Stale peer expiry update failed ({error})");
-                        } else {
-                            maybe_log_presence_mesh_count(
-                                &app,
-                                own_pubkey.as_deref(),
-                                presence.active(),
-                                expected_peers,
-                                &mut last_mesh_count,
-                            );
+                            session_status = format!("Path cache expiry update failed ({error})");
                         }
                     }
+                    if !removed.is_empty() || paths_pruned {
+                        maybe_log_control_plane_mesh_count(
+                            &app,
+                            own_pubkey.as_deref(),
+                            presence.fresh_control_plane_announcements(),
+                            expected_peers,
+                            &mut last_mesh_count,
+                        );
+                    }
                 }
-                let mesh_ready = should_pause_relays_for_mesh(
+                let mesh_policy = mesh_health_snapshot(
                     &app,
                     own_pubkey.as_deref(),
                     expected_peers,
@@ -5460,18 +5539,26 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &tunnel_runtime,
                     unix_timestamp(),
                 );
+                trace_connect_mesh_policy(
+                    "daemon_state_interval",
+                    &app,
+                    relay_connected,
+                    relays_paused_for_mesh,
+                    mesh_policy,
+                );
                 if daemon_session_active(session_enabled, expected_peers)
                     && matches!(
                         relay_connection_action(
                             app.auto_disconnect_relays_when_mesh_ready,
                             relay_connected,
-                            mesh_ready,
+                            mesh_policy.mesh_healthy,
                         ),
                         RelayConnectionAction::PauseForMesh
                     )
                 {
                     client.disconnect().await;
                     relay_connected = false;
+                    relays_paused_for_mesh = true;
                     reconnect_attempt = 0;
                     reconnect_due = Instant::now();
                     session_status = MESH_READY_RELAYS_PAUSED_STATUS.to_string();
@@ -5536,7 +5623,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             public_signal_endpoint.as_ref(),
                             &mut outbound_announces,
                             std::slice::from_ref(&sender_pubkey),
-                            Some(presence.known()),
+                            Some(presence.known_control_plane_announcements()),
                         )
                         .await
                     {
@@ -5560,7 +5647,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     if let Err(error) = maybe_run_nat_punch(
                         &app,
                         own_pubkey.as_deref(),
-                        presence.active(),
+                        presence.fresh_control_plane_announcements(),
                         &mut path_book,
                         &mut tunnel_runtime,
                         &mut public_signal_endpoint,
@@ -5571,7 +5658,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     if let Err(error) = heartbeat_pending_tunnel_peers(
                         &app,
                         own_pubkey.as_deref(),
-                        presence.active(),
+                        presence.fresh_control_plane_announcements(),
                         &tunnel_runtime,
                     ) {
                         eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
@@ -5592,7 +5679,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             public_signal_endpoint.as_ref(),
                             &mut outbound_announces,
                             std::slice::from_ref(&sender_pubkey),
-                            Some(presence.known()),
+                            Some(presence.known_control_plane_announcements()),
                         )
                         .await
                     {
@@ -5605,10 +5692,10 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     };
                 }
 
-                maybe_log_presence_mesh_count(
+                maybe_log_control_plane_mesh_count(
                     &app,
                     own_pubkey.as_deref(),
-                    presence.active(),
+                    presence.fresh_control_plane_announcements(),
                     expected_peers,
                     &mut last_mesh_count,
                 );
@@ -5776,6 +5863,13 @@ fn build_daemon_runtime_state(
     let own_pubkey = app.own_nostr_pubkey_hex().ok();
     let runtime_peers = tunnel_runtime.peer_status().ok();
     let now = unix_timestamp();
+    let data_plane_peer_book = collect_data_plane_peer_book(
+        app,
+        own_pubkey.as_deref(),
+        presence,
+        runtime_peers.as_ref(),
+        now,
+    );
     let mut peers = Vec::new();
 
     for participant in &app.participant_pubkeys_hex() {
@@ -5783,8 +5877,8 @@ fn build_daemon_runtime_state(
             continue;
         }
 
-        let Some(announcement) = presence.announcement_for(participant) else {
-            let transport = daemon_peer_transport_state(None, false, None, now);
+        let Some(announcement) = presence.control_plane_announcement_for(participant) else {
+            let transport = daemon_peer_transport_state(None, false, None);
             peers.push(DaemonPeerState {
                 participant_pubkey: participant.clone(),
                 node_id: String::new(),
@@ -5801,10 +5895,14 @@ fn build_daemon_runtime_state(
             continue;
         };
 
-        let signal_active = presence.active().contains_key(participant);
-        let runtime_peer = peer_runtime_lookup(announcement, runtime_peers.as_ref());
-        let transport =
-            daemon_peer_transport_state(Some(announcement), signal_active, runtime_peer, now);
+        let control_plane_fresh = presence
+            .fresh_control_plane_announcements()
+            .contains_key(participant);
+        let transport = daemon_peer_transport_state(
+            Some(announcement),
+            control_plane_fresh,
+            data_plane_peer_state_for(&data_plane_peer_book, participant),
+        );
 
         peers.push(DaemonPeerState {
             participant_pubkey: participant.clone(),
@@ -5814,20 +5912,14 @@ fn build_daemon_runtime_state(
             public_key: announcement.public_key.clone(),
             advertised_routes: announcement.advertised_routes.clone(),
             presence_timestamp: announcement.timestamp,
-            last_signal_seen_at: presence.last_seen_at(participant),
+            last_signal_seen_at: presence.last_signal_seen_at(participant),
             reachable: transport.reachable,
             last_handshake_at: transport.last_handshake_at,
             error: transport.error,
         });
     }
 
-    let connected_peer_count = connected_peer_count_for_runtime(
-        app,
-        own_pubkey.as_deref(),
-        presence,
-        runtime_peers.as_ref(),
-        now,
-    );
+    let connected_peer_count = data_plane_live_peer_count(&data_plane_peer_book);
     let mesh_ready = expected_peers > 0 && connected_peer_count >= expected_peers;
     let health = build_health_issues(
         app,
@@ -9582,13 +9674,15 @@ mod tests {
 
     use super::{
         AppConfig, Cli, DaemonPeerCacheEntry, DaemonPeerCacheRestore, DaemonPeerCacheState,
-        DaemonRuntimeState, DiscoveredPublicSignalEndpoint, InstallCliArgs, LinuxExitNodeIpFamily,
-        OutboundAnnounceBook, PeerAnnouncement, TunnelPeer, UninstallCliArgs, WireGuardPeerStatus,
+        DaemonRuntimeState, DataPlanePeerState, DiscoveredPublicSignalEndpoint, InstallCliArgs,
+        LinuxExitNodeIpFamily, OutboundAnnounceBook, PeerAnnouncement, TunnelPeer,
+        UninstallCliArgs, WireGuardPeerStatus,
         announcement_fingerprint, apply_config_file, apply_participants_override,
         build_daemon_reload_config, build_peer_announcement, build_runtime_magic_dns_records,
-        can_reuse_active_listen_port, connected_peer_count_for_runtime, daemon_control_file_path,
-        daemon_peer_cache_file_path, daemon_peer_transport_state, daemon_pids_from_ps_output,
+        can_reuse_active_listen_port, daemon_control_file_path, daemon_peer_cache_file_path,
+        daemon_peer_transport_state, daemon_pids_from_ps_output,
         daemon_reconnect_backoff_delay, daemon_session_active, daemon_session_idle_status,
+        data_plane_live_peer_count, data_plane_live_peer_count_for_runtime,
         default_cli_install_path, endpoint_with_listen_port, install_cli,
         is_uapi_addr_in_use_error, key_b64_to_hex, kill_error_requires_control_fallback,
         linux_default_route_device_from_output, linux_exit_node_default_route_families,
@@ -9599,6 +9693,7 @@ mod tests {
         load_config_with_overrides, local_interface_address_for_tunnel,
         macos_service_disabled_from_print_disabled_output, nat_punch_targets,
         nat_punch_targets_for_local_endpoint, nat_punch_targets_for_local_endpoints,
+        collect_data_plane_peer_book,
         parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
         peer_path_cache_timeout_secs, peer_runtime_lookup, peer_signal_timeout_secs,
         pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
@@ -9967,13 +10062,73 @@ mod tests {
         )]);
 
         assert_eq!(
-            connected_peer_count_for_runtime(&config, None, &presence, Some(&runtime_peers), now),
+            data_plane_live_peer_count_for_runtime(
+                &config,
+                None,
+                &presence,
+                Some(&runtime_peers),
+                now,
+            ),
             1
         );
 
         let runtime_peer = peer_runtime_lookup(&announcement, Some(&runtime_peers))
             .expect("runtime peer should resolve from cached announcement");
         assert!(peer_has_recent_handshake(runtime_peer));
+    }
+
+    #[test]
+    fn mesh_health_prefers_data_plane_when_control_plane_freshness_expires() {
+        let mut config = AppConfig::generated();
+        config.auto_disconnect_relays_when_mesh_ready = true;
+        let participant = "22".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let peer_keys = generate_keypair();
+        let announcement = PeerAnnouncement {
+            node_id: "peer-b".to_string(),
+            public_key: peer_keys.public_key.clone(),
+            endpoint: "203.0.113.21:51820".to_string(),
+            local_endpoint: None,
+            public_endpoint: Some("203.0.113.21:51820".to_string()),
+            tunnel_ip: "10.44.0.3/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 1,
+        };
+
+        let mut presence = PeerPresenceBook::default();
+        assert!(presence.apply_signal(
+            participant.clone(),
+            SignalPayload::Announce(announcement),
+            100,
+        ));
+        assert_eq!(
+            presence.prune_stale_control_plane_state(200, 20),
+            vec![participant.clone()]
+        );
+        assert!(presence.fresh_control_plane_announcements().is_empty());
+        assert!(
+            presence
+                .known_control_plane_announcements()
+                .contains_key(&participant)
+        );
+
+        let now = 1_700_000_000;
+        let runtime_peers = HashMap::from([(
+            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
+            WireGuardPeerStatus {
+                endpoint: Some("203.0.113.21:51820".to_string()),
+                last_handshake_sec: Some(5),
+                last_handshake_nsec: Some(0),
+            },
+        )]);
+        let data_plane_peer_book =
+            collect_data_plane_peer_book(&config, None, &presence, Some(&runtime_peers), now);
+
+        assert_eq!(data_plane_live_peer_count(&data_plane_peer_book), 1);
+        assert!(presence
+            .control_plane_announcement_for(&participant)
+            .is_some());
     }
 
     #[test]
@@ -10000,7 +10155,7 @@ mod tests {
 
     #[test]
     fn daemon_peer_transport_state_reports_missing_signal() {
-        let state = daemon_peer_transport_state(None, false, None, 1_700_000_000);
+        let state = daemon_peer_transport_state(None, false, None);
 
         assert!(!state.reachable);
         assert_eq!(state.last_handshake_at, None);
@@ -10011,21 +10166,21 @@ mod tests {
     fn daemon_peer_transport_state_reports_invalid_peer_key() {
         let announcement = sample_peer_announcement("not-a-wireguard-key".to_string());
 
-        let state = daemon_peer_transport_state(Some(&announcement), true, None, 1_700_000_000);
+        let state = daemon_peer_transport_state(Some(&announcement), true, None);
 
         assert!(!state.reachable);
         assert_eq!(state.error.as_deref(), Some("invalid peer key"));
     }
 
     #[test]
-    fn daemon_peer_transport_state_reports_signal_stale_before_runtime_error() {
+    fn daemon_peer_transport_state_reports_control_plane_stale_before_runtime_error() {
         let keys = generate_keypair();
         let announcement = sample_peer_announcement(keys.public_key);
 
-        let state = daemon_peer_transport_state(Some(&announcement), false, None, 1_700_000_000);
+        let state = daemon_peer_transport_state(Some(&announcement), false, None);
 
         assert!(!state.reachable);
-        assert_eq!(state.error.as_deref(), Some("signal stale"));
+        assert_eq!(state.error.as_deref(), Some("control-plane stale"));
     }
 
     #[test]
@@ -10033,7 +10188,7 @@ mod tests {
         let keys = generate_keypair();
         let announcement = sample_peer_announcement(keys.public_key);
 
-        let state = daemon_peer_transport_state(Some(&announcement), true, None, 1_700_000_000);
+        let state = daemon_peer_transport_state(Some(&announcement), true, None);
 
         assert!(!state.reachable);
         assert_eq!(state.error.as_deref(), Some("peer not in tunnel runtime"));
@@ -10043,17 +10198,13 @@ mod tests {
     fn daemon_peer_transport_state_reports_awaiting_handshake_when_runtime_peer_is_idle() {
         let keys = generate_keypair();
         let announcement = sample_peer_announcement(keys.public_key);
-        let runtime_peer = WireGuardPeerStatus {
+        let data_plane_state = DataPlanePeerState {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            ..WireGuardPeerStatus::default()
+            last_handshake_at: None,
+            has_recent_handshake: false,
         };
 
-        let state = daemon_peer_transport_state(
-            Some(&announcement),
-            true,
-            Some(&runtime_peer),
-            1_700_000_000,
-        );
+        let state = daemon_peer_transport_state(Some(&announcement), true, Some(&data_plane_state));
 
         assert!(!state.reachable);
         assert_eq!(state.last_handshake_at, None);
