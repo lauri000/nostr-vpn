@@ -3144,13 +3144,13 @@ fn collect_data_plane_peer_book(
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
         .filter_map(|participant| {
             let announcement = presence.control_plane_announcement_for(participant)?;
-            let runtime_peer = peer_runtime_lookup(announcement, runtime_peers);
+            let runtime_peer = peer_runtime_lookup(announcement, runtime_peers)?;
             Some((
                 participant.clone(),
                 DataPlanePeerState {
-                    endpoint: runtime_peer.and_then(|peer| peer.endpoint.clone()),
-                    last_handshake_at: runtime_peer.and_then(|peer| peer.last_handshake_at(now)),
-                    has_recent_handshake: runtime_peer.is_some_and(peer_has_recent_handshake),
+                    endpoint: runtime_peer.endpoint.clone(),
+                    last_handshake_at: runtime_peer.last_handshake_at(now),
+                    has_recent_handshake: peer_has_recent_handshake(runtime_peer),
                 },
             ))
         })
@@ -9683,6 +9683,7 @@ mod tests {
         daemon_peer_transport_state, daemon_pids_from_ps_output,
         daemon_reconnect_backoff_delay, daemon_session_active, daemon_session_idle_status,
         data_plane_live_peer_count, data_plane_live_peer_count_for_runtime,
+        data_plane_peer_state_for,
         default_cli_install_path, endpoint_with_listen_port, install_cli,
         is_uapi_addr_in_use_error, key_b64_to_hex, kill_error_requires_control_fallback,
         linux_default_route_device_from_output, linux_exit_node_default_route_families,
@@ -10129,6 +10130,40 @@ mod tests {
         assert!(presence
             .control_plane_announcement_for(&participant)
             .is_some());
+    }
+
+    #[test]
+    fn collect_data_plane_peer_book_omits_announced_peers_missing_from_runtime() {
+        let mut config = AppConfig::generated();
+        let participant = "33".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let peer_keys = generate_keypair();
+        let announcement = PeerAnnouncement {
+            node_id: "peer-c".to_string(),
+            public_key: peer_keys.public_key,
+            endpoint: "203.0.113.22:51820".to_string(),
+            local_endpoint: None,
+            public_endpoint: Some("203.0.113.22:51820".to_string()),
+            tunnel_ip: "10.44.0.4/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 1,
+        };
+
+        let mut presence = PeerPresenceBook::default();
+        assert!(presence.apply_signal(
+            participant.clone(),
+            SignalPayload::Announce(announcement),
+            100,
+        ));
+
+        let now = 1_700_000_000;
+        let runtime_peers = HashMap::new();
+        let data_plane_peer_book =
+            collect_data_plane_peer_book(&config, None, &presence, Some(&runtime_peers), now);
+
+        assert!(data_plane_peer_state_for(&data_plane_peer_book, &participant).is_none());
+        assert_eq!(data_plane_live_peer_count(&data_plane_peer_book), 0);
     }
 
     #[test]
