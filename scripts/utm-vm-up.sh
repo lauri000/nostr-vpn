@@ -115,7 +115,13 @@ summarize() {
   local host_nvpn="$1"
   local vm_nvpn="$2"
   local ssh_cmd
+  local ssh_tty_cmd
   ssh_cmd="$(ssh_connect_cmd)"
+  if [[ -n "$VM_PORT" ]]; then
+    ssh_tty_cmd="ssh -t -p $VM_PORT \"$VM_USER@$VM_HOST\""
+  else
+    ssh_tty_cmd="ssh -t \"$VM_USER@$VM_HOST\""
+  fi
 
   cat <<EOF
 
@@ -129,7 +135,7 @@ Network ID: $NETWORK_ID
 
 Next commands:
   sudo "$host_nvpn" connect --config "$HOST_CONFIG"
-  $ssh_cmd "sudo \"$vm_nvpn\" connect --config \"$VM_CONFIG\""
+  $ssh_tty_cmd "sudo \"$vm_nvpn\" connect --config \"$VM_CONFIG\""
   "$host_nvpn" status --config "$HOST_CONFIG" --json
   $ssh_cmd "\"$vm_nvpn\" status --config \"$VM_CONFIG\" --json"
 EOF

@@ -104,11 +104,13 @@ summarize() {
   local host_npub="$1"
   local vm_npub="$2"
   local ssh_cmd="ssh"
+  local ssh_tty_cmd="ssh -t"
   local remote_connect
   local remote_status
 
   if [[ -n "$VM_PORT" ]]; then
     ssh_cmd+=" -p $VM_PORT"
+    ssh_tty_cmd+=" -p $VM_PORT"
   fi
 
   remote_connect="$(printf 'bash -lc %q' "sudo $(printf '%q' "$VM_NVPN") connect --config $(printf '%q' "$VM_CONFIG")")"
@@ -126,7 +128,7 @@ VM npub: $vm_npub
 
 Next commands:
   sudo "$HOST_NVPN" connect --config "$HOST_CONFIG"
-  ${ssh_cmd} "$SSH_TARGET" "$remote_connect"
+  ${ssh_tty_cmd} "$SSH_TARGET" "$remote_connect"
   "$HOST_NVPN" status --config "$HOST_CONFIG" --json
   ${ssh_cmd} "$SSH_TARGET" "$remote_status"
 EOF
