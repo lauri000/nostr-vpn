@@ -13,6 +13,8 @@ mod mobile_wg;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -35,10 +37,11 @@ use nostr_vpn_core::config::{
 use nostr_vpn_core::diagnostics::{HealthIssue, NetworkSummary, PortMappingStatus};
 #[cfg(any(target_os = "windows", test))]
 use nostr_vpn_core::platform_paths::windows_default_config_path_for_state;
+#[cfg(any(target_os = "windows", test))]
+use nostr_vpn_core::platform_paths::windows_machine_config_path_from_program_data_dir;
 #[cfg(target_os = "windows")]
 use nostr_vpn_core::platform_paths::{
-    legacy_config_path_from_dirs_config_dir, windows_machine_config_path_from_program_data_dir,
-    windows_service_config_path_from_sc_qc_output,
+    legacy_config_path_from_dirs_config_dir, windows_service_config_path_from_sc_qc_output,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -55,9 +58,12 @@ use tauri::{Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tokio::runtime::Runtime;
 
-const LAN_DISCOVERY_ADDR: [u8; 4] = [239, 255, 73, 73];
-const LAN_DISCOVERY_PORT: u16 = 38911;
-const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
+const LAN_PAIRING_ADDR: [u8; 4] = [239, 255, 73, 73];
+const LAN_PAIRING_PORT: u16 = 38911;
+const LAN_PAIRING_STALE_AFTER_SECS: u64 = 16;
+const LAN_PAIRING_DURATION_SECS: u64 = 15 * 60;
+const LAN_PAIRING_ANNOUNCEMENT_VERSION: u8 = 2;
+const LAN_PAIRING_BUFFER_BYTES: usize = 8192;
 // Keep the GUI's online/offline grace aligned with the daemon's WireGuard
 // session window so idle peers do not flap back to "awaiting handshake".
 const PEER_ONLINE_GRACE_SECS: u64 = 180;
@@ -114,6 +120,19 @@ struct PeerLinkStatus {
     offers_exit_node: bool,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistConfigOutcome {
+    SavedLocally,
+    ReloadedRunningDaemon,
+}
+
+impl PersistConfigOutcome {
+    fn needs_explicit_daemon_reload(self) -> bool {
+        matches!(self, Self::SavedLocally)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfiguredPeerStatus {
     Local,
@@ -136,14 +155,20 @@ struct LanPeerRecord {
     npub: String,
     node_name: String,
     endpoint: String,
+    network_name: String,
+    network_id: String,
+    invite: String,
     last_seen: SystemTime,
 }
 
 #[derive(Debug, Clone)]
-struct LanDiscoverySignal {
+struct LanPairingSignal {
     npub: String,
     node_name: String,
     endpoint: String,
+    network_name: String,
+    network_id: String,
+    invite: String,
     seen_at: SystemTime,
 }
 
@@ -153,6 +178,7 @@ struct LanAnnouncement {
     npub: String,
     node_name: String,
     endpoint: String,
+    invite: String,
     timestamp: u64,
 }
 
@@ -258,8 +284,10 @@ struct LanPeerView {
     npub: String,
     node_name: String,
     endpoint: String,
+    network_name: String,
+    network_id: String,
+    invite: String,
     last_seen_text: String,
-    configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,7 +330,8 @@ struct UiState {
     magic_dns_status: String,
     auto_disconnect_relays_when_mesh_ready: bool,
     autoconnect: bool,
-    lan_discovery_enabled: bool,
+    lan_pairing_active: bool,
+    lan_pairing_remaining_secs: u64,
     launch_on_startup: bool,
     close_to_tray_on_close: bool,
     connected_peer_count: usize,
@@ -330,7 +359,6 @@ struct SettingsPatch {
     magic_dns_suffix: Option<String>,
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
     autoconnect: Option<bool>,
-    lan_discovery_enabled: Option<bool>,
     launch_on_startup: Option<bool>,
     close_to_tray_on_close: Option<bool>,
 }
@@ -520,9 +548,10 @@ struct NvpnBackend {
     relay_status: HashMap<String, RelayStatus>,
     peer_status: HashMap<String, PeerLinkStatus>,
 
-    lan_discovery_running: bool,
-    lan_discovery_rx: Option<mpsc::Receiver<LanDiscoverySignal>>,
-    lan_discovery_stop: Option<Arc<AtomicBool>>,
+    lan_pairing_running: bool,
+    lan_pairing_rx: Option<mpsc::Receiver<LanPairingSignal>>,
+    lan_pairing_stop: Option<Arc<AtomicBool>>,
+    lan_pairing_expires_at: Option<SystemTime>,
     lan_peers: HashMap<String, LanPeerRecord>,
 
     magic_dns_status: String,
@@ -627,9 +656,10 @@ impl NvpnBackend {
             force_connect_pending: false,
             relay_status,
             peer_status,
-            lan_discovery_running: false,
-            lan_discovery_rx: None,
-            lan_discovery_stop: None,
+            lan_pairing_running: false,
+            lan_pairing_rx: None,
+            lan_pairing_stop: None,
+            lan_pairing_expires_at: None,
             lan_peers: HashMap::new(),
             magic_dns_status: "DNS disabled (VPN off)".to_string(),
         };
@@ -640,9 +670,6 @@ impl NvpnBackend {
         backend.ensure_peer_status_entries();
         #[cfg(target_os = "ios")]
         write_ios_probe("backend: status entries ensured");
-        backend.maybe_refresh_lan_discovery();
-        #[cfg(target_os = "ios")]
-        write_ios_probe("backend: lan refresh complete");
         #[cfg(target_os = "ios")]
         {
             backend.sync_service_state();
@@ -721,7 +748,7 @@ impl NvpnBackend {
             self.session_status = runtime.runtime_status_detail.to_string();
             return Err(anyhow!(self.session_status.clone()));
         }
-        self.persist_config()?;
+        let _ = self.persist_config()?;
         self.sync_daemon_state();
         if self.daemon_running {
             self.resume_daemon_process()?;
@@ -755,10 +782,12 @@ impl NvpnBackend {
         self.config.add_network(name);
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -766,7 +795,7 @@ impl NvpnBackend {
 
     fn rename_network(&mut self, network_id: &str, name: &str) -> Result<()> {
         self.config.rename_network(network_id, name)?;
-        self.persist_config()?;
+        let _ = self.persist_config()?;
         self.sync_daemon_state();
         Ok(())
     }
@@ -781,12 +810,13 @@ impl NvpnBackend {
         self.config.set_network_mesh_id(network_id, mesh_id)?;
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         if is_active_network {
             self.ensure_peer_status_entries();
-            self.reload_daemon_if_running()?;
-            self.maybe_refresh_lan_discovery();
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_if_running()?;
+            }
             if self.daemon_running {
                 self.session_status = "Mesh ID updated and applied.".to_string();
             }
@@ -800,10 +830,12 @@ impl NvpnBackend {
         self.config.remove_network(network_id)?;
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -813,9 +845,11 @@ impl NvpnBackend {
         self.config.set_network_enabled(network_id, enabled)?;
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
         Ok(())
     }
@@ -840,15 +874,16 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
         if self.daemon_running {
-            self.reload_daemon_process()?;
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_process()?;
+            }
             self.session_status = "Participant saved and applied.".to_string();
         }
         self.sync_daemon_state();
-        self.maybe_refresh_lan_discovery();
 
         Ok(())
     }
@@ -861,13 +896,14 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
         self.ensure_relay_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
-        self.maybe_refresh_lan_discovery();
         self.session_status = if self.daemon_running {
             format!("Invite imported and applied for {}.", invite.network_name)
         } else {
@@ -885,17 +921,60 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_peer_status_entries();
         if self.daemon_running {
-            self.reload_daemon_process()?;
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_process()?;
+            }
             self.session_status = "Participant removed and applied.".to_string();
         }
         self.sync_daemon_state();
-        self.maybe_refresh_lan_discovery();
 
         Ok(())
+    }
+
+    fn start_lan_pairing(&mut self) -> Result<()> {
+        if self.lan_pairing_running {
+            return Ok(());
+        }
+
+        let own_npub = self
+            .config
+            .own_nostr_pubkey_hex()
+            .map(|hex| to_npub(&hex))
+            .unwrap_or_else(|_| self.config.nostr.public_key.clone());
+        let node_name = self.config.node_name.clone();
+        let endpoint = self.config.node.endpoint.clone();
+        let invite = active_network_invite_code(&self.config)?;
+
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+
+        self.runtime.spawn(async move {
+            run_lan_pairing_loop(tx, stop_flag, own_npub, node_name, endpoint, invite).await;
+        });
+
+        self.lan_pairing_rx = Some(rx);
+        self.lan_pairing_stop = Some(stop);
+        self.lan_pairing_running = true;
+        self.lan_pairing_expires_at =
+            Some(SystemTime::now() + Duration::from_secs(LAN_PAIRING_DURATION_SECS));
+        self.lan_peers.clear();
+
+        Ok(())
+    }
+
+    fn stop_lan_pairing(&mut self) {
+        if let Some(stop) = self.lan_pairing_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.lan_pairing_rx = None;
+        self.lan_pairing_running = false;
+        self.lan_pairing_expires_at = None;
+        self.lan_peers.clear();
     }
 
     fn add_relay(&mut self, relay: &str) -> Result<()> {
@@ -921,10 +1000,12 @@ impl NvpnBackend {
         self.config.nostr.relays.push(relay.to_string());
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_relay_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -944,10 +1025,12 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
         self.ensure_relay_status_entries();
-        self.reload_daemon_if_running()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
 
         Ok(())
@@ -1011,10 +1094,6 @@ impl NvpnBackend {
             self.config.autoconnect = autoconnect;
         }
 
-        if let Some(lan_discovery_enabled) = patch.lan_discovery_enabled {
-            self.config.lan_discovery_enabled = lan_discovery_enabled;
-        }
-
         if let Some(launch_on_startup) = patch.launch_on_startup {
             self.config.launch_on_startup = launch_on_startup;
         }
@@ -1025,11 +1104,9 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.persist_config()?;
+        let persist_outcome = self.persist_config()?;
 
-        self.maybe_refresh_lan_discovery();
-
-        if restart_required {
+        if restart_required && persist_outcome.needs_explicit_daemon_reload() {
             self.reload_daemon_if_running()?;
         }
 
@@ -1039,23 +1116,48 @@ impl NvpnBackend {
 
     fn set_participant_alias(&mut self, npub: &str, alias: &str) -> Result<()> {
         self.config.set_peer_alias(npub, alias)?;
-        self.persist_config()?;
-        self.reload_daemon_if_running()?;
+        let persist_outcome = self.persist_config()?;
+        if persist_outcome.needs_explicit_daemon_reload() {
+            self.reload_daemon_if_running()?;
+        }
         self.sync_daemon_state();
         Ok(())
     }
 
-    fn persist_config(&mut self) -> Result<()> {
+    fn persist_config(&mut self) -> Result<PersistConfigOutcome> {
         if self.config.nostr.relays.is_empty() {
             return Err(anyhow!("at least one relay is required"));
         }
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
+
+        #[cfg(target_os = "windows")]
+        {
+            if windows_should_use_daemon_owned_config_apply(
+                &self.config_path,
+                windows_program_data_dir().as_deref(),
+                self.daemon_running,
+            ) {
+                match self.persist_config_via_running_daemon() {
+                    Ok(()) => {
+                        self.ensure_relay_status_entries();
+                        self.ensure_peer_status_entries();
+                        return Ok(PersistConfigOutcome::ReloadedRunningDaemon);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "gui: daemon-backed config apply failed, falling back to direct save: {error}"
+                        );
+                    }
+                }
+            }
+        }
+
         if let Err(error) = self.config.save(&self.config_path) {
             #[cfg(target_os = "windows")]
             {
-                if requires_admin_privileges(&error.to_string()) {
+                if requires_admin_privileges_error(&error) {
                     self.persist_config_with_admin_privileges()?;
                 } else {
                     return Err(error);
@@ -1069,7 +1171,45 @@ impl NvpnBackend {
         }
         self.ensure_relay_status_entries();
         self.ensure_peer_status_entries();
-        Ok(())
+        Ok(PersistConfigOutcome::SavedLocally)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn persist_config_via_running_daemon(&self) -> Result<()> {
+        let temp_path = windows_temp_config_import_path();
+        self.config.save(&temp_path).with_context(|| {
+            format!(
+                "failed to stage config for daemon import {}",
+                temp_path.display()
+            )
+        })?;
+
+        let result = (|| {
+            let source = temp_path
+                .to_str()
+                .ok_or_else(|| anyhow!("temp config path is not valid UTF-8"))?;
+            let target = self
+                .config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?;
+            let output =
+                self.run_nvpn_command(windows_daemon_config_import_args(source, target))?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Err(anyhow!(
+                "nvpn apply-config-daemon failed\nstdout: {}\nstderr: {}",
+                stdout.trim(),
+                stderr.trim()
+            ))
+        })();
+
+        let _ = fs::remove_file(&temp_path);
+        result
     }
 
     #[cfg(target_os = "windows")]
@@ -1821,8 +1961,9 @@ impl NvpnBackend {
 
         #[cfg(target_os = "windows")]
         {
+            let normalized_args = normalize_windows_elevated_args(args);
             let status = runas::Command::new(nvpn_bin)
-                .args(&args)
+                .args(&normalized_args)
                 .status()
                 .context("failed to execute elevated nvpn command via Windows UAC prompt")?;
 
@@ -2462,9 +2603,7 @@ impl NvpnBackend {
     }
 
     fn tick(&mut self) {
-        self.maybe_refresh_lan_discovery();
-        self.handle_lan_discovery_events();
-        self.prune_lan_peers();
+        self.refresh_lan_pairing();
         self.maybe_perform_pending_launch_action();
         self.sync_daemon_state();
     }
@@ -2502,91 +2641,55 @@ impl NvpnBackend {
         }
     }
 
-    fn lan_discovery_should_run(&self) -> bool {
-        self.config.lan_discovery_enabled || self.config.all_participant_pubkeys_hex().is_empty()
-    }
-
-    fn maybe_refresh_lan_discovery(&mut self) {
-        let should_run = self.lan_discovery_should_run();
-
-        if should_run && !self.lan_discovery_running {
-            self.start_lan_discovery();
-        } else if !should_run && self.lan_discovery_running {
-            self.stop_lan_discovery();
-            self.lan_peers.clear();
+    fn refresh_lan_pairing(&mut self) {
+        if self.lan_pairing_running && self.lan_pairing_remaining_secs() == 0 {
+            self.stop_lan_pairing();
+            return;
         }
+
+        self.handle_lan_pairing_events();
+        self.prune_lan_peers();
     }
 
-    fn start_lan_discovery(&mut self) {
-        let own_npub = self
-            .config
-            .own_nostr_pubkey_hex()
-            .map(|hex| to_npub(&hex))
-            .unwrap_or_else(|_| self.config.nostr.public_key.clone());
-        let node_name = self.config.node_name.clone();
-        let endpoint = self.config.node.endpoint.clone();
-
-        let (tx, rx) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = stop.clone();
-
-        self.runtime.spawn(async move {
-            run_lan_discovery_loop(tx, stop_flag, own_npub, node_name, endpoint).await;
-        });
-
-        self.lan_discovery_rx = Some(rx);
-        self.lan_discovery_stop = Some(stop);
-        self.lan_discovery_running = true;
+    fn lan_pairing_remaining_secs(&self) -> u64 {
+        self.lan_pairing_expires_at
+            .and_then(|expires_at| expires_at.duration_since(SystemTime::now()).ok())
+            .map(|remaining| remaining.as_secs())
+            .unwrap_or(0)
     }
 
-    fn stop_lan_discovery(&mut self) {
-        if let Some(stop) = self.lan_discovery_stop.take() {
-            stop.store(true, Ordering::Relaxed);
-        }
-        self.lan_discovery_rx = None;
-        self.lan_discovery_running = false;
-    }
-
-    fn handle_lan_discovery_events(&mut self) {
-        let own_npub = self
-            .config
-            .own_nostr_pubkey_hex()
-            .map(|hex| to_npub(&hex))
-            .unwrap_or_default();
-
+    fn handle_lan_pairing_events(&mut self) {
         let recv_result = self
-            .lan_discovery_rx
+            .lan_pairing_rx
             .as_ref()
             .map(|receiver| receiver.try_recv());
 
         match recv_result {
             Some(Ok(event)) => {
-                if event.npub == own_npub {
-                    return;
-                }
-
                 self.lan_peers.insert(
                     event.npub.clone(),
                     LanPeerRecord {
                         npub: event.npub,
                         node_name: event.node_name,
                         endpoint: event.endpoint,
+                        network_name: event.network_name,
+                        network_id: event.network_id,
+                        invite: event.invite,
                         last_seen: event.seen_at,
                     },
                 );
 
-                if let Some(receiver) = &self.lan_discovery_rx {
+                if let Some(receiver) = &self.lan_pairing_rx {
                     while let Ok(event) = receiver.try_recv() {
-                        if event.npub == own_npub {
-                            continue;
-                        }
-
                         self.lan_peers.insert(
                             event.npub.clone(),
                             LanPeerRecord {
                                 npub: event.npub,
                                 node_name: event.node_name,
                                 endpoint: event.endpoint,
+                                network_name: event.network_name,
+                                network_id: event.network_id,
+                                invite: event.invite,
                                 last_seen: event.seen_at,
                             },
                         );
@@ -2594,9 +2697,11 @@ impl NvpnBackend {
                 }
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                self.lan_discovery_running = false;
-                self.lan_discovery_rx = None;
-                self.lan_discovery_stop = None;
+                self.lan_pairing_running = false;
+                self.lan_pairing_rx = None;
+                self.lan_pairing_stop = None;
+                self.lan_pairing_expires_at = None;
+                self.lan_peers.clear();
             }
             _ => {}
         }
@@ -2606,7 +2711,7 @@ impl NvpnBackend {
         self.lan_peers.retain(|_, peer| {
             peer.last_seen
                 .elapsed()
-                .map(|elapsed| elapsed.as_secs() <= LAN_DISCOVERY_STALE_AFTER_SECS)
+                .map(|elapsed| elapsed.as_secs() <= LAN_PAIRING_STALE_AFTER_SECS)
                 .unwrap_or(false)
         });
     }
@@ -2614,18 +2719,10 @@ impl NvpnBackend {
     fn lan_peer_rows(&self) -> Vec<LanPeerView> {
         let mut peers = self.lan_peers.values().cloned().collect::<Vec<_>>();
         peers.sort_by(|left, right| left.npub.cmp(&right.npub));
-        let configured_npubs = self
-            .config
-            .all_participant_pubkeys_hex()
-            .iter()
-            .filter_map(|value| self.npub_or_none(value))
-            .collect::<HashSet<_>>();
 
         peers
             .into_iter()
             .map(|peer| {
-                let configured = configured_npubs.contains(&peer.npub);
-
                 let last_seen_secs = peer
                     .last_seen
                     .elapsed()
@@ -2636,8 +2733,10 @@ impl NvpnBackend {
                     npub: peer.npub,
                     node_name: peer.node_name,
                     endpoint: peer.endpoint,
+                    network_name: peer.network_name,
+                    network_id: peer.network_id,
+                    invite: peer.invite,
                     last_seen_text: format!("{last_seen_secs}s ago"),
-                    configured,
                 }
             })
             .collect()
@@ -2745,7 +2844,8 @@ impl NvpnBackend {
                 .config
                 .auto_disconnect_relays_when_mesh_ready,
             autoconnect: self.config.autoconnect,
-            lan_discovery_enabled: self.lan_discovery_should_run(),
+            lan_pairing_active: self.lan_pairing_running && self.lan_pairing_remaining_secs() > 0,
+            lan_pairing_remaining_secs: self.lan_pairing_remaining_secs(),
             launch_on_startup: self.config.launch_on_startup,
             close_to_tray_on_close: self.config.close_to_tray_on_close,
             connected_peer_count,
@@ -3106,7 +3206,7 @@ impl Drop for NvpnBackend {
     fn drop(&mut self) {
         #[cfg(target_os = "android")]
         let _ = self.android_session.stop();
-        self.stop_lan_discovery();
+        self.stop_lan_pairing();
     }
 }
 
@@ -3281,6 +3381,13 @@ fn requires_admin_privileges(message: &str) -> bool {
         || lower.contains("admin privileges")
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn requires_admin_privileges_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| requires_admin_privileges(&cause.to_string()))
+}
+
 fn service_state_refresh_due(
     last_refresh_at: Option<Instant>,
     now: Instant,
@@ -3294,6 +3401,51 @@ fn service_state_refresh_due(
 #[cfg(any(target_os = "windows", test))]
 fn windows_elevated_config_import_args<'a>(source: &'a str, target: &'a str) -> [&'a str; 5] {
     ["apply-config", "--source", source, "--config", target]
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_daemon_config_import_args<'a>(source: &'a str, target: &'a str) -> [&'a str; 5] {
+    [
+        "apply-config-daemon",
+        "--source",
+        source,
+        "--config",
+        target,
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_elevated_args<const N: usize>(args: [&str; N]) -> Vec<OsString> {
+    args.into_iter()
+        .map(|arg| OsString::from(strip_windows_verbatim_prefix(arg)))
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn strip_windows_verbatim_prefix(value: &str) -> &str {
+    value.strip_prefix(r"\\?\").unwrap_or(value)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_should_use_daemon_owned_config_apply(
+    config_path: &Path,
+    windows_program_data_dir: Option<&std::path::Path>,
+    daemon_running: bool,
+) -> bool {
+    if !daemon_running {
+        return false;
+    }
+
+    let Some(machine_config_path) =
+        windows_machine_config_path_from_program_data_dir(windows_program_data_dir)
+    else {
+        return false;
+    };
+
+    let current = config_path.display().to_string();
+    let machine = machine_config_path.display().to_string();
+    strip_windows_verbatim_prefix(&current)
+        .eq_ignore_ascii_case(strip_windows_verbatim_prefix(&machine))
 }
 
 #[cfg(target_os = "windows")]
@@ -3535,23 +3687,47 @@ fn to_npub(pubkey_hex: &str) -> String {
         .unwrap_or_else(|| pubkey_hex.to_string())
 }
 
-async fn run_lan_discovery_loop(
-    tx: mpsc::Sender<LanDiscoverySignal>,
+fn decode_lan_pairing_announcement(payload: &[u8], own_npub: &str) -> Option<LanPairingSignal> {
+    let parsed = serde_json::from_slice::<LanAnnouncement>(payload).ok()?;
+    if parsed.v != LAN_PAIRING_ANNOUNCEMENT_VERSION || parsed.npub == own_npub {
+        return None;
+    }
+
+    let invite = parse_network_invite(&parsed.invite).ok()?;
+    if invite.inviter_npub != parsed.npub {
+        return None;
+    }
+
+    Some(LanPairingSignal {
+        npub: parsed.npub,
+        node_name: parsed.node_name,
+        endpoint: parsed.endpoint,
+        network_name: invite.network_name,
+        network_id: invite.network_id,
+        invite: parsed.invite,
+        seen_at: SystemTime::now(),
+    })
+}
+
+async fn run_lan_pairing_loop(
+    tx: mpsc::Sender<LanPairingSignal>,
     stop_flag: Arc<AtomicBool>,
     own_npub: String,
     node_name: String,
     endpoint: String,
+    invite: String,
 ) {
+    let started_at = Instant::now();
     let multicast = std::net::Ipv4Addr::new(
-        LAN_DISCOVERY_ADDR[0],
-        LAN_DISCOVERY_ADDR[1],
-        LAN_DISCOVERY_ADDR[2],
-        LAN_DISCOVERY_ADDR[3],
+        LAN_PAIRING_ADDR[0],
+        LAN_PAIRING_ADDR[1],
+        LAN_PAIRING_ADDR[2],
+        LAN_PAIRING_ADDR[3],
     );
-    let target = std::net::SocketAddr::from((LAN_DISCOVERY_ADDR, LAN_DISCOVERY_PORT));
+    let target = std::net::SocketAddr::from((LAN_PAIRING_ADDR, LAN_PAIRING_PORT));
 
     let std_socket =
-        match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, LAN_DISCOVERY_PORT)) {
+        match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, LAN_PAIRING_PORT)) {
             Ok(socket) => socket,
             Err(_) => return,
         };
@@ -3574,20 +3750,23 @@ async fn run_lan_discovery_loop(
 
     let mut announce_interval = tokio::time::interval(Duration::from_secs(3));
     let mut idle_interval = tokio::time::interval(Duration::from_millis(250));
-    let mut buffer = [0_u8; 2048];
+    let mut buffer = [0_u8; LAN_PAIRING_BUFFER_BYTES];
 
     loop {
-        if stop_flag.load(Ordering::Relaxed) {
+        if stop_flag.load(Ordering::Relaxed)
+            || started_at.elapsed() >= Duration::from_secs(LAN_PAIRING_DURATION_SECS)
+        {
             return;
         }
 
         tokio::select! {
             _ = announce_interval.tick() => {
                 let message = LanAnnouncement {
-                    v: 1,
+                    v: LAN_PAIRING_ANNOUNCEMENT_VERSION,
                     npub: own_npub.clone(),
                     node_name: node_name.clone(),
                     endpoint: endpoint.clone(),
+                    invite: invite.clone(),
                     timestamp: unix_timestamp(),
                 };
 
@@ -3597,16 +3776,9 @@ async fn run_lan_discovery_loop(
             }
             recv = socket.recv_from(&mut buffer) => {
                 if let Ok((len, _)) = recv
-                    && let Ok(parsed) = serde_json::from_slice::<LanAnnouncement>(&buffer[..len])
-                    && parsed.v == 1
-                    && parsed.npub != own_npub
+                    && let Some(signal) = decode_lan_pairing_announcement(&buffer[..len], &own_npub)
                 {
-                    let _ = tx.send(LanDiscoverySignal {
-                        npub: parsed.npub,
-                        node_name: parsed.node_name,
-                        endpoint: parsed.endpoint,
-                        seen_at: SystemTime::now(),
-                    });
+                    let _ = tx.send(signal);
                 }
             }
             _ = idle_interval.tick() => {}
@@ -4577,6 +4749,36 @@ async fn import_network_invite(
 }
 
 #[tauri::command]
+async fn start_lan_pairing(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, move |backend| {
+        backend.start_lan_pairing()?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+async fn stop_lan_pairing(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, move |backend| {
+        backend.stop_lan_pairing();
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
 async fn remove_participant(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -5012,6 +5214,8 @@ pub fn run() {
             set_network_enabled,
             add_participant,
             import_network_invite,
+            start_lan_pairing,
+            stop_lan_pairing,
             remove_participant,
             set_participant_alias,
             add_relay,
@@ -5038,28 +5242,33 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::{
         ConfiguredPeerStatus, DaemonPeerState, DaemonRuntimeState, GuiLaunchDisposition,
-        IOS_TAURI_ORIGIN, NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend,
-        ParticipantView, PeerPresenceStatus, PendingLaunchAction, RuntimePlatform,
-        TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID,
-        TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
-        apply_network_invite_to_active_network, bundled_nvpn_candidate_paths,
-        cli_binary_installed_at, config_path_from_roots, desktop_config_path_from_roots,
-        expected_peer_count, extract_json_document, gui_launch_disposition,
-        gui_requires_service_enable, gui_requires_service_install, ios_runtime_status_detail,
-        ios_vpn_session_control_supported, is_already_running_message, is_mesh_complete,
-        is_not_running_message, network_device_count, network_online_device_count,
-        parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
-        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
-        peer_state_label, pending_launch_action, run_blocking_mutex_action,
-        runtime_capabilities_for_platform, should_defer_gui_daemon_start_to_service_on_autostart,
+        IOS_TAURI_ORIGIN, LAN_PAIRING_ANNOUNCEMENT_VERSION, LAN_PAIRING_DURATION_SECS,
+        NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend, ParticipantView,
+        PeerPresenceStatus, PendingLaunchAction, RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID,
+        TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState,
+        active_network_invite_code, apply_network_invite_to_active_network,
+        bundled_nvpn_candidate_paths, cli_binary_installed_at, config_path_from_roots,
+        decode_lan_pairing_announcement, desktop_config_path_from_roots, expected_peer_count,
+        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
+        gui_requires_service_install, ios_runtime_status_detail, ios_vpn_session_control_supported,
+        is_already_running_message, is_mesh_complete, is_not_running_message, network_device_count,
+        network_online_device_count, parse_advertised_routes_input, parse_exit_node_input,
+        parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
+        peer_presence_state_label, peer_state_label, pending_launch_action,
+        run_blocking_mutex_action, runtime_capabilities_for_platform,
+        should_defer_gui_daemon_start_to_service_on_autostart,
         should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args,
-        tauri_protocol_request_path, to_npub, tray_exit_node_entries, tray_identity_text,
-        tray_menu_spec, tray_network_groups, tray_status_text, tray_vpn_status_menu_text,
-        tray_vpn_toggle_text, validate_nvpn_binary, windows_elevated_config_import_args,
-        within_peer_online_grace, within_peer_presence_grace,
+        strip_windows_verbatim_prefix, tauri_protocol_request_path, to_npub,
+        tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
+        tray_status_text, tray_vpn_status_menu_text, tray_vpn_toggle_text, validate_nvpn_binary,
+        windows_daemon_config_import_args, windows_elevated_config_import_args,
+        windows_should_use_daemon_owned_config_apply, within_peer_online_grace,
+        within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
@@ -5093,9 +5302,10 @@ mod tests {
             force_connect_pending: false,
             relay_status: HashMap::new(),
             peer_status: HashMap::new(),
-            lan_discovery_running: false,
-            lan_discovery_rx: None,
-            lan_discovery_stop: None,
+            lan_pairing_running: false,
+            lan_pairing_rx: None,
+            lan_pairing_stop: None,
+            lan_pairing_expires_at: None,
             lan_peers: HashMap::new(),
             magic_dns_status: String::new(),
         }
@@ -5515,6 +5725,123 @@ mod tests {
     }
 
     #[test]
+    fn decode_lan_pairing_announcement_extracts_invite_metadata() {
+        let inviter_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let inviter_npub = to_npub(&inviter_hex);
+        let invite = format!(
+            "{NETWORK_INVITE_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&NetworkInvite {
+                    v: 1,
+                    network_name: "Home".to_string(),
+                    network_id: "mesh-home".to_string(),
+                    inviter_npub: inviter_npub.clone(),
+                    relays: vec!["wss://relay.one.example".to_string()],
+                })
+                .expect("invite payload"),
+            )
+        );
+        let payload = serde_json::to_vec(&super::LanAnnouncement {
+            v: LAN_PAIRING_ANNOUNCEMENT_VERSION,
+            npub: inviter_npub.clone(),
+            node_name: "home-server".to_string(),
+            endpoint: "192.168.1.20:51820".to_string(),
+            invite: invite.clone(),
+            timestamp: 123,
+        })
+        .expect("announcement payload");
+
+        let parsed =
+            decode_lan_pairing_announcement(&payload, "npub1self").expect("announcement parses");
+
+        assert_eq!(parsed.npub, inviter_npub);
+        assert_eq!(parsed.node_name, "home-server");
+        assert_eq!(parsed.endpoint, "192.168.1.20:51820");
+        assert_eq!(parsed.network_name, "Home");
+        assert_eq!(parsed.network_id, "mesh-home");
+        assert_eq!(parsed.invite, invite);
+    }
+
+    #[test]
+    fn decode_lan_pairing_announcement_rejects_invites_for_other_identities() {
+        let announcer_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let other_hex =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let payload = serde_json::to_vec(&super::LanAnnouncement {
+            v: LAN_PAIRING_ANNOUNCEMENT_VERSION,
+            npub: to_npub(&announcer_hex),
+            node_name: "home-server".to_string(),
+            endpoint: "192.168.1.20:51820".to_string(),
+            invite: format!(
+                "{NETWORK_INVITE_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&NetworkInvite {
+                        v: 1,
+                        network_name: "Home".to_string(),
+                        network_id: "mesh-home".to_string(),
+                        inviter_npub: to_npub(&other_hex),
+                        relays: vec!["wss://relay.one.example".to_string()],
+                    })
+                    .expect("invite payload"),
+                )
+            ),
+            timestamp: 123,
+        })
+        .expect("announcement payload");
+
+        assert!(decode_lan_pairing_announcement(&payload, "npub1self").is_none());
+    }
+
+    #[test]
+    fn lan_pairing_start_sets_countdown_and_expiry_stops_it() {
+        let participant = "44".repeat(32);
+        let mut backend = test_backend(&participant);
+
+        backend.start_lan_pairing().expect("pairing should start");
+        let pairing_ui = backend.ui_state();
+
+        assert!(pairing_ui.lan_pairing_active);
+        assert!(pairing_ui.lan_pairing_remaining_secs > 0);
+        assert!(pairing_ui.lan_pairing_remaining_secs <= LAN_PAIRING_DURATION_SECS);
+
+        backend.lan_pairing_expires_at = Some(SystemTime::now() - Duration::from_secs(1));
+        backend.tick();
+        let expired_ui = backend.ui_state();
+
+        assert!(!expired_ui.lan_pairing_active);
+        assert_eq!(expired_ui.lan_pairing_remaining_secs, 0);
+        assert!(backend.lan_peers.is_empty());
+    }
+
+    #[test]
+    fn lan_peer_rows_include_invite_metadata_for_join_actions() {
+        let participant = "55".repeat(32);
+        let invite = format!("{NETWORK_INVITE_PREFIX}payload-123");
+        let mut backend = test_backend(&participant);
+        backend.lan_peers.insert(
+            "npub1alice".to_string(),
+            super::LanPeerRecord {
+                npub: "npub1alice".to_string(),
+                node_name: "alice-laptop".to_string(),
+                endpoint: "192.168.1.40:51820".to_string(),
+                network_name: "Home".to_string(),
+                network_id: "mesh-home".to_string(),
+                invite: invite.clone(),
+                last_seen: SystemTime::now() - Duration::from_secs(2),
+            },
+        );
+
+        let rows = backend.lan_peer_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].network_name, "Home");
+        assert_eq!(rows[0].network_id, "mesh-home");
+        assert_eq!(rows[0].invite, invite);
+    }
+
+    #[test]
     fn extract_invite_from_deep_link_accepts_nvpn_invite_urls() {
         let invite = format!("{NETWORK_INVITE_PREFIX}payload-123");
         assert_eq!(
@@ -5930,6 +6257,14 @@ mod tests {
     }
 
     #[test]
+    fn admin_privilege_detection_matches_windows_error_chain_context() {
+        let error = anyhow::anyhow!("Access is denied.")
+            .context(r"failed to write \\?\C:\ProgramData\Nostr VPN\config.toml");
+
+        assert!(super::requires_admin_privileges_error(&error));
+    }
+
+    #[test]
     fn gui_launch_autoconnect_skips_direct_start_until_service_exists() {
         assert!(!should_start_gui_daemon_on_launch(true, true, true, true));
         assert!(should_start_gui_daemon_on_launch(true, true, true, false));
@@ -6196,6 +6531,65 @@ mod tests {
                 "--config",
                 r"C:\ProgramData\Nostr VPN\config.toml",
             ]
+        );
+    }
+
+    #[test]
+    fn windows_daemon_config_import_command_uses_source_and_target_paths() {
+        let args = windows_daemon_config_import_args(
+            r"C:\Users\sirius\AppData\Local\Temp\nvpn-import.toml",
+            r"C:\ProgramData\Nostr VPN\config.toml",
+        );
+
+        assert_eq!(
+            args,
+            [
+                "apply-config-daemon",
+                "--source",
+                r"C:\Users\sirius\AppData\Local\Temp\nvpn-import.toml",
+                "--config",
+                r"C:\ProgramData\Nostr VPN\config.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_daemon_owned_config_apply_only_targets_machine_config_with_running_daemon() {
+        assert!(windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"C:\ProgramData\Nostr VPN\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            true,
+        ));
+        assert!(windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"\\?\C:\ProgramData\Nostr VPN\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            true,
+        ));
+        assert!(!windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"C:\Users\sirius\AppData\Roaming\nvpn\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            true,
+        ));
+        assert!(!windows_should_use_daemon_owned_config_apply(
+            std::path::Path::new(r"C:\ProgramData\Nostr VPN\config.toml"),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            false,
+        ));
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_keeps_non_verbatim_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"C:\ProgramData\Nostr VPN\config.toml"),
+            r"C:\ProgramData\Nostr VPN\config.toml"
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_removes_local_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\ProgramData\Nostr VPN\config.toml"),
+            r"C:\ProgramData\Nostr VPN\config.toml"
         );
     }
 

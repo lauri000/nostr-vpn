@@ -73,7 +73,8 @@ pub struct AppConfig {
     pub node_name: String,
     #[serde(default = "default_auto_disconnect_relays_when_mesh_ready")]
     pub auto_disconnect_relays_when_mesh_ready: bool,
-    #[serde(default = "default_lan_discovery_enabled")]
+    // Legacy field kept so older config files still deserialize cleanly.
+    #[serde(default = "default_lan_discovery_enabled", skip_serializing)]
     pub lan_discovery_enabled: bool,
     #[serde(default = "default_launch_on_startup")]
     pub launch_on_startup: bool,

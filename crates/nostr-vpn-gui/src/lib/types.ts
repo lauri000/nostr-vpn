@@ -45,8 +45,10 @@ export interface LanPeerView {
   npub: string
   nodeName: string
   endpoint: string
+  networkName: string
+  networkId: string
+  invite: string
   lastSeenText: string
-  configured: boolean
 }
 
 export interface HealthIssue {
@@ -119,7 +121,8 @@ export interface UiState {
   magicDnsStatus: string
   autoDisconnectRelaysWhenMeshReady: boolean
   autoconnect: boolean
-  lanDiscoveryEnabled: boolean
+  lanPairingActive: boolean
+  lanPairingRemainingSecs: number
   launchOnStartup: boolean
   closeToTrayOnClose: boolean
   connectedPeerCount: number
@@ -145,7 +148,6 @@ export interface SettingsPatch {
   magicDnsSuffix?: string
   autoDisconnectRelaysWhenMeshReady?: boolean
   autoconnect?: boolean
-  lanDiscoveryEnabled?: boolean
   launchOnStartup?: boolean
   closeToTrayOnClose?: boolean
 }

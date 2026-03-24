@@ -1,5 +1,7 @@
 # nostr-vpn
 
+> Main development is on [decentralized git](https://git.iris.to/#/npub1xdhnr9mrv47kkrn95k6cwecearydeh8e895990n3acntwvmgk2dsdeeycm/nostr-vpn): `htree://npub1xdhnr9mrv47kkrn95k6cwecearydeh8e895990n3acntwvmgk2dsdeeycm/nostr-vpn`
+
 ## Downloads
 
 - [Latest release](https://github.com/mmalmi/nostr-vpn/releases/latest)
@@ -50,7 +52,7 @@ It currently ships:
 - Tracks peer endpoints, including NAT-discovered public endpoints and hole-punch attempts
 - Supports route advertisement and exit-node selection
 - Exposes JSON status, relay checks, network diagnostics, and doctor bundles
-- Includes a desktop GUI with service-first session control, invite QR/import flows, tray integration, autostart, LAN discovery, MagicDNS controls, health reporting, and port-mapping status
+- Includes a desktop GUI with service-first session control, invite QR/import flows, tray integration, autostart, timed LAN pairing, MagicDNS controls, health reporting, and port-mapping status
 - Includes Linux-focused Docker e2e coverage for signaling, mesh formation, NAT traversal, and exit-node routing
 
 ## Default relays
@@ -74,7 +76,7 @@ By default, `nvpn` uses the OS config directory:
 
 The config contains:
 
-- global app settings such as autoconnect, LAN discovery, tray behavior, and MagicDNS suffix
+- global app settings such as autoconnect, tray behavior, and MagicDNS suffix
 - Nostr settings including relay URLs and identity keys
 - NAT settings including STUN servers, reflectors, and discovery timeout
 - node settings including endpoint, tunnel IP, listen port, and advertised routes
@@ -287,7 +289,7 @@ Notes:
 - `tauri:dev` and `tauri:build` automatically prepare an `nvpn` sidecar binary for desktop targets
 - on desktop, the frontend shells out to `nvpn`; mobile targets use the in-app platform-specific VPN runtime code
 - the desktop app is service-first on supported platforms: install the background service first, then use the app for normal on/off control
-- the GUI exposes network membership, invite QR/import flows, relay state, session health, MagicDNS, exit-node selection, advertised routes, LAN discovery, autostart, and tray controls
+- the GUI exposes network membership, invite QR/import flows, relay state, session health, MagicDNS, exit-node selection, advertised routes, timed LAN pairing, LAN discovery, autostart, and tray controls
 - tagged releases currently publish Apple Silicon macOS, Windows x64, and Android arm64 app artifacts
 - the iOS target is checked in for source builds, but the release workflow does not currently publish an iOS artifact
 

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { NetworkView, SettingsPatch, UiState } from './types'
+import type { LanPeerView, NetworkView, SettingsPatch, UiState } from './types'
 
 declare const __APP_VERSION__: string
 
@@ -97,6 +97,24 @@ const computeMockEffectiveAdvertisedRoutes = () => {
   return effective
 }
 
+const defaultMockLanPeers = (): LanPeerView[] => [
+  {
+    npub: 'npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m',
+    nodeName: 'home-server',
+    endpoint: '192.168.1.20:51820',
+    networkName: 'Home',
+    networkId: 'mesh-home',
+    invite: encodeInvitePayload({
+      v: 1,
+      networkName: 'Home',
+      networkId: 'mesh-home',
+      inviterNpub: 'npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m',
+      relays: ['wss://temp.iris.to', 'wss://relay.damus.io'],
+    }),
+    lastSeenText: '2s ago',
+  },
+]
+
 const mockState: UiState = {
   platform: 'desktop',
   mobile: false,
@@ -135,7 +153,8 @@ const mockState: UiState = {
   magicDnsStatus: 'System DNS active for .nvpn via 127.0.0.1:1053',
   autoDisconnectRelaysWhenMeshReady: true,
   autoconnect: true,
-  lanDiscoveryEnabled: true,
+  lanPairingActive: true,
+  lanPairingRemainingSecs: 11 * 60 + 42,
   launchOnStartup: true,
   closeToTrayOnClose: true,
   connectedPeerCount: 0,
@@ -172,16 +191,10 @@ const mockState: UiState = {
     { url: 'wss://nos.lol', state: 'unknown', statusText: 'not checked' },
   ],
   relaySummary: { up: 0, down: 0, checking: 0, unknown: 3 },
-  lanPeers: [
-    {
-      npub: 'npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m',
-      nodeName: 'home-server',
-      endpoint: '192.168.1.20:51820',
-      lastSeenText: '2s ago',
-      configured: false,
-    },
-  ],
+  lanPeers: defaultMockLanPeers(),
 }
+
+let mockLanPairingEndsAt = Date.now() + mockState.lanPairingRemainingSecs * 1000
 
 const cloneMockState = () => structuredClone(mockState)
 
@@ -239,22 +252,36 @@ const recomputeMockConnectivity = () => {
     mockState.connectedPeerCount >= mockState.expectedPeerCount
 }
 
-const refreshMockLanConfigured = () => {
-  const configured = new Set(
-    mockState.networks.flatMap((network) =>
-      network.participants.map((participant) => participant.npub),
-    ),
-  )
+const refreshMockLanPairing = () => {
+  if (mockLanPairingEndsAt === null) {
+    mockState.lanPairingActive = false
+    mockState.lanPairingRemainingSecs = 0
+    mockState.lanPeers = []
+    return
+  }
 
-  mockState.lanPeers = mockState.lanPeers.map((peer) => ({
-    ...peer,
-    configured: configured.has(peer.npub),
-  }))
+  const remainingSecs = Math.max(
+    Math.ceil((mockLanPairingEndsAt - Date.now()) / 1000),
+    0,
+  )
+  if (remainingSecs === 0) {
+    mockLanPairingEndsAt = null
+    mockState.lanPairingActive = false
+    mockState.lanPairingRemainingSecs = 0
+    mockState.lanPeers = []
+    return
+  }
+
+  mockState.lanPairingActive = true
+  mockState.lanPairingRemainingSecs = remainingSecs
+  if (mockState.lanPeers.length === 0) {
+    mockState.lanPeers = defaultMockLanPeers()
+  }
 }
 
 const asResult = async () => {
   recomputeMockConnectivity()
-  refreshMockLanConfigured()
+  refreshMockLanPairing()
   mockState.effectiveAdvertisedRoutes = computeMockEffectiveAdvertisedRoutes()
   return cloneMockState()
 }
@@ -539,6 +566,24 @@ export const importNetworkInvite = (invite: string) =>
         return asResult()
       })()
 
+export const startLanPairing = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('start_lan_pairing')
+    : (() => {
+        mockLanPairingEndsAt = Date.now() + 15 * 60 * 1000
+        mockState.lanPeers = defaultMockLanPeers()
+        return asResult()
+      })()
+
+export const stopLanPairing = () =>
+  isTauriRuntime()
+    ? invoke<UiState>('stop_lan_pairing')
+    : (() => {
+        mockLanPairingEndsAt = null
+        mockState.lanPeers = []
+        return asResult()
+      })()
+
 export const removeParticipant = (networkId: string, npub: string) =>
   isTauriRuntime()
     ? invoke<UiState>('remove_participant', { networkId, npub })
@@ -655,9 +700,6 @@ export const updateSettings = (patch: SettingsPatch) =>
         }
         if (patch.autoconnect !== undefined) {
           mockState.autoconnect = patch.autoconnect
-        }
-        if (patch.lanDiscoveryEnabled !== undefined) {
-          mockState.lanDiscoveryEnabled = patch.lanDiscoveryEnabled
         }
         if (patch.launchOnStartup !== undefined) {
           mockState.launchOnStartup = patch.launchOnStartup

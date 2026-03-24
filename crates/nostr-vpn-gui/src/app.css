@@ -422,9 +422,14 @@ body {
 
 .mesh-share-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
   flex-wrap: wrap;
   margin-top: 10px;
+}
+
+.lan-pairing-timer {
+  font-variant-numeric: tabular-nums;
 }
 
 .spotlight-profile-fields {

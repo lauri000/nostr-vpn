@@ -251,6 +251,9 @@ enum Command {
     /// Internal config import helper for elevated GUI writes.
     #[command(hide = true)]
     ApplyConfig(ApplyConfigArgs),
+    /// Internal daemon-backed config import helper for GUI writes.
+    #[command(hide = true)]
+    ApplyConfigDaemon(ApplyConfigArgs),
     /// Broadcast this node's presence signal over Nostr.
     Announce {
         #[arg(long)]
@@ -1163,6 +1166,10 @@ async fn run_command(command: Command) -> Result<()> {
         Command::ApplyConfig(args) => {
             let config_path = args.config.unwrap_or_else(default_config_path);
             apply_config_file(&args.source, &config_path)?;
+        }
+        Command::ApplyConfigDaemon(args) => {
+            let config_path = args.config.unwrap_or_else(default_config_path);
+            apply_config_via_running_daemon(&args.source, &config_path)?;
         }
         Command::Announce {
             config,
@@ -5165,7 +5172,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             }
             _ = state_interval.tick() => {
                 if let Some(request) = take_daemon_control_request(&config_path) {
-                    match request {
+                    let control_result = match request {
                         DaemonControlRequest::Stop => break,
                         DaemonControlRequest::Pause => {
                             if relay_connected {
@@ -5198,6 +5205,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             } else {
                                 session_status = "Paused".to_string();
                             }
+                            Ok(())
                         }
                         DaemonControlRequest::Resume => {
                             if !session_enabled {
@@ -5269,8 +5277,11 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                     session_status = WAITING_FOR_PARTICIPANTS_STATUS.to_string();
                                 }
                             }
+                            Ok(())
                         }
                         DaemonControlRequest::Reload => {
+                            match update_daemon_config_from_staged_request(&config_path) {
+                                Ok(staged_config_applied) => {
                             match load_config_with_overrides(
                                 &config_path,
                                 network_override.clone(),
@@ -5392,13 +5403,26 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                         )
                                         .await;
                                     }
+                                    Ok(())
                                 }
                                 Err(error) => {
-                                    session_status = format!("Config reload failed ({})", error);
+                                    session_status = if staged_config_applied {
+                                        format!("Config apply failed (reload: {error})")
+                                    } else {
+                                        format!("Config reload failed ({error})")
+                                    };
+                                    Err(error)
+                                }
+                            }
+                                }
+                                Err(error) => {
+                                    session_status = format!("Config apply failed ({error})");
+                                    Err(error)
                                 }
                             }
                         }
-                    }
+                    };
+                    let _ = write_daemon_control_result(&config_path, request, control_result);
                     let _ = persist_daemon_runtime_state(
                         &state_file,
                         &app,
@@ -6159,11 +6183,32 @@ fn daemon_control_file_path(config_path: &Path) -> PathBuf {
     parent.join("daemon.control")
 }
 
+fn daemon_control_result_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("daemon.control.result.json")
+}
+
+fn daemon_staged_config_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("config.pending.toml")
+}
+
 fn daemon_peer_cache_file_path(config_path: &Path) -> PathBuf {
     let parent = config_path
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
     parent.join("daemon.mesh-cache.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonControlResult {
+    request: String,
+    ok: bool,
+    error: Option<String>,
 }
 
 fn ensure_no_other_daemon_processes_for_config(config_path: &Path, current_pid: u32) -> Result<()> {
@@ -6192,12 +6237,135 @@ fn write_daemon_control_request(config_path: &Path, request: DaemonControlReques
     Ok(())
 }
 
+fn clear_daemon_control_result(config_path: &Path) {
+    let _ = fs::remove_file(daemon_control_result_file_path(config_path));
+}
+
+fn write_daemon_control_result(
+    config_path: &Path,
+    request: DaemonControlRequest,
+    result: Result<()>,
+) -> Result<()> {
+    let result_file = daemon_control_result_file_path(config_path);
+    if let Some(parent) = result_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let payload = match result {
+        Ok(()) => DaemonControlResult {
+            request: request.as_str().to_string(),
+            ok: true,
+            error: None,
+        },
+        Err(error) => DaemonControlResult {
+            request: request.as_str().to_string(),
+            ok: false,
+            error: Some(error.to_string()),
+        },
+    };
+    let raw = serde_json::to_vec_pretty(&payload)?;
+    write_runtime_file_atomically(&result_file, &raw)
+        .with_context(|| format!("failed to write {}", result_file.display()))?;
+    set_daemon_runtime_file_permissions(&result_file)?;
+    Ok(())
+}
+
+fn read_daemon_control_result(config_path: &Path) -> Result<Option<DaemonControlResult>> {
+    let result_file = daemon_control_result_file_path(config_path);
+    if !result_file.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&result_file)
+        .with_context(|| format!("failed to read {}", result_file.display()))?;
+    let parsed = serde_json::from_str::<DaemonControlResult>(&raw)
+        .with_context(|| format!("failed to parse {}", result_file.display()))?;
+    Ok(Some(parsed))
+}
+
+fn wait_for_daemon_control_result(
+    config_path: &Path,
+    request: DaemonControlRequest,
+    timeout: Duration,
+) -> Result<()> {
+    let result_file = daemon_control_result_file_path(config_path);
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(result) = read_daemon_control_result(config_path)?
+            && result.request == request.as_str()
+        {
+            let _ = fs::remove_file(&result_file);
+            return if result.ok {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "{}",
+                    result
+                        .error
+                        .unwrap_or_else(|| "daemon control request failed".to_string())
+                ))
+            };
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(anyhow!(
+        "daemon did not report result for {} within {}s; restart the daemon with a newer nvpn binary",
+        request.as_str(),
+        timeout.as_secs()
+    ))
+}
+
+fn stage_daemon_config_apply(config_path: &Path, source_path: &Path) -> Result<()> {
+    let staged_path = daemon_staged_config_file_path(config_path);
+    if let Some(parent) = staged_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = fs::read(source_path)
+        .with_context(|| format!("failed to read source config {}", source_path.display()))?;
+    write_runtime_file_atomically(&staged_path, &raw)
+        .with_context(|| format!("failed to stage config {}", staged_path.display()))?;
+    set_private_cache_file_permissions(&staged_path)?;
+    Ok(())
+}
+
+fn update_daemon_config_from_staged_request(config_path: &Path) -> Result<bool> {
+    let staged_path = daemon_staged_config_file_path(config_path);
+    if !staged_path.exists() {
+        return Ok(false);
+    }
+
+    let result = apply_config_file(&staged_path, config_path);
+    let _ = fs::remove_file(&staged_path);
+    result?;
+    Ok(true)
+}
+
 fn request_daemon_stop(config_path: &Path) -> Result<()> {
     write_daemon_control_request(config_path, DaemonControlRequest::Stop)
 }
 
 fn request_daemon_reload(config_path: &Path) -> Result<()> {
     write_daemon_control_request(config_path, DaemonControlRequest::Reload)
+}
+
+fn apply_config_via_running_daemon(source_path: &Path, config_path: &Path) -> Result<()> {
+    let status = daemon_status(config_path)?;
+    if !status.running {
+        return Err(anyhow!("daemon: not running"));
+    }
+
+    clear_daemon_control_result(config_path);
+    stage_daemon_config_apply(config_path, source_path)?;
+    request_daemon_reload(config_path)?;
+    wait_for_daemon_control_ack(config_path, Duration::from_secs(3))?;
+    wait_for_daemon_control_result(
+        config_path,
+        DaemonControlRequest::Reload,
+        Duration::from_secs(3),
+    )
 }
 
 fn wait_for_daemon_control_ack(config_path: &Path, timeout: Duration) -> Result<()> {
@@ -9589,19 +9757,19 @@ mod tests {
         can_reuse_active_listen_port, connected_peer_count_for_runtime, daemon_control_file_path,
         daemon_peer_cache_file_path, daemon_peer_transport_state, daemon_pids_from_ps_output,
         daemon_reconnect_backoff_delay, daemon_session_active, daemon_session_idle_status,
-        default_cli_install_path, endpoint_with_listen_port, install_cli,
-        is_uapi_addr_in_use_error, key_b64_to_hex, kill_error_requires_control_fallback,
-        linux_default_route_device_from_output, linux_exit_node_default_route_families,
-        linux_exit_node_firewall_binary, linux_exit_node_forward_in_rule,
-        linux_exit_node_forward_out_rule, linux_exit_node_ipv4_masquerade_rule,
-        linux_exit_node_source_cidr, linux_ipv4_route_source, linux_route_get_spec_from_output,
-        linux_route_target_is_ipv4, linux_service_status_from_show_output,
-        load_config_with_overrides, local_interface_address_for_tunnel,
-        macos_service_disabled_from_print_disabled_output, nat_punch_targets,
-        nat_punch_targets_for_local_endpoint, nat_punch_targets_for_local_endpoints,
-        parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
-        peer_path_cache_timeout_secs, peer_runtime_lookup, peer_signal_timeout_secs,
-        pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
+        daemon_staged_config_file_path, default_cli_install_path, endpoint_with_listen_port,
+        install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
+        kill_error_requires_control_fallback, linux_default_route_device_from_output,
+        linux_exit_node_default_route_families, linux_exit_node_firewall_binary,
+        linux_exit_node_forward_in_rule, linux_exit_node_forward_out_rule,
+        linux_exit_node_ipv4_masquerade_rule, linux_exit_node_source_cidr, linux_ipv4_route_source,
+        linux_route_get_spec_from_output, linux_route_target_is_ipv4,
+        linux_service_status_from_show_output, load_config_with_overrides,
+        local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
+        nat_punch_targets, nat_punch_targets_for_local_endpoint,
+        nat_punch_targets_for_local_endpoints, parse_exit_node_arg, parse_nonzero_pid,
+        peer_has_recent_handshake, peer_path_cache_timeout_secs, peer_runtime_lookup,
+        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
         persisted_peer_cache_timeout_secs, planned_tunnel_peers,
         planned_tunnel_peers_for_local_endpoints, public_endpoint_for_listen_port,
         public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
@@ -9610,7 +9778,8 @@ mod tests {
         relay_connection_action, request_daemon_reload, request_daemon_stop,
         restore_daemon_peer_cache, route_targets_for_tunnel_peers,
         route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
-        take_daemon_control_request, uninstall_cli, utun_interface_candidates,
+        stage_daemon_config_apply, take_daemon_control_request, uninstall_cli,
+        update_daemon_config_from_staged_request, utun_interface_candidates,
         windows_service_bin_path, windows_service_disabled_from_qc_output,
         windows_service_status_from_query_output, write_daemon_peer_cache,
     };
@@ -11654,6 +11823,62 @@ mod tests {
         let loaded = AppConfig::load(&target).expect("load target config");
         assert_eq!(loaded.node_name, "windows-box");
         assert_eq!(loaded.participant_pubkeys_hex(), vec!["ab".repeat(32)]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_daemon_config_apply_writes_staged_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-stage-config-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let source = dir.join("source.toml");
+        let target = dir.join("config.toml");
+        let mut config = AppConfig::generated();
+        config.node_name = "staged-node".to_string();
+        config.save(&source).expect("save source config");
+
+        stage_daemon_config_apply(&target, &source).expect("stage config should succeed");
+
+        let staged = daemon_staged_config_file_path(&target);
+        let loaded = AppConfig::load(&staged).expect("load staged config");
+        assert_eq!(loaded.node_name, "staged-node");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_daemon_config_from_staged_request_replaces_target_and_cleans_up() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-stage-apply-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let source = dir.join("source.toml");
+        let target = dir.join("config.toml");
+        let mut source_config = AppConfig::generated();
+        source_config.node_name = "service-owned".to_string();
+        source_config.save(&source).expect("save source config");
+
+        let mut target_config = AppConfig::generated();
+        target_config.node_name = "old-name".to_string();
+        target_config.save(&target).expect("save target config");
+
+        stage_daemon_config_apply(&target, &source).expect("stage config should succeed");
+        update_daemon_config_from_staged_request(&target).expect("apply staged config");
+
+        let loaded = AppConfig::load(&target).expect("load target config");
+        assert_eq!(loaded.node_name, "service-owned");
+        assert!(
+            !daemon_staged_config_file_path(&target).exists(),
+            "staged config should be cleaned up"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

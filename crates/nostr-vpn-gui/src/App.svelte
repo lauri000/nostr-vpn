@@ -4,6 +4,10 @@
   import QRCode from 'qrcode'
 
   import { dispatchBootReady, waitForNextPaint } from './lib/boot.js'
+  import {
+    lanPairingDeadlineFromSnapshot,
+    remainingSecsFromDeadline,
+  } from './lib/countdown.js'
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
   import {
     canonicalizeMeshIdInput,
@@ -31,6 +35,8 @@
     setNetworkMeshId,
     setParticipantAlias,
     setAutostartEnabled,
+    startLanPairing,
+    stopLanPairing,
     tick,
     uninstallCli,
     uninstallSystemService,
@@ -82,6 +88,7 @@
 
   const debouncers = new Map<string, number>()
   let pollHandle: number | null = null
+  let lanPairingTickHandle: number | null = null
   let copiedHandle: number | null = null
   let refreshInFlight = false
   let actionInFlight = false
@@ -94,6 +101,8 @@
   let trayBehaviorSupported = false
   let bootReadyDispatched = false
   let appDisposed = false
+  let lanPairingDeadlineMs: number | null = null
+  let lanPairingDisplayRemainingSecs = 0
 
   const NETWORK_MESH_ID_IDLE_COMMIT_MS = 5000
 
@@ -486,6 +495,39 @@
     }
   }
 
+  const formatCountdown = (totalSecs: number) => {
+    const minutes = Math.floor(totalSecs / 60)
+    const seconds = totalSecs % 60
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`
+  }
+
+  const lanPairingHelpText = (state: UiState) =>
+    state.lanPairingActive
+      ? 'Nearby devices can join this mesh directly while pairing is active.'
+      : 'Broadcast this invite on the local network for 15 minutes so nearby devices can join.'
+
+  function syncLanPairingCountdown() {
+    const now = Date.now()
+    lanPairingDeadlineMs = lanPairingDeadlineFromSnapshot(
+      lanPairingDeadlineMs,
+      !!state?.lanPairingActive,
+      state?.lanPairingRemainingSecs ?? 0,
+      now,
+    )
+    lanPairingDisplayRemainingSecs = remainingSecsFromDeadline(lanPairingDeadlineMs, now)
+  }
+
+  function tickLanPairingCountdown() {
+    lanPairingDisplayRemainingSecs = remainingSecsFromDeadline(lanPairingDeadlineMs, Date.now())
+  }
+
+  $: if (state) {
+    syncLanPairingCountdown()
+  } else {
+    lanPairingDeadlineMs = null
+    lanPairingDisplayRemainingSecs = 0
+  }
+
   async function refresh() {
     if (refreshInFlight || actionInFlight) {
       return
@@ -854,8 +896,16 @@
     }
   }
 
-  async function onAddLanPeer(networkId: string, npub: string) {
-    await runAction(() => addParticipant(networkId, npub, ''))
+  async function onJoinLanPeer(invite: string) {
+    await runAction(() => importNetworkInvite(invite))
+  }
+
+  async function onStartLanPairing() {
+    await runAction(() => startLanPairing())
+  }
+
+  async function onStopLanPairing() {
+    await runAction(() => stopLanPairing())
   }
 
   async function onImportInvite() {
@@ -1000,6 +1050,8 @@
   }
 
   onMount(() => {
+    lanPairingTickHandle = window.setInterval(tickLanPairingCountdown, 1000)
+
     void (async () => {
       await waitForNextPaint(window)
       if (appDisposed) {
@@ -1025,6 +1077,9 @@
     appDisposed = true
     if (pollHandle) {
       window.clearInterval(pollHandle)
+    }
+    if (lanPairingTickHandle) {
+      window.clearInterval(lanPairingTickHandle)
     }
     if (copiedHandle) {
       window.clearTimeout(copiedHandle)
@@ -1287,7 +1342,7 @@
         </div>
         <div class="spotlight-meta-card spotlight-share-card">
           <div class="panel-kicker">Join & share</div>
-          <div class="spotlight-meta-value">Copy, scan, or paste</div>
+          <div class="spotlight-meta-value">Copy, scan, or pair</div>
           <div class="config-path">
             Includes the Mesh ID, your npub, and the relay list for {activeNetworkView.name}.
           </div>
@@ -1302,7 +1357,20 @@
               </span>
               <span>{copiedValue === 'invite' ? 'Copied' : 'Copy Invite'}</span>
             </button>
+            <button
+              class="btn"
+              data-testid="lan-pairing-toggle"
+              on:click={state.lanPairingActive ? onStopLanPairing : onStartLanPairing}
+            >
+              {state.lanPairingActive ? 'Stop LAN Pairing' : 'Start LAN Pairing'}
+            </button>
+            {#if state.lanPairingActive}
+              <span class="badge warn lan-pairing-timer">
+                {formatCountdown(lanPairingDisplayRemainingSecs)} left
+              </span>
+            {/if}
           </div>
+          <div class="config-path">{lanPairingHelpText(state)}</div>
           {#if inviteQrDataUrl}
             <div class="invite-qr-wrap">
               <img class="invite-qr" src={inviteQrDataUrl} alt={`Invite QR for ${activeNetworkView.name}`} />
@@ -1311,13 +1379,36 @@
           {:else if inviteQrError}
             <div class="config-path">{inviteQrError}</div>
           {/if}
+          {#if state.lanPairingActive}
+            {@const lanJoinCandidates = state.lanPeers.filter((peer) => !networkHasParticipant(activeNetworkView, peer.npub))}
+            <div class="lan-title">Nearby pairing devices</div>
+            {#if lanJoinCandidates.length === 0}
+              <div class="config-path">Listening for invite broadcasts from nearby devices.</div>
+            {:else}
+              <div class="stack rows">
+                {#each lanJoinCandidates as peer}
+                  <div class="item-row" data-testid="lan-peer-row">
+                    <div class="item-main">
+                      <div class="item-title">{peer.networkName || short(peer.npub, 22, 12)}</div>
+                      <div class="item-sub">
+                        {peer.nodeName} | {short(peer.npub, 18, 12)} | {peer.endpoint} | seen {peer.lastSeenText}
+                      </div>
+                    </div>
+                    <button class="btn" on:click={() => onJoinLanPeer(peer.invite)}>
+                      Join
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          {/if}
         </div>
       </div>
 
       <div class="participant-add-panel network-onboarding-panel">
         <div class="participant-add-label">Add devices</div>
         <div class="invite-help">
-          Fastest: paste an invite from another device. That sets the mesh ID, adds that device, and merges its relays.
+          Fastest: paste an invite from another device. LAN pairing can also broadcast yours nearby for 15 minutes.
         </div>
         <div class="invite-import-fields">
           <input
@@ -1367,24 +1458,11 @@
         </div>
       </div>
 
-      <label class="toggle-row lan-discovery-toggle">
-        <input
-          type="checkbox"
-          checked={state.lanDiscoveryEnabled}
-          data-testid="lan-discovery-toggle"
-          on:change={(event) =>
-            onUpdateSettings({
-              lanDiscoveryEnabled: (event.currentTarget as HTMLInputElement).checked,
-            })}
-        />
-        LAN discovery (multicast)
-      </label>
-
       {#if activeNetworkView.participants.length === 0}
         <div class="item-row network-empty-state">
           <div class="item-main">
             <div class="item-title">No devices yet</div>
-            <div class="item-sub">Add participant npubs to start building the active mesh.</div>
+            <div class="item-sub">Import an invite, start LAN pairing, or add a participant npub to start building the active mesh.</div>
           </div>
         </div>
       {:else}
@@ -1450,25 +1528,6 @@
         </div>
       {/if}
 
-      {#if state.lanDiscoveryEnabled}
-        {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(activeNetworkView, peer.npub))}
-        {#if unconfiguredLan.length > 0}
-          <div class="lan-title">LAN peers</div>
-          <div class="stack rows">
-            {#each unconfiguredLan as peer}
-              <div class="item-row" data-testid="lan-peer-row">
-                <div class="item-main">
-                  <div class="item-title">{short(peer.npub, 22, 12)}</div>
-                  <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
-                </div>
-                <button class="btn" on:click={() => onAddLanPeer(activeNetworkView.id, peer.npub)}>
-                  Add
-                </button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      {/if}
     </section>
 
     <section class="panel exit-node-panel">
@@ -1761,25 +1820,6 @@
                     </div>
                   {/if}
 
-                  {#if state.lanDiscoveryEnabled}
-                    {@const unconfiguredLan = state.lanPeers.filter((peer) => !networkHasParticipant(network, peer.npub))}
-                    {#if unconfiguredLan.length > 0}
-                      <div class="lan-title">LAN peers</div>
-                      <div class="stack rows">
-                        {#each unconfiguredLan as peer}
-                          <div class="item-row" data-testid="lan-peer-row">
-                            <div class="item-main">
-                              <div class="item-title">{short(peer.npub, 22, 12)}</div>
-                              <div class="item-sub">{peer.nodeName} | {peer.endpoint} | seen {peer.lastSeenText}</div>
-                            </div>
-                            <button class="btn" on:click={() => onAddLanPeer(network.id, peer.npub)}>
-                              Add
-                            </button>
-                          </div>
-                        {/each}
-                      </div>
-                    {/if}
-                  {/if}
                 </details>
               </section>
             {/each}
