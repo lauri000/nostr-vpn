@@ -22,7 +22,7 @@ else
 fi
 
 log() {
-  printf '[deploy] %s\n' "$*"
+  printf '[deploy] %s\n' "$*" >&2
 }
 
 die() {
@@ -38,6 +38,14 @@ build_flag() {
   if [[ "$BUILD_PROFILE" == "release" ]]; then
     printf '%s' '--release'
   fi
+}
+
+vm_nvpn_path() {
+  local profile_dir="debug"
+  if [[ "$BUILD_PROFILE" == "release" ]]; then
+    profile_dir="release"
+  fi
+  printf '%s/target/%s/nvpn' "$VM_DIR" "$profile_dir"
 }
 
 ssh_run() {
@@ -95,29 +103,6 @@ run_requested_scripts() {
   fi
 }
 
-summarize() {
-  local ssh_cmd="ssh"
-  local rebuild_cmd="cd $(printf '%q' "$VM_DIR") && cargo build -p nostr-vpn-cli -p nostr-vpn-relay"
-
-  if [[ -n "$VM_PORT" ]]; then
-    ssh_cmd+=" -p $VM_PORT"
-  fi
-  if [[ "$BUILD_PROFILE" == "release" ]]; then
-    rebuild_cmd+=" --release"
-  fi
-
-  cat <<EOF
-
-Deployment complete.
-
-VM repo: $VM_DIR
-
-Suggested next commands:
-  ${ssh_cmd} "$SSH_TARGET"
-  ${ssh_cmd} "$SSH_TARGET" "bash -lc $(printf '%q' "$rebuild_cmd")"
-EOF
-}
-
 main() {
   [[ -n "$VM_HOST" ]] || die "set VM_HOST to the Ubuntu VM hostname or IP"
 
@@ -126,7 +111,7 @@ main() {
   rsync_repo
   build_remote
   run_requested_scripts
-  summarize
+  vm_nvpn_path
 }
 
 main "$@"
