@@ -3255,6 +3255,10 @@ fn relay_connection_action(
     }
 }
 
+fn should_prune_control_plane_freshness(relays_paused_for_mesh: bool, mesh_healthy: bool) -> bool {
+    !(relays_paused_for_mesh && mesh_healthy)
+}
+
 fn daemon_session_active(session_enabled: bool, expected_peers: usize) -> bool {
     session_enabled && expected_peers > 0
 }
@@ -4507,18 +4511,37 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
             _ = announce_interval.tick() => {
                 let now = unix_timestamp();
                 let signal_timeout_secs = peer_signal_timeout_secs(args.announce_interval_secs);
-                let removed = presence.prune_stale_control_plane_state(now, signal_timeout_secs);
-                for participant in &removed {
-                    outbound_announces.forget(participant);
-                }
+                let pre_prune_mesh_policy = mesh_health_snapshot(
+                    &app,
+                    own_pubkey.as_deref(),
+                    expected_peers,
+                    &presence,
+                    &tunnel_runtime,
+                    now,
+                );
+                let should_prune_freshness = should_prune_control_plane_freshness(
+                    relays_paused_for_mesh,
+                    pre_prune_mesh_policy.mesh_healthy,
+                );
+                let removed = if should_prune_freshness {
+                    let removed = presence.prune_stale_control_plane_state(now, signal_timeout_secs);
+                    for participant in &removed {
+                        outbound_announces.forget(participant);
+                    }
+                    removed
+                } else {
+                    Vec::new()
+                };
                 let paths_pruned =
                     path_book.prune_stale(now, peer_path_cache_timeout_secs(args.announce_interval_secs));
-                let recent = recently_seen_participants(
-                    &presence,
-                    now,
-                    signal_timeout_secs,
-                );
-                outbound_announces.retain_participants(&recent);
+                if should_prune_freshness {
+                    let recent = recently_seen_participants(
+                        &presence,
+                        now,
+                        signal_timeout_secs,
+                    );
+                    outbound_announces.retain_participants(&recent);
+                }
                 if !removed.is_empty() {
                     info!(
                         phase = "announce_interval",
@@ -5490,21 +5513,39 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
                 if daemon_session_active(session_enabled, expected_peers) {
                     let now = unix_timestamp();
-                    let removed = presence.prune_stale_control_plane_state(
+                    let signal_timeout_secs = peer_signal_timeout_secs(args.announce_interval_secs);
+                    let pre_prune_mesh_policy = mesh_health_snapshot(
+                        &app,
+                        own_pubkey.as_deref(),
+                        expected_peers,
+                        &presence,
+                        &tunnel_runtime,
                         now,
-                        peer_signal_timeout_secs(args.announce_interval_secs),
                     );
-                    for participant in &removed {
-                        outbound_announces.forget(participant);
-                    }
+                    let should_prune_freshness = should_prune_control_plane_freshness(
+                        relays_paused_for_mesh,
+                        pre_prune_mesh_policy.mesh_healthy,
+                    );
+                    let removed = if should_prune_freshness {
+                        let removed =
+                            presence.prune_stale_control_plane_state(now, signal_timeout_secs);
+                        for participant in &removed {
+                            outbound_announces.forget(participant);
+                        }
+                        removed
+                    } else {
+                        Vec::new()
+                    };
                     let paths_pruned =
                         path_book.prune_stale(now, peer_path_cache_timeout_secs(args.announce_interval_secs));
-                    let recent = recently_seen_participants(
-                        &presence,
-                        now,
-                        peer_signal_timeout_secs(args.announce_interval_secs),
-                    );
-                    outbound_announces.retain_participants(&recent);
+                    if should_prune_freshness {
+                        let recent = recently_seen_participants(
+                            &presence,
+                            now,
+                            signal_timeout_secs,
+                        );
+                        outbound_announces.retain_participants(&recent);
+                    }
                     if !removed.is_empty() || paths_pruned {
                         last_nat_punch_attempt = None;
                     }
@@ -9706,6 +9747,7 @@ mod tests {
         relay_connection_action, request_daemon_reload, request_daemon_stop,
         restore_daemon_peer_cache, route_targets_for_tunnel_peers,
         route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
+        should_prune_control_plane_freshness,
         take_daemon_control_request, uninstall_cli, utun_interface_candidates,
         windows_service_bin_path, windows_service_disabled_from_qc_output,
         windows_service_status_from_query_output, write_daemon_peer_cache,
@@ -11044,6 +11086,13 @@ mod tests {
             relay_connection_action(false, true, true),
             super::RelayConnectionAction::KeepConnected
         );
+    }
+
+    #[test]
+    fn paused_mesh_skips_control_plane_freshness_prune() {
+        assert!(!should_prune_control_plane_freshness(true, true));
+        assert!(should_prune_control_plane_freshness(true, false));
+        assert!(should_prune_control_plane_freshness(false, true));
     }
 
     #[test]
