@@ -47,6 +47,8 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoadsInWebContent: true
           NSAllowsLocalNetworking: true
+        NSCameraUsageDescription: Scan Nostr VPN invite QR codes.
+        NSPhotoLibraryUsageDescription: Select a saved invite QR image to join a network.
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
@@ -58,8 +60,8 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.2.11
-        CFBundleVersion: "0.2.11"
+        CFBundleShortVersionString: 0.2.14
+        CFBundleVersion: "0.2.14"
     entitlements:
       path: nostr-vpn-gui_iOS/nostr-vpn-gui_iOS.entitlements
     scheme:
@@ -110,8 +112,8 @@ targets:
     info:
       path: PacketTunnel/Info.plist
       properties:
-        CFBundleShortVersionString: "0.2.11"
-        CFBundleVersion: "0.2.11"
+        CFBundleShortVersionString: "0.2.14"
+        CFBundleVersion: "0.2.14"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
@@ -141,9 +143,9 @@ targets:
           set -euo pipefail
           plist="${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
           /usr/libexec/PlistBuddy -c "Delete :CFBundleShortVersionString" "${plist}" || true
-          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.2.11" "${plist}"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.2.14" "${plist}"
           /usr/libexec/PlistBuddy -c "Delete :CFBundleVersion" "${plist}" || true
-          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 0.2.11" "${plist}"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 0.2.14" "${plist}"
           /usr/libexec/PlistBuddy -c "Delete :NSExtension" "${plist}" || true
           /usr/libexec/PlistBuddy -c "Add :NSExtension dict" "${plist}"
           /usr/libexec/PlistBuddy -c "Add :NSExtension:NSExtensionPointIdentifier string com.apple.networkextension.packet-tunnel" "${plist}"

@@ -3001,18 +3001,29 @@ fn apply_network_invite_to_active_network(
     config: &mut AppConfig,
     invite: &NetworkInvite,
 ) -> Result<()> {
-    let should_adopt_name = {
-        let active = config.active_network();
-        active.participants.is_empty()
-            && (active.name.trim().is_empty() || active.name.trim().starts_with("Network "))
+    let normalized_invite_network_id = normalize_runtime_network_id(&invite.network_id);
+    let target_network_entry_id = if let Some(existing) = config.networks.iter().find(|network| {
+        normalize_runtime_network_id(&network.network_id) == normalized_invite_network_id
+    }) {
+        existing.id.clone()
+    } else if network_should_adopt_invite(config.active_network()) {
+        config.active_network().id.clone()
+    } else {
+        let network_id = config.add_network(&invite.network_name);
+        config.set_network_enabled(&network_id, true)?;
+        network_id
     };
-    let active_network_entry_id = config.active_network().id.clone();
+    let should_adopt_name = config
+        .network_by_id(&target_network_entry_id)
+        .map(network_should_adopt_invite)
+        .unwrap_or(false);
 
-    config.set_active_network_id(&invite.network_id)?;
-    config.add_participant_to_network(&active_network_entry_id, &invite.inviter_npub)?;
+    config.set_network_enabled(&target_network_entry_id, true)?;
+    config.set_network_mesh_id(&target_network_entry_id, &invite.network_id)?;
+    config.add_participant_to_network(&target_network_entry_id, &invite.inviter_npub)?;
 
     if should_adopt_name {
-        config.rename_network(&active_network_entry_id, &invite.network_name)?;
+        config.rename_network(&target_network_entry_id, &invite.network_name)?;
     }
 
     for relay in &invite.relays {
@@ -3022,6 +3033,11 @@ fn apply_network_invite_to_active_network(
     }
 
     Ok(())
+}
+
+fn network_should_adopt_invite(network: &nostr_vpn_core::config::NetworkConfig) -> bool {
+    let trimmed = network.name.trim();
+    network.participants.is_empty() && (trimmed.is_empty() || trimmed.starts_with("Network "))
 }
 
 fn normalized_invite_relays(relays: &[String]) -> Result<Vec<String>> {
@@ -5722,6 +5738,109 @@ mod tests {
                 "wss://invite.example".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn applying_network_invite_reuses_existing_matching_network_and_activates_it() {
+        let work_peer_hex = AppConfig::generated()
+            .own_nostr_pubkey_hex()
+            .expect("work peer hex");
+        let work_peer_npub = to_npub(&work_peer_hex);
+        let home_peer_hex = AppConfig::generated()
+            .own_nostr_pubkey_hex()
+            .expect("home peer hex");
+        let home_peer_npub = to_npub(&home_peer_hex);
+        let inviter_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let invite = NetworkInvite {
+            v: 1,
+            network_name: "Home".to_string(),
+            network_id: "mesh-home".to_string(),
+            inviter_npub: to_npub(&inviter_hex),
+            relays: vec!["wss://invite.example".to_string()],
+        };
+        let mut config = AppConfig::generated();
+        let work_id = config.networks[0].id.clone();
+        config.networks[0].name = "Work".to_string();
+        config
+            .set_active_network_id("mesh-work")
+            .expect("work mesh id");
+        config
+            .add_participant_to_network(&work_id, &work_peer_npub)
+            .expect("work peer");
+        let home_id = config.add_network("Home");
+        config
+            .set_network_mesh_id(&home_id, "mesh-home")
+            .expect("home mesh id");
+        config
+            .add_participant_to_network(&home_id, &home_peer_npub)
+            .expect("home peer");
+
+        apply_network_invite_to_active_network(&mut config, &invite).expect("invite should apply");
+
+        let work = config.network_by_id(&work_id).expect("work network exists");
+        let home = config.network_by_id(&home_id).expect("home network exists");
+
+        assert!(!work.enabled);
+        assert_eq!(work.name, "Work");
+        assert_eq!(work.network_id, "mesh-work");
+        assert_eq!(work.participants, vec![work_peer_hex]);
+
+        assert!(home.enabled);
+        assert_eq!(home.name, "Home");
+        assert_eq!(home.network_id, "mesh-home");
+        let mut expected_participants = vec![home_peer_hex, inviter_hex];
+        expected_participants.sort();
+        assert_eq!(home.participants, expected_participants);
+        assert_eq!(config.effective_network_id(), "mesh-home");
+    }
+
+    #[test]
+    fn applying_network_invite_creates_new_network_when_active_network_is_populated() {
+        let work_peer_hex = AppConfig::generated()
+            .own_nostr_pubkey_hex()
+            .expect("work peer hex");
+        let work_peer_npub = to_npub(&work_peer_hex);
+        let inviter_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let invite = NetworkInvite {
+            v: 1,
+            network_name: "Home".to_string(),
+            network_id: "mesh-home".to_string(),
+            inviter_npub: to_npub(&inviter_hex),
+            relays: vec!["wss://invite.example".to_string()],
+        };
+        let mut config = AppConfig::generated();
+        let work_id = config.networks[0].id.clone();
+        config.networks[0].name = "Work".to_string();
+        config
+            .set_active_network_id("mesh-work")
+            .expect("work mesh id");
+        config
+            .add_participant_to_network(&work_id, &work_peer_npub)
+            .expect("work peer");
+
+        apply_network_invite_to_active_network(&mut config, &invite).expect("invite should apply");
+
+        assert_eq!(config.networks.len(), 2);
+
+        let work = config.network_by_id(&work_id).expect("work network exists");
+        let home = config
+            .networks
+            .iter()
+            .find(|network| network.id != work_id)
+            .expect("home network exists");
+
+        assert!(!work.enabled);
+        assert_eq!(work.name, "Work");
+        assert_eq!(work.network_id, "mesh-work");
+        assert_eq!(work.participants, vec![work_peer_hex]);
+
+        assert!(home.enabled);
+        assert_eq!(home.name, "Home");
+        assert_eq!(home.network_id, "mesh-home");
+        assert_eq!(home.participants, vec![inviter_hex]);
+        assert_eq!(config.effective_network_id(), "mesh-home");
     }
 
     #[test]

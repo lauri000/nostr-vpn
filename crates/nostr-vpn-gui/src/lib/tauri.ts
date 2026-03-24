@@ -1,4 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
+import {
+  decodeInvitePayload,
+  determineInviteImportTarget,
+  encodeInvitePayload,
+} from './invite-code.js'
 import type { LanPeerView, NetworkView, SettingsPatch, UiState } from './types'
 
 declare const __APP_VERSION__: string
@@ -16,7 +21,6 @@ const normalizeAlias = (value: string) =>
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/^-+|-+$/g, '')
 
-const NETWORK_INVITE_PREFIX = 'nvpn://invite/'
 const APP_VERSION = __APP_VERSION__
 
 type MockNetworkInvite = {
@@ -33,40 +37,6 @@ const pseudoHexFromNpub = (npub: string) => {
     .replace(/[^a-z0-9]/gi, '')
     .toLowerCase()
   return (seed + 'a'.repeat(64)).slice(0, 64)
-}
-
-const encodeInvitePayload = (payload: MockNetworkInvite) => {
-  const bytes = new TextEncoder().encode(JSON.stringify(payload))
-  let binary = ''
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte)
-  }
-  return `${NETWORK_INVITE_PREFIX}${btoa(binary)
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '')}`
-}
-
-const decodeInvitePayload = (invite: string): MockNetworkInvite => {
-  const trimmed = invite.trim()
-  if (!trimmed) {
-    throw new Error('Invite code is empty')
-  }
-
-  const payload = trimmed.startsWith('{')
-    ? trimmed
-    : trimmed.startsWith(NETWORK_INVITE_PREFIX)
-      ? trimmed.slice(NETWORK_INVITE_PREFIX.length)
-      : trimmed
-
-  if (payload.startsWith('{')) {
-    return JSON.parse(payload) as MockNetworkInvite
-  }
-
-  const padded = payload + '='.repeat((4 - (payload.length % 4 || 4)) % 4)
-  const binary = atob(padded.replace(/-/g, '+').replace(/_/g, '/'))
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
-  return JSON.parse(new TextDecoder().decode(bytes)) as MockNetworkInvite
 }
 
 const countExpectedPeers = (network: NetworkView) =>
@@ -221,6 +191,17 @@ const activateMockNetwork = (networkId: string) => {
     ...network,
     enabled: network.id === networkId,
   }))
+}
+
+const nextMockNetworkId = () => {
+  const index = mockState.networks.length + 1
+  let id = `network-${index}`
+  let suffix = 2
+  while (mockState.networks.some((network) => network.id === id)) {
+    id = `network-${index}-${suffix}`
+    suffix += 1
+  }
+  return id
 }
 
 const mockRequiresServiceSetup = () =>
@@ -426,12 +407,7 @@ export const addNetwork = (name: string) =>
     : (() => {
         const index = mockState.networks.length + 1
         const normalized = name.trim() || `Network ${index}`
-        let id = `network-${index}`
-        let suffix = 2
-        while (mockState.networks.some((network) => network.id === id)) {
-          id = `network-${index}-${suffix}`
-          suffix += 1
-        }
+        const id = nextMockNetworkId()
         mockState.networks.push({
           id,
           name: normalized,
@@ -532,22 +508,51 @@ export const importNetworkInvite = (invite: string) =>
   isTauriRuntime()
     ? invoke<UiState>('import_network_invite', { invite })
     : (() => {
-        const parsed = decodeInvitePayload(invite)
+        const parsed = decodeInvitePayload(invite) as MockNetworkInvite
         const activeNetwork = mockActiveNetwork()
         if (!activeNetwork) {
           return asResult()
         }
 
+        const importTarget = determineInviteImportTarget(
+          mockState.networks,
+          activeNetwork.id,
+          parsed.networkId,
+        )
+        let targetNetwork =
+          (importTarget.networkId &&
+            mockState.networks.find((network) => network.id === importTarget.networkId)) ||
+          null
+
+        if (importTarget.mode === 'create') {
+          const id = nextMockNetworkId()
+          targetNetwork = {
+            id,
+            name: parsed.networkName.trim() || `Network ${mockState.networks.length + 1}`,
+            enabled: false,
+            networkId: parsed.networkId.trim() || id.replace(/-/g, ''),
+            onlineCount: 0,
+            expectedCount: 0,
+            participants: [],
+          }
+          mockState.networks.push(targetNetwork)
+        }
+
+        if (!targetNetwork) {
+          targetNetwork = activeNetwork
+        }
+
         if (
           parsed.networkName.trim() &&
-          (activeNetwork.participants.length === 0 || /^Network \d+/.test(activeNetwork.name))
+          (targetNetwork.participants.length === 0 || /^Network \d+/.test(targetNetwork.name))
         ) {
-          activeNetwork.name = parsed.networkName.trim()
+          targetNetwork.name = parsed.networkName.trim()
         }
         if (parsed.networkId.trim()) {
-          activeNetwork.networkId = parsed.networkId.trim()
+          targetNetwork.networkId = parsed.networkId.trim()
         }
-        upsertMockParticipant(activeNetwork.id, parsed.inviterNpub)
+        activateMockNetwork(targetNetwork.id)
+        upsertMockParticipant(targetNetwork.id, parsed.inviterNpub)
         for (const relay of parsed.relays) {
           const normalizedRelay = relay.trim()
           if (
@@ -562,7 +567,7 @@ export const importNetworkInvite = (invite: string) =>
           }
         }
         updateMockRelaySummary()
-        mockState.sessionStatus = `Invite imported for ${parsed.networkName.trim() || activeNetwork.name}`
+        mockState.sessionStatus = `Invite imported for ${parsed.networkName.trim() || targetNetwork.name}`
         return asResult()
       })()
 

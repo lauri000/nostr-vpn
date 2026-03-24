@@ -902,6 +902,63 @@ body {
   align-items: center;
 }
 
+.invite-scan-actions {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.invite-scan-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.invite-scan-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.16);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.invite-scan-preview {
+  position: relative;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid rgba(117, 236, 255, 0.2);
+  background:
+    radial-gradient(circle at top, rgba(117, 236, 255, 0.18), transparent 56%),
+    linear-gradient(180deg, rgba(11, 18, 24, 0.94), rgba(10, 10, 10, 0.94));
+}
+
+.invite-scan-video {
+  display: block;
+  width: 100%;
+  min-height: 220px;
+  max-height: 320px;
+  object-fit: cover;
+}
+
+.invite-scan-reticle {
+  position: absolute;
+  inset: 50% auto auto 50%;
+  width: min(64vw, 220px);
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border: 2px solid rgba(117, 236, 255, 0.82);
+  border-radius: 18px;
+  box-shadow:
+    0 0 0 999px rgba(8, 11, 16, 0.34),
+    0 0 18px rgba(117, 236, 255, 0.2);
+}
+
 .participant-add-npub {
   min-width: 0;
 }
@@ -1319,6 +1376,15 @@ body {
 
   .invite-import-fields {
     grid-template-columns: 1fr;
+  }
+
+  .invite-scan-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .invite-scan-video {
+    min-height: 180px;
   }
 
   .inline-copy-field {

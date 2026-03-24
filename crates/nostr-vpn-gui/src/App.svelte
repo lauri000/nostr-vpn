@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
+  import jsQR from 'jsqr'
   import { Check, Copy, Trash2 } from 'lucide-svelte'
   import QRCode from 'qrcode'
 
@@ -9,6 +10,7 @@
     remainingSecsFromDeadline,
   } from './lib/countdown.js'
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
+  import { decodeInvitePayload, determineInviteImportTarget } from './lib/invite-code.js'
   import {
     canonicalizeMeshIdInput,
     formatMeshIdDraftForDisplay,
@@ -65,6 +67,15 @@
 
   let newNetworkName = ''
   let inviteInputDraft = ''
+  let inviteScanInput: HTMLInputElement | null = null
+  let inviteScanVideo: HTMLVideoElement | null = null
+  let inviteScanCanvas: HTMLCanvasElement | null = null
+  let inviteScanStream: MediaStream | null = null
+  let inviteScanOpen = false
+  let inviteScanBusy = false
+  let inviteScanStatus = ''
+  let inviteScanError = ''
+  let inviteScanFrameHandle: number | null = null
   let nodeNameDraft = ''
   let endpointDraft = ''
   let tunnelIpDraft = ''
@@ -277,6 +288,290 @@
     state.networks.find((network) => network.enabled) ?? state.networks[0]
 
   const inactiveNetworks = (state: UiState) => state.networks.filter((network) => !network.enabled)
+
+  const describeInviteScanError = (err: unknown) => {
+    const name =
+      err && typeof err === 'object' && 'name' in err ? String((err as { name?: unknown }).name) : ''
+    switch (name) {
+      case 'NotAllowedError':
+      case 'PermissionDeniedError':
+        return 'Camera access was denied. You can still scan a saved QR image.'
+      case 'NotFoundError':
+      case 'DevicesNotFoundError':
+        return 'No camera was found. You can still scan a saved QR image.'
+      case 'NotReadableError':
+      case 'TrackStartError':
+        return 'The camera is busy in another app. Close it there or scan a saved QR image.'
+      default:
+        return `Live QR scanning failed: ${String(err)}`
+    }
+  }
+
+  const ensureInviteScanCanvas = () => {
+    if (!inviteScanCanvas) {
+      inviteScanCanvas = document.createElement('canvas')
+    }
+    return inviteScanCanvas
+  }
+
+  const decodeInviteFromImageSource = (
+    source: CanvasImageSource,
+    width: number,
+    height: number,
+  ) => {
+    if (!width || !height) {
+      return null
+    }
+
+    const canvas = ensureInviteScanCanvas()
+    canvas.width = width
+    canvas.height = height
+    const context = canvas.getContext('2d', { willReadFrequently: true })
+    if (!context) {
+      throw new Error('QR scanner could not read image pixels')
+    }
+
+    context.drawImage(source, 0, 0, width, height)
+    const imageData = context.getImageData(0, 0, width, height)
+    return jsQR(imageData.data, width, height, {
+      inversionAttempts: 'attemptBoth',
+    })?.data?.trim() || null
+  }
+
+  const decodeInviteFromFile = async (file: File) => {
+    const objectUrl = URL.createObjectURL(file)
+    try {
+      const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const next = new Image()
+        next.onload = () => resolve(next)
+        next.onerror = () => reject(new Error('Could not read the selected image'))
+        next.src = objectUrl
+      })
+      const invite = decodeInviteFromImageSource(
+        image,
+        image.naturalWidth || image.width,
+        image.naturalHeight || image.height,
+      )
+      if (!invite) {
+        throw new Error('No QR code was found in the selected image')
+      }
+      return invite
+    } finally {
+      URL.revokeObjectURL(objectUrl)
+    }
+  }
+
+  const stopInviteScan = () => {
+    if (inviteScanFrameHandle !== null) {
+      window.cancelAnimationFrame(inviteScanFrameHandle)
+      inviteScanFrameHandle = null
+    }
+    if (inviteScanStream) {
+      for (const track of inviteScanStream.getTracks()) {
+        track.stop()
+      }
+      inviteScanStream = null
+    }
+    if (inviteScanVideo) {
+      inviteScanVideo.pause()
+      inviteScanVideo.srcObject = null
+    }
+    inviteScanBusy = false
+    inviteScanOpen = false
+  }
+
+  const queueInviteScanFrame = () => {
+    if (!inviteScanOpen) {
+      return
+    }
+
+    inviteScanFrameHandle = window.requestAnimationFrame(() => {
+      inviteScanFrameHandle = null
+      void scanInviteVideoFrame()
+    })
+  }
+
+  const buildInviteImportPrompt = (invite: {
+    networkName: string
+    networkId: string
+    inviterNpub: string
+  }) => {
+    const lines = [
+      `Import invite for "${invite.networkName}" from ${short(invite.inviterNpub, 18, 12)}?`,
+    ]
+
+    if (state) {
+      const importTarget = determineInviteImportTarget(
+        state.networks,
+        activeNetwork(state).id,
+        invite.networkId,
+      )
+      switch (importTarget.mode) {
+        case 'existing':
+          lines.push('This adds the scanned device to the matching network you already have.')
+          break
+        case 'reuse-active':
+          lines.push('This reuses your current empty network slot and fills it from the invite.')
+          break
+        case 'create':
+        default:
+          lines.push('This creates a new network entry so your current network stays untouched.')
+          break
+      }
+    }
+
+    lines.push('Press Cancel to fill the invite field instead of importing right away.')
+    return lines.join('\n\n')
+  }
+
+  type InviteImportOptions = {
+    updateDraft?: boolean
+    clearDraftOnSuccess?: boolean
+  }
+
+  const importInviteCode = async (invite: string, options: InviteImportOptions = {}) => {
+    const normalized = invite.trim()
+    if (!normalized) {
+      return false
+    }
+
+    if (options.updateDraft) {
+      inviteInputDraft = normalized
+    }
+
+    await runAction(() => importNetworkInvite(normalized))
+    const succeeded = !error
+    if (succeeded && options.clearDraftOnSuccess) {
+      inviteInputDraft = ''
+    }
+    return succeeded
+  }
+
+  const handleScannedInvite = async (invite: string) => {
+    const normalized = invite.trim()
+    let parsed
+    try {
+      parsed = decodeInvitePayload(normalized)
+    } catch (err) {
+      throw new Error(`Scanned QR is not a valid Nostr VPN invite: ${String(err)}`)
+    }
+
+    inviteScanError = ''
+    inviteScanStatus = ''
+
+    if (typeof window.confirm === 'function' && !window.confirm(buildInviteImportPrompt(parsed))) {
+      inviteInputDraft = normalized
+      inviteScanStatus = 'Invite loaded into the field. Press Import when ready.'
+      return
+    }
+
+    const imported = await importInviteCode(normalized, {
+      updateDraft: true,
+      clearDraftOnSuccess: true,
+    })
+    if (imported) {
+      inviteScanStatus = `Imported ${parsed.networkName}.`
+    }
+  }
+
+  async function scanInviteVideoFrame() {
+    if (!inviteScanOpen || !inviteScanVideo) {
+      return
+    }
+
+    if (
+      inviteScanVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      inviteScanVideo.videoWidth === 0 ||
+      inviteScanVideo.videoHeight === 0
+    ) {
+      queueInviteScanFrame()
+      return
+    }
+
+    const invite = decodeInviteFromImageSource(
+      inviteScanVideo,
+      inviteScanVideo.videoWidth,
+      inviteScanVideo.videoHeight,
+    )
+    if (!invite) {
+      queueInviteScanFrame()
+      return
+    }
+
+    stopInviteScan()
+    try {
+      await handleScannedInvite(invite)
+    } catch (err) {
+      inviteScanError = String(err)
+    }
+  }
+
+  async function onStartInviteScan() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      inviteScanError = 'Live QR scanning is unavailable here. Use Choose Image instead.'
+      return
+    }
+
+    stopInviteScan()
+    inviteScanError = ''
+    inviteScanStatus = 'Requesting camera access...'
+    inviteScanOpen = true
+    await waitForNextPaint(window)
+
+    if (!inviteScanVideo) {
+      inviteScanOpen = false
+      inviteScanStatus = ''
+      inviteScanError = 'Scanner preview could not open'
+      return
+    }
+
+    try {
+      inviteScanStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+        audio: false,
+      })
+      inviteScanVideo.srcObject = inviteScanStream
+      await inviteScanVideo.play()
+      inviteScanBusy = true
+      inviteScanStatus = 'Point the camera at an invite QR code.'
+      queueInviteScanFrame()
+    } catch (err) {
+      stopInviteScan()
+      inviteScanStatus = ''
+      inviteScanError = describeInviteScanError(err)
+    }
+  }
+
+  function onCloseInviteScan() {
+    stopInviteScan()
+    inviteScanStatus = ''
+  }
+
+  function onChooseInviteQrImage() {
+    stopInviteScan()
+    inviteScanError = ''
+    inviteScanStatus = ''
+    inviteScanInput?.click()
+  }
+
+  async function onInviteScanFileSelected(event: Event) {
+    const input = event.currentTarget as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (!file) {
+      return
+    }
+
+    inviteScanError = ''
+    inviteScanStatus = 'Scanning QR image...'
+    try {
+      const invite = await decodeInviteFromFile(file)
+      await handleScannedInvite(invite)
+    } catch (err) {
+      inviteScanStatus = ''
+      inviteScanError = String(err)
+    }
+  }
 
   const heroStateBadgeClass = (state: UiState) => {
     if (!state.vpnSessionControlSupported) {
@@ -897,7 +1192,7 @@
   }
 
   async function onJoinLanPeer(invite: string) {
-    await runAction(() => importNetworkInvite(invite))
+    await importInviteCode(invite)
   }
 
   async function onStartLanPairing() {
@@ -909,15 +1204,10 @@
   }
 
   async function onImportInvite() {
-    const invite = inviteInputDraft.trim()
-    if (!invite) {
-      return
-    }
-
-    await runAction(() => importNetworkInvite(invite))
-    if (!error) {
-      inviteInputDraft = ''
-    }
+    await importInviteCode(inviteInputDraft, {
+      updateDraft: true,
+      clearDraftOnSuccess: true,
+    })
   }
 
   async function onAddRelay() {
@@ -1075,6 +1365,7 @@
 
   onDestroy(() => {
     appDisposed = true
+    stopInviteScan()
     if (pollHandle) {
       window.clearInterval(pollHandle)
     }
@@ -1427,6 +1718,48 @@
             Import
           </button>
         </div>
+        <div class="invite-scan-actions">
+          <button class="btn" data-testid="invite-scan-start" on:click={onStartInviteScan}>
+            Scan QR
+          </button>
+          <button class="btn" data-testid="invite-scan-image" on:click={onChooseInviteQrImage}>
+            Choose Image
+          </button>
+          <input
+            class="invite-scan-file-input"
+            type="file"
+            accept="image/*"
+            capture="environment"
+            bind:this={inviteScanInput}
+            on:change={onInviteScanFileSelected}
+          />
+        </div>
+        {#if inviteScanOpen}
+          <div class="invite-scan-panel">
+            <div class="invite-scan-preview">
+              <video
+                class="invite-scan-video"
+                bind:this={inviteScanVideo}
+                autoplay
+                muted
+                playsinline
+              ></video>
+              <div class="invite-scan-reticle" aria-hidden="true"></div>
+            </div>
+            <div class="invite-qr-caption">
+              Point the camera at an invite QR. Use Cancel in the next prompt to just fill the field.
+            </div>
+            <button class="btn" data-testid="invite-scan-close" on:click={onCloseInviteScan}>
+              Close Scanner
+            </button>
+          </div>
+        {/if}
+        {#if inviteScanStatus}
+          <div class="config-path">{inviteScanStatus}</div>
+        {/if}
+        {#if inviteScanError}
+          <div class="config-path mesh-id-note-error">{inviteScanError}</div>
+        {/if}
         <div class="participant-add-separator">or add one manually</div>
         <div class="participant-add-fields">
           <input
