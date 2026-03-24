@@ -349,6 +349,7 @@ struct UiState {
     active_network_invite: String,
     node_id: String,
     node_name: String,
+    self_magic_dns_name: String,
     endpoint: String,
     tunnel_ip: String,
     listen_port: u16,
@@ -2557,16 +2558,24 @@ impl NvpnBackend {
     ) -> ParticipantView {
         let tunnel_ip =
             derive_mesh_tunnel_ip(network_id, participant).unwrap_or_else(|| "-".to_string());
+        let is_local = Some(participant) == own_pubkey_hex;
         let transport_state = self.peer_state_for(participant, own_pubkey_hex);
         let presence_state = self.peer_presence_state_for(participant, own_pubkey_hex);
         let status_text = self.peer_status_line(participant, transport_state);
         let last_signal_text = self.peer_presence_line(participant, own_pubkey_hex);
-        let magic_dns_alias = self.config.peer_alias(participant).unwrap_or_default();
-        let magic_dns_name = self
-            .config
-            .magic_dns_name_for_participant(participant)
-            .unwrap_or_default();
-        let is_local = Some(participant) == own_pubkey_hex;
+        let (magic_dns_alias, magic_dns_name) = if is_local {
+            (
+                self.config.self_magic_dns_label().unwrap_or_default(),
+                self.config.self_magic_dns_name().unwrap_or_default(),
+            )
+        } else {
+            (
+                self.config.peer_alias(participant).unwrap_or_default(),
+                self.config
+                    .magic_dns_name_for_participant(participant)
+                    .unwrap_or_default(),
+            )
+        };
         let advertised_routes = if is_local {
             self.config.effective_advertised_routes()
         } else {
@@ -3253,6 +3262,7 @@ impl NvpnBackend {
             active_network_invite: active_network_invite_code(&self.config).unwrap_or_default(),
             node_id: self.config.node.id.clone(),
             node_name: self.config.node_name.clone(),
+            self_magic_dns_name: self.config.self_magic_dns_name().unwrap_or_default(),
             endpoint: self.config.node.endpoint.clone(),
             tunnel_ip: self.config.node.tunnel_ip.clone(),
             listen_port: self.config.node.listen_port,
@@ -7223,6 +7233,34 @@ mod tests {
         let state = backend.ui_state();
 
         assert_eq!(state.app_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn ui_state_reports_assigned_self_magic_dns_name() {
+        let own = nostr_sdk::prelude::Keys::generate();
+        let peer = nostr_sdk::prelude::Keys::generate();
+        let own_hex = own.public_key().to_hex();
+        let peer_hex = peer.public_key().to_hex();
+        let peer_npub = to_npub(&peer_hex);
+
+        let mut backend = test_backend(&peer_hex);
+        backend.config.nostr.secret_key = own.secret_key().to_secret_hex();
+        backend.config.nostr.public_key = own_hex;
+        backend.config.node_name = "Home Server".to_string();
+        backend.config.ensure_defaults();
+        backend
+            .config
+            .peer_aliases
+            .insert(peer_npub, "home-server".to_string());
+        backend.config.ensure_defaults();
+
+        let state = backend.ui_state();
+
+        assert_eq!(state.self_magic_dns_name, "home-server.nvpn");
+        assert_eq!(
+            backend.config.peer_alias(&peer_hex).as_deref(),
+            Some("home-server-2")
+        );
     }
 
     #[test]

@@ -127,6 +127,7 @@ export interface UiState {
   activeNetworkInvite: string
   nodeId: string
   nodeName: string
+  selfMagicDnsName: string
   endpoint: string
   tunnelIp: string
   listenPort: number

@@ -125,9 +125,15 @@
   const processedDeepLinks = new Set<string>()
 
   const NETWORK_MESH_ID_IDLE_COMMIT_MS = 5000
-  const nodeNamePreviewText = (nodeName: string, suffix: string) => {
-    const preview = nodeNameDnsPreview(nodeName, suffix)
-    return preview ? `Shared as ${preview}` : 'Shared name has no DNS-safe .nvpn label yet.'
+  const nodeNamePreviewText = (nodeName: string, currentState: UiState) => {
+    if (nodeName.trim() === currentState.nodeName.trim()) {
+      return currentState.selfMagicDnsName
+        ? `Shared as ${currentState.selfMagicDnsName}`
+        : 'Shared name has no DNS-safe .nvpn label yet.'
+    }
+
+    const preview = nodeNameDnsPreview(nodeName, currentState.magicDnsSuffix)
+    return preview ? `Will share as ${preview}` : 'Shared name has no DNS-safe .nvpn label yet.'
   }
 
   $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
@@ -1589,7 +1595,7 @@
             bind:value={nodeNameDraft}
             on:input={() => debounce('nodeName', () => onUpdateSettings({ nodeName: nodeNameDraft }))}
           />
-          <div class="config-path hero-device-preview">{nodeNamePreviewText(nodeNameDraft, state.magicDnsSuffix)}</div>
+          <div class="config-path hero-device-preview">{nodeNamePreviewText(nodeNameDraft, state)}</div>
           <div class="config-path">{state.tunnelIp} • {state.endpoint}</div>
         </div>
       </div>

@@ -174,6 +174,18 @@ pub fn build_magic_dns_records(config: &AppConfig) -> HashMap<String, Ipv4Addr> 
     let network_id = config.effective_network_id();
     let mut records = HashMap::new();
 
+    if let (Some(alias), Ok(own_pubkey_hex)) =
+        (config.self_magic_dns_label(), config.own_nostr_pubkey_hex())
+        && let Some(tunnel_ip) = derive_mesh_tunnel_ip(&network_id, &own_pubkey_hex)
+        && let Ok(ipv4) = strip_cidr(&tunnel_ip).parse::<Ipv4Addr>()
+    {
+        let alias = alias.to_ascii_lowercase();
+        records.insert(alias.clone(), ipv4);
+        if !suffix.is_empty() {
+            records.insert(format!("{alias}.{suffix}"), ipv4);
+        }
+    }
+
     for participant in &config.participant_pubkeys_hex() {
         let Some(alias) = config.peer_alias(participant) else {
             continue;

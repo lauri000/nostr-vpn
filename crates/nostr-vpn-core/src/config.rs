@@ -754,6 +754,9 @@ impl AppConfig {
         }
 
         let mut used_aliases = HashSet::new();
+        if let Some(self_alias) = self.preferred_self_magic_dns_label() {
+            used_aliases.insert(self_alias);
+        }
         let mut final_aliases = HashMap::new();
         for participant in &self.all_participant_pubkeys_hex() {
             let participant_npub = npub_for_pubkey_hex(participant);
@@ -764,6 +767,29 @@ impl AppConfig {
             final_aliases.insert(participant_npub, alias);
         }
         self.peer_aliases = final_aliases;
+    }
+
+    fn preferred_self_magic_dns_label(&self) -> Option<String> {
+        normalize_magic_dns_label(&self.node_name)
+    }
+
+    pub fn self_magic_dns_label(&self) -> Option<String> {
+        let preferred = self.preferred_self_magic_dns_label()?;
+        let mut used_aliases = self
+            .peer_aliases
+            .values()
+            .cloned()
+            .collect::<HashSet<String>>();
+        Some(uniquify_magic_dns_label(preferred, &mut used_aliases))
+    }
+
+    pub fn self_magic_dns_name(&self) -> Option<String> {
+        let alias = self.self_magic_dns_label()?;
+        if self.magic_dns_suffix.is_empty() {
+            Some(alias)
+        } else {
+            Some(format!("{alias}.{}", self.magic_dns_suffix))
+        }
     }
 
     pub fn peer_alias(&self, participant: &str) -> Option<String> {
@@ -818,6 +844,22 @@ impl AppConfig {
         let query = query.trim().trim_end_matches('.').to_lowercase();
         if query.is_empty() {
             return None;
+        }
+
+        if let Ok(own_pubkey_hex) = self.own_nostr_pubkey_hex() {
+            if self
+                .self_magic_dns_label()
+                .is_some_and(|alias| query == alias.as_str())
+            {
+                return Some(own_pubkey_hex.clone());
+            }
+
+            if self
+                .self_magic_dns_name()
+                .is_some_and(|name| query == name.as_str())
+            {
+                return Some(own_pubkey_hex);
+            }
         }
 
         for participant in &self.participant_pubkeys_hex() {

@@ -42,6 +42,47 @@ fn build_magic_dns_records_emits_alias_and_suffix_variants() {
 }
 
 #[test]
+fn build_magic_dns_records_includes_self_name_and_suffixes_peer_collision() {
+    let own = Keys::generate();
+    let peer = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+    let peer_hex = peer.public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex.clone();
+    config.node_name = "Home Server".to_string();
+    if let Some(network) = config.networks.first_mut() {
+        network.participants = vec![peer_hex.clone()];
+    }
+    config.ensure_defaults();
+    config
+        .set_peer_alias(&peer_hex, "home-server")
+        .expect("set colliding alias");
+
+    let records = build_magic_dns_records(&config);
+    let expected_own_ip = derive_mesh_tunnel_ip(&config.effective_network_id(), &own_hex)
+        .expect("derived own ip")
+        .split('/')
+        .next()
+        .expect("split cidr")
+        .parse::<Ipv4Addr>()
+        .expect("ipv4");
+    let expected_peer_ip = derive_mesh_tunnel_ip(&config.effective_network_id(), &peer_hex)
+        .expect("derived peer ip")
+        .split('/')
+        .next()
+        .expect("split cidr")
+        .parse::<Ipv4Addr>()
+        .expect("ipv4");
+
+    assert_eq!(records.get("home-server"), Some(&expected_own_ip));
+    assert_eq!(records.get("home-server.nvpn"), Some(&expected_own_ip));
+    assert_eq!(records.get("home-server-2"), Some(&expected_peer_ip));
+    assert_eq!(records.get("home-server-2.nvpn"), Some(&expected_peer_ip));
+}
+
+#[test]
 fn magic_dns_server_answers_a_and_nxdomain() {
     let expected_ip = Ipv4Addr::new(10, 44, 0, 11);
     let mut records = HashMap::new();

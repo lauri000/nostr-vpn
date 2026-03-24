@@ -784,6 +784,64 @@ fn set_peer_alias_normalizes_and_blank_resets_to_default() {
 }
 
 #[test]
+fn self_magic_dns_name_uses_node_name_and_resolves_to_own_pubkey() {
+    let own = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex.clone();
+    config.node_name = "My Pocket Router".to_string();
+    config.ensure_defaults();
+
+    assert_eq!(
+        config.self_magic_dns_label().as_deref(),
+        Some("my-pocket-router")
+    );
+    assert_eq!(
+        config.self_magic_dns_name().as_deref(),
+        Some("my-pocket-router.nvpn")
+    );
+    assert_eq!(
+        config.resolve_magic_dns_query("my-pocket-router"),
+        Some(own_hex.clone())
+    );
+    assert_eq!(
+        config.resolve_magic_dns_query("my-pocket-router.nvpn"),
+        Some(own_hex)
+    );
+}
+
+#[test]
+fn self_magic_dns_label_keeps_node_name_and_suffixes_colliding_peer_aliases() {
+    let own = Keys::generate();
+    let peer = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+    let peer_hex = peer.public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex;
+    config.node_name = "Home Server".to_string();
+    set_default_network_participants(&mut config, vec![peer_hex.clone()]);
+    config.ensure_defaults();
+
+    let assigned_peer_alias = config
+        .set_peer_alias(&peer_hex, "home-server")
+        .expect("set colliding alias");
+
+    assert_eq!(
+        config.self_magic_dns_name().as_deref(),
+        Some("home-server.nvpn")
+    );
+    assert_eq!(assigned_peer_alias, "home-server-2");
+    assert_eq!(
+        config.peer_alias(&peer_hex).as_deref(),
+        Some("home-server-2")
+    );
+}
+
+#[test]
 fn peer_aliases_use_npub_keys_in_serialized_config() {
     let own = Keys::generate();
     let peer = Keys::generate();

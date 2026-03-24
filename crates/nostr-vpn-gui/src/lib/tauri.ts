@@ -119,6 +119,7 @@ const mockState: UiState = {
   activeNetworkInvite: '',
   nodeId: 'mock-node',
   nodeName: 'nostr-vpn-node',
+  selfMagicDnsName: 'nostr-vpn-node.nvpn',
   endpoint: '192.168.1.4:51820',
   tunnelIp: '10.44.0.1/32',
   listenPort: 51820,
@@ -192,6 +193,11 @@ const buildMockActiveNetworkInvite = () => {
     inviterNpub: mockState.ownNpub,
     relays: mockState.relays.map((relay) => relay.url),
   })
+}
+
+const buildMockSelfMagicDnsName = () => {
+  const alias = normalizeAlias(mockState.nodeName)
+  return alias ? composeMagicDnsName(alias, mockState.magicDnsSuffix) : ''
 }
 
 const activateMockNetwork = (networkId: string) => {
@@ -284,6 +290,7 @@ const refreshMockLanPairing = () => {
 const asResult = async () => {
   recomputeMockConnectivity()
   refreshMockLanPairing()
+  mockState.selfMagicDnsName = buildMockSelfMagicDnsName()
   mockState.effectiveAdvertisedRoutes = computeMockEffectiveAdvertisedRoutes()
   return cloneMockState()
 }
