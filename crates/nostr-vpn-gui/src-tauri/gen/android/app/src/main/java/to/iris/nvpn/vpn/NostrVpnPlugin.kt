@@ -69,6 +69,23 @@ object NostrVpnState {
   }
 
   @Synchronized
+  fun shouldDispatchStopIntent(): Boolean = service != null || active
+
+  @Synchronized
+  fun cancelPendingStart(message: String = "VPN start cancelled"): Boolean {
+    val hadPending = pendingConfig != null || startFuture != null
+    if (!hadPending) {
+      return false
+    }
+    pendingConfig = null
+    active = false
+    lastError = message
+    startFuture?.completeExceptionally(IllegalStateException(message))
+    startFuture = null
+    return true
+  }
+
+  @Synchronized
   fun failStart(message: String) {
     active = false
     lastError = message
@@ -164,6 +181,15 @@ class NostrVpnPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun stop(invoke: Invoke) {
     Log.i(TAG, "stop requested")
+    if (!NostrVpnState.shouldDispatchStopIntent()) {
+      if (NostrVpnState.cancelPendingStart()) {
+        Log.i(TAG, "stop skipped service intent; cancelled pending vpn start")
+      } else {
+        Log.i(TAG, "stop skipped service intent; no active vpn service")
+      }
+      invoke.resolve()
+      return
+    }
     val intent = Intent(activity, NostrVpnService::class.java).setAction(NostrVpnService.ACTION_STOP)
     activity.startService(intent)
     invoke.resolve()

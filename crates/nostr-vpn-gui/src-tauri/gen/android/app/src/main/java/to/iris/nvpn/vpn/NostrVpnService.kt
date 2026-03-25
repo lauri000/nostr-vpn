@@ -27,6 +27,13 @@ class NostrVpnService : VpnService() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     Log.i(TAG, "onStartCommand action=${intent?.action} startId=$startId")
+    val status =
+      if (intent?.action == ACTION_STOP) {
+        "Stopping tunnel"
+      } else {
+        "Starting tunnel"
+      }
+    startForeground(NOTIFICATION_ID, buildNotification(status))
     when (intent?.action) {
       ACTION_STOP -> {
         stopTunnel()
@@ -34,7 +41,6 @@ class NostrVpnService : VpnService() {
         stopSelf()
       }
       else -> {
-        startForeground(NOTIFICATION_ID, buildNotification("Starting tunnel"))
         startTunnel()
       }
     }
