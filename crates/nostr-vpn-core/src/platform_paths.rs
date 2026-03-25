@@ -43,7 +43,18 @@ pub fn windows_default_config_path_for_state(
 }
 
 pub fn windows_service_config_path_from_sc_qc_output(output: &str) -> Option<PathBuf> {
-    let command = output.lines().find_map(|line| {
+    let command = windows_service_command_from_sc_qc_output(output)?;
+
+    windows_command_line_value_for_flag(command, "--config").map(PathBuf::from)
+}
+
+pub fn windows_service_binary_path_from_sc_qc_output(output: &str) -> Option<PathBuf> {
+    let command = windows_service_command_from_sc_qc_output(output)?;
+    windows_command_line_program(command).map(PathBuf::from)
+}
+
+fn windows_service_command_from_sc_qc_output(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
         let trimmed = line.trim();
         let (key, value) = trimmed.split_once(':')?;
         if key.trim().eq_ignore_ascii_case("BINARY_PATH_NAME") {
@@ -51,9 +62,7 @@ pub fn windows_service_config_path_from_sc_qc_output(output: &str) -> Option<Pat
         } else {
             None
         }
-    })?;
-
-    windows_command_line_value_for_flag(command, "--config").map(PathBuf::from)
+    })
 }
 
 fn windows_command_line_value_for_flag(command: &str, flag: &str) -> Option<String> {
@@ -74,11 +83,27 @@ fn windows_command_line_value_for_flag(command: &str, flag: &str) -> Option<Stri
     Some(after_flag[..end].to_string())
 }
 
+fn windows_command_line_program(command: &str) -> Option<String> {
+    let command = command.trim_start();
+    if command.is_empty() {
+        return None;
+    }
+
+    if let Some(remainder) = command.strip_prefix('"') {
+        let end = remainder.find('"')?;
+        return Some(remainder[..end].to_string());
+    }
+
+    let end = command.find(char::is_whitespace).unwrap_or(command.len());
+    Some(command[..end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         legacy_config_path_from_dirs_config_dir, windows_default_config_path_for_state,
         windows_machine_config_path_from_program_data_dir,
+        windows_service_binary_path_from_sc_qc_output,
         windows_service_config_path_from_sc_qc_output,
     };
     use std::path::{Path, PathBuf};
@@ -155,6 +180,16 @@ mod tests {
         assert_eq!(
             windows_service_config_path_from_sc_qc_output(output),
             Some(PathBuf::from(r"C:\ProgramData\Nostr VPN\config.toml"))
+        );
+    }
+
+    #[test]
+    fn windows_service_binary_path_parser_extracts_executable() {
+        let output = "SERVICE_NAME: NvpnService\n        TYPE               : 10  WIN32_OWN_PROCESS\n        START_TYPE         : 2   AUTO_START\n        BINARY_PATH_NAME   : \"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --service --config \"C:\\ProgramData\\Nostr VPN\\config.toml\" --iface \"nvpn\"\n";
+
+        assert_eq!(
+            windows_service_binary_path_from_sc_qc_output(output),
+            Some(PathBuf::from(r"C:\Program Files\Nostr VPN\nvpn.exe"))
         );
     }
 }

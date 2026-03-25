@@ -43,7 +43,8 @@ use nostr_vpn_core::platform_paths::windows_default_config_path_for_state;
 use nostr_vpn_core::platform_paths::windows_machine_config_path_from_program_data_dir;
 #[cfg(target_os = "windows")]
 use nostr_vpn_core::platform_paths::{
-    legacy_config_path_from_dirs_config_dir, windows_service_config_path_from_sc_qc_output,
+    legacy_config_path_from_dirs_config_dir, windows_service_binary_path_from_sc_qc_output,
+    windows_service_config_path_from_sc_qc_output,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -1352,7 +1353,7 @@ impl NvpnBackend {
     }
 
     #[cfg(target_os = "windows")]
-    fn persist_config_via_running_daemon(&self) -> Result<()> {
+    fn persist_config_via_running_daemon(&mut self) -> Result<()> {
         let temp_path = windows_temp_config_import_path();
         self.config.save(&temp_path).with_context(|| {
             format!(
@@ -1368,21 +1369,31 @@ impl NvpnBackend {
             let target = self
                 .config_path
                 .to_str()
-                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?;
-            let output =
-                self.run_nvpn_command(windows_daemon_config_import_args(source, target))?;
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?
+                .to_string();
+            let args = windows_daemon_config_import_args(source, target.as_str());
+            let mut output = self.run_nvpn_command(args)?;
 
-            if output.status.success() {
-                return Ok(());
+            if !output.status.success() {
+                let failure = windows_nvpn_command_failure("apply-config-daemon", &output);
+                if windows_daemon_apply_requires_service_repair(&failure) {
+                    eprintln!(
+                        "gui: daemon-backed config apply detected stale Windows service; reinstalling service and retrying"
+                    );
+                    self.reinstall_windows_system_service()?;
+                    self.invalidate_service_status_cache();
+                    output = self.run_nvpn_command(args)?;
+                }
             }
 
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Err(anyhow!(
-                "nvpn apply-config-daemon failed\nstdout: {}\nstderr: {}",
-                stdout.trim(),
-                stderr.trim()
-            ))
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "{}",
+                    windows_nvpn_command_failure("apply-config-daemon", &output)
+                ))
+            }
         })();
 
         let _ = fs::remove_file(&temp_path);
@@ -1794,7 +1805,15 @@ impl NvpnBackend {
             return Err(anyhow!(self.service_status_detail.clone()));
         }
         #[cfg(target_os = "windows")]
-        let args = ["service", "install", "--force"];
+        let args = [
+            "service",
+            "install",
+            "--force",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ];
 
         #[cfg(not(target_os = "windows"))]
         let args = [
@@ -1829,6 +1848,28 @@ impl NvpnBackend {
             self.invalidate_service_status_cache();
             #[cfg(target_os = "windows")]
             self.reload_preferred_windows_config_path()?;
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn reinstall_windows_system_service(&self) -> Result<()> {
+        let config_path = self
+            .config_path
+            .to_str()
+            .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?;
+        let args = ["service", "install", "--force", "--config", config_path];
+        let output = self.run_nvpn_command(args)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let message = windows_nvpn_command_failure("service install", &output);
+        if requires_admin_privileges(&message) {
+            self.run_nvpn_command_with_admin_privileges(args)?;
             return Ok(());
         }
 
@@ -3735,6 +3776,14 @@ fn resolve_nvpn_cli_path() -> Result<PathBuf> {
         return validate_nvpn_binary(candidate);
     }
 
+    #[cfg(target_os = "windows")]
+    if let Some(candidate) = windows_installed_service_binary_path()
+        && candidate.exists()
+        && let Ok(validated) = validate_nvpn_binary(candidate)
+    {
+        return Ok(validated);
+    }
+
     let bundled_candidates = nvpn_bundled_binary_candidates();
     if let Ok(exe) = env::current_exe()
         && let Some(dir) = exe.parent()
@@ -3794,6 +3843,20 @@ fn validate_nvpn_binary(path: PathBuf) -> Result<PathBuf> {
 
 fn cli_binary_installed() -> bool {
     resolve_nvpn_cli_path().is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_installed_service_binary_path() -> Option<PathBuf> {
+    let mut command = ProcessCommand::new("sc.exe");
+    let output = apply_windows_subprocess_flags(&mut command)
+        .args(["qc", "NvpnService"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    windows_service_binary_path_from_sc_qc_output(&stdout)
 }
 
 #[cfg(test)]
@@ -3905,6 +3968,24 @@ fn requires_admin_privileges_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| requires_admin_privileges(&cause.to_string()))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_nvpn_command_failure(command: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    format!(
+        "nvpn {command} failed\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_daemon_apply_requires_service_repair(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("restart the daemon with a newer nvpn binary")
+        || lowered.contains("older nvpn daemon binary is still running")
 }
 
 fn service_state_refresh_due(
@@ -7424,6 +7505,19 @@ mod tests {
             .context(r"failed to write \\?\C:\ProgramData\Nostr VPN\config.toml");
 
         assert!(super::requires_admin_privileges_error(&error));
+    }
+
+    #[test]
+    fn windows_daemon_apply_repair_detection_matches_stale_service_errors() {
+        assert!(super::windows_daemon_apply_requires_service_repair(
+            "daemon did not acknowledge control request within 3s; restart the daemon with a newer nvpn binary"
+        ));
+        assert!(super::windows_daemon_apply_requires_service_repair(
+            "daemon acknowledged control request but did not reload; likely an older nvpn daemon binary is still running. restart or reinstall the app/service so the daemon matches the current CLI"
+        ));
+        assert!(!super::windows_daemon_apply_requires_service_repair(
+            "daemon: not running"
+        ));
     }
 
     #[test]

@@ -2,6 +2,9 @@
   ClearErrors
   ExecWait 'sc.exe stop NvpnService' $0
   Sleep 1500
+  ClearErrors
+  ExecWait 'taskkill.exe /F /FI "SERVICES eq NvpnService" /T' $0
+  Sleep 500
   ExecWait 'sc.exe delete NvpnService' $0
 !macroend
 
