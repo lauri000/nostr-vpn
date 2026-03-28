@@ -120,6 +120,7 @@ export interface UiState {
   serviceStatusDetail: string
   sessionStatus: string
   appVersion: string
+  daemonBinaryVersion: string
   configPath: string
   ownNpub: string
   ownPubkeyHex: string

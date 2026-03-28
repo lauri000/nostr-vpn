@@ -719,6 +719,7 @@ fn build_runtime_state(
 
     DaemonRuntimeState {
         updated_at: unix_timestamp(),
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
         session_active: true,
         relay_connected,
         session_status: if expected_peers == 0 {
@@ -863,6 +864,9 @@ fn build_peer_announcement(config: &AppConfig, listen_port: u16) -> PeerAnnounce
         endpoint: endpoint.clone(),
         local_endpoint: Some(endpoint),
         public_endpoint: None,
+        relay_endpoint: None,
+        relay_pubkey: None,
+        relay_expires_at: None,
         tunnel_ip: config.node.tunnel_ip.clone(),
         advertised_routes: config.effective_advertised_routes(),
         timestamp: unix_timestamp(),
@@ -1206,6 +1210,9 @@ mod tests {
             endpoint: endpoint.to_string(),
             local_endpoint: None,
             public_endpoint: Some(endpoint.to_string()),
+            relay_endpoint: None,
+            relay_pubkey: None,
+            relay_expires_at: None,
             tunnel_ip: tunnel_ip.to_string(),
             advertised_routes: routes.iter().map(|route| (*route).to_string()).collect(),
             timestamp: 1,

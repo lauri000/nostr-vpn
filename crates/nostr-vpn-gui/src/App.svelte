@@ -16,6 +16,11 @@
     buildInviteScanConstraintCandidates,
     openInviteScanStream,
   } from './lib/invite-scan.js'
+  import {
+    serviceRepairErrorText,
+    serviceRepairRecommended,
+    serviceRepairRetryRecommended,
+  } from './lib/service-repair.js'
   import { parseAppDeepLink } from './lib/deep-link-actions.js'
   import { decodeInvitePayload, determineInviteImportTarget } from './lib/invite-code.js'
   import {
@@ -118,6 +123,10 @@
   let actionInFlight = false
   let serviceInstallRecommended = false
   let serviceEnableRecommended = false
+  let serviceRepairPromptRecommended = false
+  let serviceRepairRetryAfterInstall = false
+  let serviceRepairPromptShownFor = ''
+  let serviceRepairPromptInFlight = false
   let serviceSetupRequired = false
   let vpnControlSupported = false
   let cliInstallSupported = false
@@ -144,6 +153,8 @@
   $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
   $: serviceEnableRecommended =
     !!state?.serviceEnablementSupported && !!state?.serviceInstalled && !!state?.serviceDisabled
+  $: serviceRepairPromptRecommended = serviceRepairRecommended(error, state)
+  $: serviceRepairRetryAfterInstall = serviceRepairRetryRecommended(error)
   $: serviceSetupRequired = serviceInstallRecommended && !state?.daemonRunning
   $: vpnControlSupported = !!state?.vpnSessionControlSupported
   $: cliInstallSupported = !!state?.cliInstallSupported
@@ -155,6 +166,16 @@
       inviteQrSource = invite
       void refreshInviteQr(invite)
     }
+  }
+  $: if (
+    state &&
+    serviceRepairPromptRecommended &&
+    !actionInFlight &&
+    !refreshInFlight &&
+    !serviceRepairPromptInFlight &&
+    !appDisposed
+  ) {
+    void maybePromptForServiceRepair()
   }
 
   async function refreshInviteQr(invite: string) {
@@ -894,6 +915,45 @@
     }
   }
 
+  function currentServiceRepairPromptKey(currentState: UiState) {
+    return `${currentState.appVersion}:${currentState.daemonBinaryVersion || 'unknown'}`
+  }
+
+  async function maybePromptForServiceRepair() {
+    if (
+      !state ||
+      !serviceRepairRecommended(error, state) ||
+      serviceRepairPromptInFlight ||
+      actionInFlight ||
+      refreshInFlight
+    ) {
+      return
+    }
+
+    const promptKey = currentServiceRepairPromptKey(state)
+    if (serviceRepairPromptShownFor === promptKey) {
+      return
+    }
+    serviceRepairPromptShownFor = promptKey
+
+    if (typeof window.confirm !== 'function') {
+      return
+    }
+
+    serviceRepairPromptInFlight = true
+    try {
+      if (
+        window.confirm(
+          'Background service is out of date. Reinstall it now so this app version can control the VPN?'
+        )
+      ) {
+        await onRepairSystemService(false)
+      }
+    } finally {
+      serviceRepairPromptInFlight = false
+    }
+  }
+
   async function ensureStateLoaded() {
     if (!state) {
       await refresh()
@@ -1203,7 +1263,9 @@
     const wasInstalled = !!state?.serviceInstalled
     await runAction(installSystemService)
     if (!error) {
-      serviceActionStatus = 'System service installed and started'
+      serviceActionStatus = wasInstalled
+        ? 'System service reinstalled and started'
+        : 'System service installed and started'
     } else if (!wasInstalled && state?.serviceInstalled) {
       error = ''
       serviceActionStatus = state.serviceRunning
@@ -1212,7 +1274,20 @@
     }
     if (connectAfter && !error && state && !state.sessionActive) {
       await runAction(connectSession)
+      if (!error) {
+        serviceActionStatus = state.sessionActive
+          ? wasInstalled
+            ? 'System service reinstalled and VPN started'
+            : 'System service installed and VPN started'
+          : wasInstalled
+            ? 'System service reinstalled'
+            : 'System service installed'
+      }
     }
+  }
+
+  async function onRepairSystemService(connectAfter = false) {
+    await onInstallSystemService(connectAfter)
   }
 
   async function onEnableSystemService(connectAfter = false) {
@@ -1652,16 +1727,16 @@
     {/if}
   </section>
 
-  {#if error}
-    <section class="panel error">{error}</section>
+  {#if serviceRepairErrorText(error, state)}
+    <section class="panel error">{serviceRepairErrorText(error, state)}</section>
   {/if}
 
   {#if state}
     {@const activeNetworkView = activeNetwork(state)}
 
-    {#if serviceInstallRecommended || serviceEnableRecommended}
+    {#if serviceInstallRecommended || serviceEnableRecommended || serviceRepairPromptRecommended}
       <section
-        class={`panel service-panel ${serviceSetupRequired ? 'service-panel-required' : ''}`}
+        class={`panel service-panel ${serviceSetupRequired || serviceRepairPromptRecommended ? 'service-panel-required' : ''}`}
         data-testid="service-panel"
       >
         <div class="section-title-row">
@@ -1684,12 +1759,16 @@
 
         <div class="service-panel-copy">
           <div class="service-panel-title">
-            {serviceSetupRequired
+            {serviceRepairPromptRecommended
+              ? 'Reinstall the service to finish this app update'
+              : serviceSetupRequired
               ? 'Install once for reliable background VPN'
               : 'Enable the service to keep VPN control out of the GUI process'}
           </div>
           <div class="service-panel-text">
-            Required for background startup, resilient reconnects, and avoiding repeated admin prompts.
+            {serviceRepairPromptRecommended
+              ? 'The running background service looks older than this app. Reinstall it once so the daemon matches the current version.'
+              : 'Required for background startup, resilient reconnects, and avoiding repeated admin prompts.'}
           </div>
           {#if state.serviceStatusDetail}
             <div class="service-panel-detail" data-testid="service-status-detail">
@@ -1703,14 +1782,22 @@
 
         <div class="row service-actions-row">
           <button
-            class={`btn ${serviceSetupRequired ? 'service-primary-btn' : ''}`}
+            class={`btn ${serviceSetupRequired || serviceRepairPromptRecommended ? 'service-primary-btn' : ''}`}
             data-testid="install-service-btn"
             on:click={() =>
-              serviceEnableRecommended
+              serviceRepairPromptRecommended
+                ? onRepairSystemService(serviceRepairRetryAfterInstall)
+                : serviceEnableRecommended
                 ? onEnableSystemService()
                 : onInstallSystemService(serviceSetupRequired)}
           >
-            {serviceEnableRecommended
+            {serviceRepairPromptRecommended
+              ? serviceRepairRetryAfterInstall && !state.sessionActive
+                ? 'Reinstall service and retry'
+                : state.sessionActive
+                ? 'Reinstall service'
+                : 'Reinstall service'
+              : serviceEnableRecommended
               ? 'Enable service'
               : state.serviceInstalled
                 ? 'Reinstall service'

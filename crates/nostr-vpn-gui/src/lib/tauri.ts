@@ -112,6 +112,7 @@ const mockState: UiState = {
   serviceStatusDetail: 'Background service is not installed',
   sessionStatus: 'Install background service to turn VPN on from the app',
   appVersion: APP_VERSION,
+  daemonBinaryVersion: APP_VERSION,
   configPath: '~/.config/nvpn/config.toml',
   ownNpub: 'npub1akgu9lxldpt32lnjf97k005a4kgasewmvsrmkpzqeff39ssev0ssd6t3u',
   ownPubkeyHex: 'f'.repeat(64),

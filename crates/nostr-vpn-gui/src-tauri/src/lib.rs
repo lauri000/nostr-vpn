@@ -216,6 +216,8 @@ struct CliDaemonStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DaemonRuntimeState {
     updated_at: u64,
+    #[serde(default)]
+    binary_version: String,
     session_active: bool,
     relay_connected: bool,
     session_status: String,
@@ -339,6 +341,7 @@ struct UiState {
     service_status_detail: String,
     session_status: String,
     app_version: String,
+    daemon_binary_version: String,
     config_path: String,
     own_npub: String,
     own_pubkey_hex: String,
@@ -3224,6 +3227,11 @@ impl NvpnBackend {
             .as_ref()
             .map(|state| state.port_mapping.clone())
             .unwrap_or_default();
+        let daemon_binary_version = self
+            .daemon_state
+            .as_ref()
+            .map(|state| state.binary_version.clone())
+            .unwrap_or_default();
 
         UiState {
             platform: runtime_capabilities.platform.to_string(),
@@ -3245,6 +3253,7 @@ impl NvpnBackend {
             service_status_detail: self.service_status_detail.clone(),
             session_status: self.session_status.clone(),
             app_version: PRODUCT_VERSION.to_string(),
+            daemon_binary_version,
             config_path: self.config_path.display().to_string(),
             own_npub,
             own_pubkey_hex,
@@ -6101,6 +6110,7 @@ mod tests {
         let connected_peer_count = usize::from(peer.as_ref().is_some_and(|value| value.reachable));
         DaemonRuntimeState {
             updated_at: epoch_secs_ago(0),
+            binary_version: env!("CARGO_PKG_VERSION").to_string(),
             session_active,
             relay_connected: false,
             session_status: if session_active {
@@ -7388,6 +7398,15 @@ mod tests {
         let state = backend.ui_state();
 
         assert_eq!(state.app_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn ui_state_reports_daemon_binary_version() {
+        let mut backend = test_backend(&"44".repeat(32));
+        backend.daemon_state = Some(daemon_state_with_peer(None, true));
+        let state = backend.ui_state();
+
+        assert_eq!(state.daemon_binary_version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

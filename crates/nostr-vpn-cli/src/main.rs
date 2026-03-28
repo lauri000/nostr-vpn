@@ -132,6 +132,7 @@ const PERSISTED_PATH_CACHE_TIMEOUT_MULTIPLIER: u64 = 90;
 const MESH_READY_RELAYS_PAUSED_STATUS: &str = "Mesh ready (relays paused)";
 const WAITING_FOR_PARTICIPANTS_STATUS: &str = "Waiting for participants";
 const LISTENING_FOR_JOIN_REQUESTS_STATUS: &str = "Listening for join requests";
+const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_DAEMON_STATE_FRESHNESS_SECS: u64 = 5;
 #[cfg(target_os = "macos")]
@@ -1389,6 +1390,8 @@ struct ServiceStatusView {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DaemonRuntimeState {
     updated_at: u64,
+    #[serde(default)]
+    binary_version: String,
     session_active: bool,
     relay_connected: bool,
     session_status: String,
@@ -1436,6 +1439,12 @@ struct DaemonPeerCacheState {
     updated_at: u64,
     peers: Vec<DaemonPeerCacheEntry>,
     path_book: PeerPathBook,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutableFingerprint {
+    len: u64,
+    modified_unix_nanos: Option<u128>,
 }
 
 struct DaemonPeerCacheRestore<'a> {
@@ -4828,6 +4837,15 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         ),
     )?;
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let supervised_service_executable = if args.service {
+        Some(current_executable_fingerprint()?)
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let supervised_service_executable: Option<(PathBuf, ExecutableFingerprint)> = None;
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -5445,6 +5463,24 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         &port_mapping_runtime.status(),
                     );
                 }
+                if let Some((executable, launched_fingerprint)) =
+                    supervised_service_executable.as_ref()
+                {
+                    match service_supervisor_restart_due(executable, launched_fingerprint) {
+                        Ok(true) => {
+                            eprintln!(
+                                "daemon: service executable changed on disk; exiting so the supervisor restarts the updated binary"
+                            );
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "daemon: failed to check service executable fingerprint: {error}"
+                            );
+                        }
+                    }
+                }
                 if daemon_session_active(session_enabled, expected_peers) {
                     let now = unix_timestamp();
                     let mesh_ready_before_prune = should_pause_relays_for_mesh(
@@ -5713,6 +5749,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
 
     let final_state = DaemonRuntimeState {
         updated_at: unix_timestamp(),
+        binary_version: PRODUCT_VERSION.to_string(),
         session_active: false,
         relay_connected: false,
         session_status: "Disconnected".to_string(),
@@ -5924,6 +5961,7 @@ fn build_daemon_runtime_state(
     );
     DaemonRuntimeState {
         updated_at: now,
+        binary_version: PRODUCT_VERSION.to_string(),
         session_active,
         relay_connected,
         session_status: session_status.to_string(),
@@ -7038,6 +7076,35 @@ fn set_private_cache_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn executable_fingerprint(path: &Path) -> Result<ExecutableFingerprint> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat executable {}", path.display()))?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos());
+    Ok(ExecutableFingerprint {
+        len: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
+fn current_executable_fingerprint() -> Result<(PathBuf, ExecutableFingerprint)> {
+    let executable = std::env::current_exe().context("failed to resolve current executable")?;
+    let executable = fs::canonicalize(&executable)
+        .with_context(|| format!("failed to canonicalize {}", executable.display()))?;
+    let fingerprint = executable_fingerprint(&executable)?;
+    Ok((executable, fingerprint))
+}
+
+fn service_supervisor_restart_due(
+    executable: &Path,
+    launched_fingerprint: &ExecutableFingerprint,
+) -> Result<bool> {
+    Ok(executable_fingerprint(executable)? != *launched_fingerprint)
+}
+
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: &str) -> Result<()> {
     if cfg!(not(unix)) {
@@ -7719,7 +7786,7 @@ fn macos_disable_service() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn macos_service_plist_content(
     executable: &Path,
     config_path: &Path,
@@ -7744,6 +7811,7 @@ fn macos_service_plist_content(
   <array>
     <string>{exec}</string>
     <string>daemon</string>
+    <string>--service</string>
     <string>--config</string>
     <string>{config}</string>
     <string>--iface</string>
@@ -8069,7 +8137,7 @@ fn linux_query_service_status() -> Result<ServiceStatusView> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn linux_service_unit_content(
     executable: &Path,
     config_path: &Path,
@@ -8082,7 +8150,7 @@ fn linux_service_unit_content(
     let iface = systemd_quote(iface);
     let log = systemd_quote(&log_path.display().to_string());
     format!(
-        "[Unit]\nDescription=Nostr VPN daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exec} daemon --config {config} --iface {iface} --announce-interval-secs {announce_interval_secs}\nRestart=always\nRestartSec=3\nStandardOutput=append:{log}\nStandardError=append:{log}\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=Nostr VPN daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exec} daemon --service --config {config} --iface {iface} --announce-interval-secs {announce_interval_secs}\nRestart=always\nRestartSec=3\nStandardOutput=append:{log}\nStandardError=append:{log}\n\n[Install]\nWantedBy=multi-user.target\n"
     )
 }
 
@@ -8559,7 +8627,7 @@ fn parse_nonzero_pid(value: &str) -> Option<u32> {
     value.trim().parse::<u32>().ok().filter(|pid| *pid > 0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn systemd_quote(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
@@ -10056,6 +10124,36 @@ mod tests {
             output,
             "missing.service"
         ));
+    }
+
+    #[test]
+    fn macos_service_plist_runs_service_supervised_daemon() {
+        let plist = super::macos_service_plist_content(
+            Path::new("/Applications/Nostr VPN.app/Contents/MacOS/nvpn"),
+            Path::new("/Users/sirius/Library/Application Support/nvpn/config.toml"),
+            "utun100",
+            20,
+            Path::new("/Users/sirius/Library/Logs/nvpn/daemon.log"),
+        );
+
+        assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains("<string>--service</string>"));
+        assert!(plist.contains("<string>--config</string>"));
+    }
+
+    #[test]
+    fn linux_service_unit_runs_service_supervised_daemon() {
+        let unit = super::linux_service_unit_content(
+            Path::new("/usr/local/bin/nvpn"),
+            Path::new("/home/sirius/.config/nvpn/config.toml"),
+            "nvpn",
+            20,
+            Path::new("/home/sirius/.local/state/nvpn/daemon.log"),
+        );
+
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/nvpn\" daemon --service --config"));
+        assert!(unit.contains("--iface \"nvpn\""));
+        assert!(unit.contains("--announce-interval-secs 20"));
     }
 
     #[test]

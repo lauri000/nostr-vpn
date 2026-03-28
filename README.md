@@ -182,7 +182,7 @@ case "$(uname -s)/$(uname -m)" in
   Linux/x86_64) ASSET=nvpn-x86_64-unknown-linux-musl.tar.gz ;;
   Linux/aarch64|Linux/arm64) ASSET=nvpn-aarch64-unknown-linux-musl.tar.gz ;;
   Darwin/x86_64)
-    echo "Prebuilt Intel macOS releases have been sunset. Build from source or use an older release." >&2
+    echo "No prebuilt Intel macOS release is currently published. Build from source or use an older release." >&2
     exit 1
     ;;
   *)
