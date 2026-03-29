@@ -1071,6 +1071,8 @@ mod tests {
                 tunnel_ip: "10.44.0.2/32".to_string(),
                 endpoint: "203.0.113.20:51820".to_string(),
                 runtime_endpoint: None,
+                tx_bytes: 0,
+                rx_bytes: 0,
                 public_key: "pk".to_string(),
                 advertised_routes: vec!["0.0.0.0/0".to_string()],
                 presence_timestamp: 1,

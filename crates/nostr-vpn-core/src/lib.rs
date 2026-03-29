@@ -5,9 +5,12 @@ pub mod diagnostics;
 pub mod join_requests;
 pub mod magic_dns;
 pub mod nat;
+pub mod node_record;
 pub mod paths;
 pub mod platform_paths;
 pub mod presence;
+pub mod relay;
+pub mod service_signaling;
 pub mod signaling;
 pub mod wireguard;
 

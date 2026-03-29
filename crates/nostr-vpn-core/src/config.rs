@@ -72,6 +72,12 @@ pub struct AppConfig {
     pub networks: Vec<NetworkConfig>,
     #[serde(default = "default_node_name")]
     pub node_name: String,
+    #[serde(default = "default_use_public_relay_fallback")]
+    pub use_public_relay_fallback: bool,
+    #[serde(default = "default_relay_for_others")]
+    pub relay_for_others: bool,
+    #[serde(default = "default_provide_nat_assist")]
+    pub provide_nat_assist: bool,
     #[serde(default = "default_auto_disconnect_relays_when_mesh_ready")]
     pub auto_disconnect_relays_when_mesh_ready: bool,
     // Legacy field kept so older config files still deserialize cleanly.
@@ -177,6 +183,9 @@ impl Default for AppConfig {
                 inbound_join_requests: Vec::new(),
             }],
             node_name: default_node_name(),
+            use_public_relay_fallback: default_use_public_relay_fallback(),
+            relay_for_others: default_relay_for_others(),
+            provide_nat_assist: default_provide_nat_assist(),
             auto_disconnect_relays_when_mesh_ready: default_auto_disconnect_relays_when_mesh_ready(
             ),
             lan_discovery_enabled: default_lan_discovery_enabled(),
@@ -1199,6 +1208,18 @@ fn default_peer_aliases() -> HashMap<String, String> {
 
 fn default_node_name() -> String {
     LEGACY_DEFAULT_NODE_NAME.to_string()
+}
+
+const fn default_use_public_relay_fallback() -> bool {
+    true
+}
+
+const fn default_relay_for_others() -> bool {
+    false
+}
+
+const fn default_provide_nat_assist() -> bool {
+    false
 }
 
 fn uses_default_node_name(value: &str, own_pubkey_hex: Option<&str>) -> bool {

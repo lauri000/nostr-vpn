@@ -697,6 +697,9 @@ fn build_runtime_state(
                 endpoint: runtime_status
                     .map(|status| status.endpoint.to_string())
                     .unwrap_or_else(|| announcement.endpoint.clone()),
+                runtime_endpoint: runtime_status.map(|status| status.endpoint.to_string()),
+                tx_bytes: 0,
+                rx_bytes: 0,
                 public_key: announcement.public_key.clone(),
                 advertised_routes: announcement.advertised_routes.clone(),
                 presence_timestamp: announcement.timestamp,
@@ -735,6 +738,10 @@ fn build_runtime_state(
         health: Vec::new(),
         network: Default::default(),
         port_mapping: Default::default(),
+        relay_operator_running: false,
+        relay_operator_status: "Relay operator disabled".to_string(),
+        nat_assist_running: false,
+        nat_assist_status: "NAT assist disabled".to_string(),
         peers,
     }
 }

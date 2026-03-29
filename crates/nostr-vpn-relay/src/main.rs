@@ -47,6 +47,10 @@ struct NostrFilter {
     kinds: Option<Vec<u32>>,
     #[serde(rename = "#p", skip_serializing_if = "Option::is_none")]
     p_tags: Option<Vec<String>>,
+    #[serde(rename = "#t", skip_serializing_if = "Option::is_none")]
+    t_tags: Option<Vec<String>>,
+    #[serde(rename = "#d", skip_serializing_if = "Option::is_none")]
+    d_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     since: Option<u64>,
 }
@@ -73,6 +77,24 @@ impl NostrFilter {
                 .tags
                 .iter()
                 .any(|tag| tag.len() >= 2 && tag[0] == "p" && p_tags.contains(&tag[1]));
+            if !has_match {
+                return false;
+            }
+        }
+        if let Some(t_tags) = &self.t_tags {
+            let has_match = event
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "t" && t_tags.contains(&tag[1]));
+            if !has_match {
+                return false;
+            }
+        }
+        if let Some(d_tags) = &self.d_tags {
+            let has_match = event
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "d" && d_tags.contains(&tag[1]));
             if !has_match {
                 return false;
             }

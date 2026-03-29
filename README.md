@@ -113,7 +113,7 @@ Additional automation:
 - `.github/workflows/windows-smoke.yml` can manually build the Windows CLI and GUI on `windows-latest`
 - `.github/workflows/release.yml` publishes Apple Silicon macOS, Windows x64, and Android arm64 APK/AAB app artifacts, plus CLI archives for Apple Silicon macOS, Windows x64, Linux x86_64, and Linux arm64
 - `scripts/publish-zapstore-android.sh` builds a signed Android APK locally and publishes it with `zsp` using `zapstore.yaml`
-- `scripts/local-release.mjs` builds whatever this machine can produce locally, stages a hashtree-style release directory, and can publish it to `releases/nostr-vpn`
+- `scripts/local-release.mjs` builds whatever this machine can produce locally, stages a hashtree-style release directory, and can publish it to `nostr-vpn-releases`
 
 ### Local release
 
@@ -194,6 +194,8 @@ curl -fsSL "https://github.com/mmalmi/nostr-vpn/releases/latest/download/${ASSET
 ```
 
 That command supports Apple Silicon macOS and Linux. On Intel macOS it exits with a clear message. The installer creates the target directory when needed and defaults to `/opt/homebrew/bin` on Apple Silicon macOS when that location exists or is already in `PATH`; otherwise it uses `/usr/local/bin`.
+
+The quick-install line still points at GitHub until a verified `nostr-vpn-releases/latest` tree is published on hashtree. `htree release publish` already maintains the `latest` alias automatically; the missing step is publishing the release tree and verifying the public `upload.iris.to/<npub>/nostr-vpn-releases/latest/...` paths.
 
 On Windows, download the `nvpn-<version>-x86_64-pc-windows-msvc.zip` release asset and run `nvpn.exe`, or build from source.
 

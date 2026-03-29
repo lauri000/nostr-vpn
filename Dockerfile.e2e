@@ -14,5 +14,6 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/nvpn /usr/local/bin/nvpn
 COPY --from=builder /app/target/release/nostr-vpn-relay /usr/local/bin/nostr-vpn-relay
 COPY --from=builder /app/target/release/nvpn-reflector /usr/local/bin/nvpn-reflector
+COPY --from=builder /app/target/release/nvpn-udp-relay /usr/local/bin/nvpn-udp-relay
 
 ENV RUST_LOG=info

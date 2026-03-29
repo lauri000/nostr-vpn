@@ -128,6 +128,13 @@ const mockState: UiState = {
   advertiseExitNode: false,
   advertisedRoutes: [],
   effectiveAdvertisedRoutes: [],
+  usePublicRelayFallback: true,
+  relayForOthers: false,
+  provideNatAssist: false,
+  relayOperatorRunning: false,
+  relayOperatorStatus: 'Relay operator disabled',
+  natAssistRunning: false,
+  natAssistStatus: 'NAT assist disabled',
   magicDnsSuffix: 'nvpn',
   magicDnsStatus: 'System DNS active for .nvpn via 127.0.0.1:1053',
   autoDisconnectRelaysWhenMeshReady: true,
@@ -171,6 +178,7 @@ const mockState: UiState = {
     { url: 'wss://nos.lol', state: 'unknown', statusText: 'not checked' },
   ],
   relaySummary: { up: 0, down: 0, checking: 0, unknown: 3 },
+  relayOperator: null,
   lanPeers: defaultMockLanPeers(),
 }
 
@@ -557,6 +565,10 @@ const upsertMockParticipant = (networkId: string, npub: string, alias = '') => {
     tunnelIp: '10.44.0.2/32',
     magicDnsAlias,
     magicDnsName: composeMagicDnsName(magicDnsAlias, mockState.magicDnsSuffix),
+    relayPathActive: false,
+    runtimeEndpoint: '',
+    txBytes: 0,
+    rxBytes: 0,
     advertisedRoutes: [],
     offersExitNode: false,
     state: 'unknown',
@@ -790,6 +802,9 @@ export const updateSettings = (patch: SettingsPatch) =>
             .filter((value) => value.length > 0)
         }
         mockState.effectiveAdvertisedRoutes = computeMockEffectiveAdvertisedRoutes()
+        if (patch.usePublicRelayFallback !== undefined) {
+          mockState.usePublicRelayFallback = patch.usePublicRelayFallback
+        }
         if (patch.autoDisconnectRelaysWhenMeshReady !== undefined) {
           mockState.autoDisconnectRelaysWhenMeshReady =
             patch.autoDisconnectRelaysWhenMeshReady

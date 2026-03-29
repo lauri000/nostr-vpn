@@ -1,0 +1,9 @@
+.git
+target
+dist
+.claude
+.codex_tmp*
+
+crates/nostr-vpn-gui/src-tauri/gen/android/.gradle
+crates/nostr-vpn-gui/src-tauri/gen/android/app/build
+crates/nostr-vpn-gui/src-tauri/gen/apple/build

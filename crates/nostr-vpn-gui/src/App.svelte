@@ -866,6 +866,72 @@
     }
   }
 
+  const publicRelayFallbackStatusText = (state: UiState) => {
+    if (state.usePublicRelayFallback) {
+      return 'If a peer cannot be reached directly, nostr-vpn will try discoverable public relays before giving up.'
+    }
+
+    return 'Only direct peer paths will be used. Devices on restrictive networks may stay offline until a direct path works.'
+  }
+
+  const formatTrafficBytes = (bytes: number) => {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+      return '0 B'
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']
+    let value = bytes
+    let unitIndex = 0
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024
+      unitIndex += 1
+    }
+    const digits = unitIndex === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2
+    return `${value.toFixed(digits)} ${units[unitIndex]}`
+  }
+
+  const participantTrafficText = (participant: ParticipantView) =>
+    `rx ${formatTrafficBytes(participant.rxBytes)} · tx ${formatTrafficBytes(participant.txBytes)}`
+
+  const formatTrafficRate = (bytesPerSecond: number) =>
+    `${formatTrafficBytes(bytesPerSecond)}/s`
+
+  const relayFallbackParticipants = (network: NetworkView) =>
+    network.participants.filter((participant) => participant.relayPathActive)
+
+  const relayFallbackSummaryText = (network: NetworkView) => {
+    const participants = relayFallbackParticipants(network)
+    if (participants.length === 0) {
+      return 'No peers are currently using relay fallback.'
+    }
+
+    const totals = participants.reduce(
+      (acc, participant) => ({
+        rx: acc.rx + participant.rxBytes,
+        tx: acc.tx + participant.txBytes,
+      }),
+      { rx: 0, tx: 0 },
+    )
+    const verb = participants.length === 1 ? 'is' : 'are'
+    return `${participants.length} peer${participants.length === 1 ? '' : 's'} ${verb} currently using relay fallback · rx ${formatTrafficBytes(totals.rx)} · tx ${formatTrafficBytes(totals.tx)}`
+  }
+
+  const relayOperatorSummaryText = (state: UiState) => {
+    const relay = state.relayOperator
+    if (!relay) {
+      return 'No local relay operator snapshot yet.'
+    }
+
+    if (relay.activeSessionCount === 0) {
+      return `No active relayed sessions right now · total ${formatTrafficBytes(relay.totalForwardedBytes)} across ${relay.totalSessionsServed} sessions`
+    }
+
+    return `${relay.activeSessionCount} active relayed session${relay.activeSessionCount === 1 ? '' : 's'} · ${formatTrafficRate(relay.currentForwardBps)} · total ${formatTrafficBytes(relay.totalForwardedBytes)}`
+  }
+
+  const relaySessionTrafficText = (bytesFromRequester: number, bytesFromTarget: number) =>
+    `A→B ${formatTrafficBytes(bytesFromRequester)} · B→A ${formatTrafficBytes(bytesFromTarget)}`
+
   const formatCountdown = (totalSecs: number) => {
     const minutes = Math.floor(totalSecs / 60)
     const seconds = totalSecs % 60
@@ -2198,6 +2264,10 @@
                 </div>
                 <div class="item-sub" data-testid="participant-status-text">
                   {participant.magicDnsName || participant.magicDnsAlias || 'No alias'} | {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
+                  | {participantTrafficText(participant)}
+                  {#if participant.relayPathActive && participant.runtimeEndpoint}
+                    | relay {participant.runtimeEndpoint}
+                  {/if}
                   {#if participant.advertisedRoutes.length > 0}
                     | routes {participant.advertisedRoutes.join(', ')}
                   {/if}
@@ -2216,6 +2286,9 @@
                 >
                   {participantPresenceBadgeText(participant)}
                 </span>
+                {#if participant.relayPathActive}
+                  <span class="badge participant-badge warn">Relay fallback</span>
+                {/if}
                 {#if participant.offersExitNode}
                   <span class="badge participant-badge warn">Exit node</span>
                 {/if}
@@ -2759,6 +2832,121 @@
     <details class="panel collapsible-panel">
       <summary class="collapsible-summary">
         <div>
+          <div class="panel-kicker">Contribute</div>
+          <h2>Public Services</h2>
+        </div>
+        <div class="section-meta">
+          {state.relayOperatorRunning || state.natAssistRunning
+            ? 'Running'
+            : state.relayForOthers || state.provideNatAssist
+              ? 'Waiting to start'
+              : 'Disabled'}
+        </div>
+      </summary>
+
+      <div class="collapsible-body">
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={state.relayForOthers}
+            on:change={(event) =>
+              onUpdateSettings({
+                relayForOthers: (event.target as HTMLInputElement).checked,
+              })}
+          />
+          <span>Relay traffic for others</span>
+        </label>
+
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={state.provideNatAssist}
+            on:change={(event) =>
+              onUpdateSettings({
+                provideNatAssist: (event.target as HTMLInputElement).checked,
+              })}
+          />
+          <span>Provide NAT assist</span>
+        </label>
+
+        <div class="config-path settings-note">{state.relayOperatorStatus}</div>
+        <div class="config-path settings-note">{state.natAssistStatus}</div>
+        <div class="config-path settings-note">{relayOperatorSummaryText(state)}</div>
+
+        {#if state.relayOperator}
+          <div class="stack rows">
+            <div class="item-row">
+              <div class="item-main">
+                <div class="item-title">Relay identity</div>
+                <div class="item-sub">{short(state.relayOperator.relayNpub, 18, 12)}</div>
+              </div>
+              <div class="participant-badges">
+                <span class="badge muted">Relay operator</span>
+              </div>
+            </div>
+
+            <div class="item-row">
+              <div class="item-main">
+                <div class="item-title">Advertised ingress</div>
+                <div class="item-sub">
+                  {state.relayOperator.advertisedEndpoint || 'not advertising ingress'}
+                </div>
+              </div>
+              <div class="participant-badges">
+                <span
+                  class={`badge ${state.relayOperator.activeSessionCount > 0 ? 'warn' : 'muted'}`}
+                >
+                  {formatTrafficRate(state.relayOperator.currentForwardBps)}
+                </span>
+              </div>
+            </div>
+
+            <div class="item-row">
+              <div class="item-main">
+                <div class="item-title">Lifetime totals</div>
+                <div class="item-sub">
+                  {state.relayOperator.totalSessionsServed} sessions · {state.relayOperator.uniquePeerCount} peers · {formatTrafficBytes(state.relayOperator.totalForwardedBytes)}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-meta">Active relayed sessions</div>
+          {#if state.relayOperator.activeSessions.length === 0}
+            <div class="config-path settings-note">No peers are currently being relayed through this device.</div>
+          {:else}
+            <div class="stack rows">
+              {#each state.relayOperator.activeSessions as session}
+                <div class="item-row">
+                  <div class="item-main">
+                    <div class="item-title">
+                      {short(session.requesterNpub, 16, 10)} → {short(session.targetNpub, 16, 10)}
+                    </div>
+                    <div class="item-sub">
+                      {relaySessionTrafficText(session.bytesFromRequester, session.bytesFromTarget)} | started {session.startedText} | expires {session.expiresText}
+                    </div>
+                    <div class="item-sub">
+                      ingress A {session.requesterIngressEndpoint} | ingress B {session.targetIngressEndpoint}
+                    </div>
+                  </div>
+                  <div class="participant-badges">
+                    <span class="badge warn">{formatTrafficBytes(session.totalForwardedBytes)}</span>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        {:else}
+          <div class="config-path settings-note">
+            Run a local relay operator and its forwarded traffic, active sessions, and cumulative totals will appear here.
+          </div>
+        {/if}
+      </div>
+    </details>
+
+    <details class="panel collapsible-panel">
+      <summary class="collapsible-summary">
+        <div>
           <div class="panel-kicker">Advanced</div>
           <h2>Relays</h2>
         </div>
@@ -2820,6 +3008,19 @@
           <label class="toggle-row">
             <input
               type="checkbox"
+              checked={state.usePublicRelayFallback}
+              on:change={(event) =>
+                onUpdateSettings({
+                  usePublicRelayFallback: (event.target as HTMLInputElement).checked,
+                })}
+            />
+            <span>Use public relay fallback when direct connection fails</span>
+          </label>
+          <div class="config-path settings-note">{publicRelayFallbackStatusText(state)}</div>
+
+          <label class="toggle-row">
+            <input
+              type="checkbox"
               checked={state.autoDisconnectRelaysWhenMeshReady}
               on:change={(event) =>
                 onUpdateSettings({
@@ -2840,6 +3041,30 @@
             />
             <span>Auto-connect session on app start</span>
           </label>
+
+          <div class="section-meta">Current fallback</div>
+          <div class="config-path settings-note">{relayFallbackSummaryText(activeNetworkView)}</div>
+          {#if relayFallbackParticipants(activeNetworkView).length > 0}
+            <div class="stack rows">
+              {#each relayFallbackParticipants(activeNetworkView) as participant}
+                <div class="item-row">
+                  <div class="item-main">
+                    <div class="item-title">
+                      {participant.magicDnsName || participant.magicDnsAlias || participant.npub}
+                    </div>
+                    <div class="item-sub">
+                      {participant.runtimeEndpoint
+                        ? `relay ${participant.runtimeEndpoint}`
+                        : 'relay fallback active'} | {participantTrafficText(participant)}
+                    </div>
+                  </div>
+                  <div class="participant-badges">
+                    <span class="badge participant-badge warn">Relay fallback</span>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
         </div>
       </details>
     {/if}

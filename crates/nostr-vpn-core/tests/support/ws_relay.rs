@@ -28,6 +28,7 @@ struct NostrEvent {
     sig: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct RelayEventSnapshot {
     pub pubkey: String,
@@ -46,6 +47,10 @@ struct NostrFilter {
     kinds: Option<Vec<u32>>,
     #[serde(rename = "#p", skip_serializing_if = "Option::is_none")]
     p_tags: Option<Vec<String>>,
+    #[serde(rename = "#t", skip_serializing_if = "Option::is_none")]
+    t_tags: Option<Vec<String>>,
+    #[serde(rename = "#d", skip_serializing_if = "Option::is_none")]
+    d_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     since: Option<u64>,
 }
@@ -72,6 +77,24 @@ impl NostrFilter {
                 .tags
                 .iter()
                 .any(|t| t.len() >= 2 && t[0] == "p" && p_tags.contains(&t[1]));
+            if !has_match {
+                return false;
+            }
+        }
+        if let Some(t_tags) = &self.t_tags {
+            let has_match = event
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "t" && t_tags.contains(&t[1]));
+            if !has_match {
+                return false;
+            }
+        }
+        if let Some(d_tags) = &self.d_tags {
+            let has_match = event
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "d" && d_tags.contains(&t[1]));
             if !has_match {
                 return false;
             }
@@ -153,6 +176,7 @@ impl WsRelay {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn events_snapshot(&self) -> Vec<RelayEventSnapshot> {
         self.state
             .events

@@ -23,12 +23,45 @@ export interface ParticipantView {
   tunnelIp: string
   magicDnsAlias: string
   magicDnsName: string
+  relayPathActive: boolean
+  runtimeEndpoint: string
+  txBytes: number
+  rxBytes: number
   advertisedRoutes: string[]
   offersExitNode: boolean
   state: PeerState
   presenceState: PresenceState
   statusText: string
   lastSignalText: string
+}
+
+export interface RelayOperatorSessionView {
+  requestId: string
+  networkId: string
+  requesterNpub: string
+  requesterPubkeyHex: string
+  targetNpub: string
+  targetPubkeyHex: string
+  requesterIngressEndpoint: string
+  targetIngressEndpoint: string
+  startedText: string
+  expiresText: string
+  bytesFromRequester: number
+  bytesFromTarget: number
+  totalForwardedBytes: number
+}
+
+export interface RelayOperatorView {
+  relayNpub: string
+  relayPubkeyHex: string
+  advertisedEndpoint: string
+  totalSessionsServed: number
+  totalForwardedBytes: number
+  currentForwardBps: number
+  uniquePeerCount: number
+  activeSessionCount: number
+  updatedText: string
+  activeSessions: RelayOperatorSessionView[]
 }
 
 export interface OutboundJoinRequestView {
@@ -136,6 +169,13 @@ export interface UiState {
   advertiseExitNode: boolean
   advertisedRoutes: string[]
   effectiveAdvertisedRoutes: string[]
+  usePublicRelayFallback: boolean
+  relayForOthers: boolean
+  provideNatAssist: boolean
+  relayOperatorRunning: boolean
+  relayOperatorStatus: string
+  natAssistRunning: boolean
+  natAssistStatus: string
   magicDnsSuffix: string
   magicDnsStatus: string
   autoDisconnectRelaysWhenMeshReady: boolean
@@ -153,6 +193,7 @@ export interface UiState {
   networks: NetworkView[]
   relays: RelayView[]
   relaySummary: RelaySummary
+  relayOperator: RelayOperatorView | null
   lanPeers: LanPeerView[]
 }
 
@@ -164,6 +205,9 @@ export interface SettingsPatch {
   exitNode?: string
   advertiseExitNode?: boolean
   advertisedRoutes?: string
+  usePublicRelayFallback?: boolean
+  relayForOthers?: boolean
+  provideNatAssist?: boolean
   magicDnsSuffix?: string
   autoDisconnectRelaysWhenMeshReady?: boolean
   autoconnect?: boolean

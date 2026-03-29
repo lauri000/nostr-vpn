@@ -11,6 +11,7 @@ use crate::control::{
 enum PeerPathSource {
     Local,
     Public,
+    Relay,
     Legacy,
     Observed,
 }
@@ -21,14 +22,19 @@ impl PeerPathSource {
     }
 
     fn rank(self, same_subnet_local: bool) -> u8 {
+        if matches!(self, Self::Relay) {
+            return 5;
+        }
+
         if same_subnet_local {
-            return 3;
+            return 4;
         }
 
         match self {
             Self::Public | Self::Observed => 2,
             Self::Legacy => 1,
             Self::Local => 0,
+            Self::Relay => 5,
         }
     }
 }
@@ -278,6 +284,12 @@ impl PeerPathBook {
             return Some(current_endpoint.clone());
         }
 
+        if preferred_state.source == PeerPathSource::Relay
+            && current.source != PeerPathSource::Relay
+        {
+            return Some(preferred);
+        }
+
         let can_rotate = current
             .last_selected_at
             .map(|selected_at| now.saturating_sub(selected_at) >= retry_after_secs)
@@ -307,6 +319,13 @@ fn announcement_endpoints(announcement: &PeerAnnouncement) -> Vec<(String, PeerP
         && seen.insert(public_endpoint.to_string())
     {
         endpoints.push((public_endpoint.to_string(), PeerPathSource::Public));
+    }
+
+    if let Some(relay_endpoint) = announcement.relay_endpoint.as_deref()
+        && !relay_endpoint.trim().is_empty()
+        && seen.insert(relay_endpoint.to_string())
+    {
+        endpoints.push((relay_endpoint.to_string(), PeerPathSource::Relay));
     }
 
     if !announcement.endpoint.trim().is_empty() && seen.insert(announcement.endpoint.clone()) {

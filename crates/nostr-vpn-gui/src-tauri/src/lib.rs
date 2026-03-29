@@ -46,6 +46,10 @@ use nostr_vpn_core::platform_paths::{
     legacy_config_path_from_dirs_config_dir, windows_service_binary_path_from_sc_qc_output,
     windows_service_config_path_from_sc_qc_output,
 };
+use nostr_vpn_core::relay::{
+    RelayOperatorState as SharedRelayOperatorState,
+    ServiceOperatorState as SharedServiceOperatorState,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri::WindowEvent;
@@ -118,6 +122,9 @@ struct PeerLinkStatus {
     reachable: Option<bool>,
     last_handshake_at: Option<SystemTime>,
     endpoint: Option<String>,
+    runtime_endpoint: Option<String>,
+    tx_bytes: u64,
+    rx_bytes: u64,
     error: Option<String>,
     checked_at: Option<SystemTime>,
     last_signal_seen_at: Option<SystemTime>,
@@ -230,6 +237,14 @@ struct DaemonRuntimeState {
     network: NetworkSummary,
     #[serde(default)]
     port_mapping: PortMappingStatus,
+    #[serde(default)]
+    relay_operator_running: bool,
+    #[serde(default)]
+    relay_operator_status: String,
+    #[serde(default)]
+    nat_assist_running: bool,
+    #[serde(default)]
+    nat_assist_status: String,
     peers: Vec<DaemonPeerState>,
 }
 
@@ -240,6 +255,12 @@ struct DaemonPeerState {
     node_id: String,
     tunnel_ip: String,
     endpoint: String,
+    #[serde(default)]
+    runtime_endpoint: Option<String>,
+    #[serde(default)]
+    tx_bytes: u64,
+    #[serde(default)]
+    rx_bytes: u64,
     public_key: String,
     advertised_routes: Vec<String>,
     presence_timestamp: u64,
@@ -265,12 +286,49 @@ struct ParticipantView {
     tunnel_ip: String,
     magic_dns_alias: String,
     magic_dns_name: String,
+    relay_path_active: bool,
+    runtime_endpoint: String,
+    tx_bytes: u64,
+    rx_bytes: u64,
     advertised_routes: Vec<String>,
     offers_exit_node: bool,
     state: String,
     presence_state: String,
     status_text: String,
     last_signal_text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayOperatorSessionView {
+    request_id: String,
+    network_id: String,
+    requester_npub: String,
+    requester_pubkey_hex: String,
+    target_npub: String,
+    target_pubkey_hex: String,
+    requester_ingress_endpoint: String,
+    target_ingress_endpoint: String,
+    started_text: String,
+    expires_text: String,
+    bytes_from_requester: u64,
+    bytes_from_target: u64,
+    total_forwarded_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayOperatorView {
+    relay_npub: String,
+    relay_pubkey_hex: String,
+    advertised_endpoint: String,
+    total_sessions_served: u64,
+    total_forwarded_bytes: u64,
+    current_forward_bps: u64,
+    unique_peer_count: usize,
+    active_session_count: usize,
+    updated_text: String,
+    active_sessions: Vec<RelayOperatorSessionView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -357,6 +415,13 @@ struct UiState {
     advertise_exit_node: bool,
     advertised_routes: Vec<String>,
     effective_advertised_routes: Vec<String>,
+    use_public_relay_fallback: bool,
+    relay_for_others: bool,
+    provide_nat_assist: bool,
+    relay_operator_running: bool,
+    relay_operator_status: String,
+    nat_assist_running: bool,
+    nat_assist_status: String,
     magic_dns_suffix: String,
     magic_dns_status: String,
     auto_disconnect_relays_when_mesh_ready: bool,
@@ -374,6 +439,7 @@ struct UiState {
     networks: Vec<NetworkView>,
     relays: Vec<RelayView>,
     relay_summary: RelaySummary,
+    relay_operator: Option<RelayOperatorView>,
     lan_peers: Vec<LanPeerView>,
 }
 
@@ -387,6 +453,9 @@ struct SettingsPatch {
     exit_node: Option<String>,
     advertise_exit_node: Option<bool>,
     advertised_routes: Option<String>,
+    use_public_relay_fallback: Option<bool>,
+    relay_for_others: Option<bool>,
+    provide_nat_assist: Option<bool>,
     magic_dns_suffix: Option<String>,
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
     autoconnect: Option<bool>,
@@ -573,6 +642,7 @@ struct NvpnBackend {
     service_status_detail: String,
     last_service_status_refresh_at: Option<Instant>,
     daemon_state: Option<DaemonRuntimeState>,
+    relay_operator_state: Option<SharedServiceOperatorState>,
     launch_start_pending: bool,
     force_connect_pending: bool,
 
@@ -683,6 +753,7 @@ impl NvpnBackend {
             service_status_detail: String::new(),
             last_service_status_refresh_at: None,
             daemon_state: None,
+            relay_operator_state: None,
             launch_start_pending: false,
             force_connect_pending: false,
             relay_status,
@@ -699,6 +770,7 @@ impl NvpnBackend {
 
         backend.ensure_relay_status_entries();
         backend.ensure_peer_status_entries();
+        backend.refresh_relay_operator_state();
         #[cfg(target_os = "ios")]
         write_ios_probe("backend: status entries ensured");
         #[cfg(target_os = "ios")]
@@ -1249,6 +1321,21 @@ impl NvpnBackend {
 
         if let Some(advertised_routes) = patch.advertised_routes {
             self.config.node.advertised_routes = parse_advertised_routes_input(&advertised_routes)?;
+            restart_required = true;
+        }
+
+        if let Some(use_public_relay_fallback) = patch.use_public_relay_fallback {
+            self.config.use_public_relay_fallback = use_public_relay_fallback;
+            restart_required = true;
+        }
+
+        if let Some(relay_for_others) = patch.relay_for_others {
+            self.config.relay_for_others = relay_for_others;
+            restart_required = true;
+        }
+
+        if let Some(provide_nat_assist) = patch.provide_nat_assist {
+            self.config.provide_nat_assist = provide_nat_assist;
             restart_required = true;
         }
 
@@ -2335,6 +2422,8 @@ impl NvpnBackend {
                 status.last_handshake_at = None;
                 status.endpoint = None;
                 status.error = Some("vpn unavailable on this platform".to_string());
+                status.tx_bytes = 0;
+                status.rx_bytes = 0;
                 status.checked_at = Some(SystemTime::now());
                 status.last_signal_seen_at = None;
                 status.advertised_routes = Vec::new();
@@ -2368,6 +2457,9 @@ impl NvpnBackend {
                     status.reachable = None;
                     status.last_handshake_at = None;
                     status.endpoint = None;
+                    status.runtime_endpoint = None;
+                    status.tx_bytes = 0;
+                    status.rx_bytes = 0;
                     status.error = Some("vpn off".to_string());
                     status.checked_at = Some(SystemTime::now());
                     status.last_signal_seen_at = None;
@@ -2570,6 +2662,9 @@ impl NvpnBackend {
                 status.reachable = None;
                 status.last_handshake_at = None;
                 status.endpoint = None;
+                status.runtime_endpoint = None;
+                status.tx_bytes = 0;
+                status.rx_bytes = 0;
                 status.error = None;
                 status.last_signal_seen_at = None;
                 status.advertised_routes = Vec::new();
@@ -2581,6 +2676,9 @@ impl NvpnBackend {
                 status.reachable = None;
                 status.last_handshake_at = None;
                 status.endpoint = None;
+                status.runtime_endpoint = None;
+                status.tx_bytes = 0;
+                status.rx_bytes = 0;
                 status.error = Some("vpn off".to_string());
                 status.last_signal_seen_at = None;
                 status.advertised_routes = Vec::new();
@@ -2592,6 +2690,9 @@ impl NvpnBackend {
                 status.reachable = Some(false);
                 status.last_handshake_at = None;
                 status.endpoint = None;
+                status.runtime_endpoint = None;
+                status.tx_bytes = 0;
+                status.rx_bytes = 0;
                 status.error = Some("no signal yet".to_string());
                 status.last_signal_seen_at = None;
                 status.advertised_routes = Vec::new();
@@ -2611,6 +2712,9 @@ impl NvpnBackend {
             } else {
                 Some(peer.endpoint.clone())
             };
+            status.runtime_endpoint = peer.runtime_endpoint.clone();
+            status.tx_bytes = peer.tx_bytes;
+            status.rx_bytes = peer.rx_bytes;
             let daemon_handshake_at = peer.last_handshake_at.and_then(epoch_secs_to_system_time);
             status.last_handshake_at = if daemon_handshake_at.is_some() {
                 daemon_handshake_at
@@ -2690,6 +2794,13 @@ impl NvpnBackend {
         let presence_state = self.peer_presence_state_for(participant, own_pubkey_hex);
         let status_text = self.peer_status_line(participant, transport_state);
         let last_signal_text = self.peer_presence_line(participant, own_pubkey_hex);
+        let link = self.peer_status.get(participant);
+        let relay_path_active = link.is_some_and(peer_link_uses_relay_path);
+        let runtime_endpoint = link
+            .and_then(|status| status.runtime_endpoint.clone())
+            .unwrap_or_default();
+        let tx_bytes = link.map(|status| status.tx_bytes).unwrap_or(0);
+        let rx_bytes = link.map(|status| status.rx_bytes).unwrap_or(0);
         let (magic_dns_alias, magic_dns_name) = if is_local {
             (
                 self.config.self_magic_dns_label().unwrap_or_default(),
@@ -2726,6 +2837,10 @@ impl NvpnBackend {
             tunnel_ip,
             magic_dns_alias,
             magic_dns_name,
+            relay_path_active,
+            runtime_endpoint,
+            tx_bytes,
+            rx_bytes,
             advertised_routes,
             offers_exit_node,
             state: peer_state_label(transport_state).to_string(),
@@ -2908,6 +3023,14 @@ impl NvpnBackend {
                     return "online".to_string();
                 };
 
+                if peer_link_uses_relay_path(link) {
+                    let runtime_endpoint = link.runtime_endpoint.as_deref().unwrap_or_default();
+                    return format!(
+                        "online via relay {}",
+                        shorten_middle(runtime_endpoint, 18, 10)
+                    );
+                }
+
                 let handshake_age = link
                     .last_handshake_at
                     .and_then(|handshake_at| handshake_at.elapsed().ok())
@@ -2974,7 +3097,44 @@ impl NvpnBackend {
         self.clear_connected_join_requests();
         self.maybe_perform_pending_launch_action();
         self.sync_daemon_state();
+        self.refresh_relay_operator_state();
         self.clear_connected_join_requests();
+    }
+
+    fn relay_operator_state_path(&self) -> PathBuf {
+        self.config_path.with_file_name("relay.operator.json")
+    }
+
+    fn refresh_relay_operator_state(&mut self) {
+        let path = self.relay_operator_state_path();
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.relay_operator_state = None;
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "gui: failed to read relay operator state {}: {error}",
+                    path.display()
+                );
+                self.relay_operator_state = None;
+                return;
+            }
+        };
+
+        match parse_service_operator_state(&raw) {
+            Ok(state) => {
+                self.relay_operator_state = Some(state);
+            }
+            Err(error) => {
+                eprintln!(
+                    "gui: failed to parse relay operator state {}: {error}",
+                    path.display()
+                );
+                self.relay_operator_state = None;
+            }
+        }
     }
 
     fn maybe_perform_pending_launch_action(&mut self) {
@@ -3168,6 +3328,45 @@ impl NvpnBackend {
             .collect()
     }
 
+    fn relay_operator_view(&self) -> Option<RelayOperatorView> {
+        let state = self.relay_operator_state.as_ref()?.relay.as_ref()?;
+        let now = current_unix_timestamp();
+        let updated_text = compact_age_text(now.saturating_sub(state.updated_at));
+
+        Some(RelayOperatorView {
+            relay_npub: to_npub(&state.relay_pubkey),
+            relay_pubkey_hex: state.relay_pubkey.clone(),
+            advertised_endpoint: state.advertised_endpoint.clone(),
+            total_sessions_served: state.total_sessions_served,
+            total_forwarded_bytes: state.total_forwarded_bytes,
+            current_forward_bps: state.current_forward_bps,
+            unique_peer_count: state.unique_peer_count,
+            active_session_count: state.active_sessions.len(),
+            updated_text,
+            active_sessions: state
+                .active_sessions
+                .iter()
+                .map(|session| RelayOperatorSessionView {
+                    request_id: session.request_id.clone(),
+                    network_id: session.network_id.clone(),
+                    requester_npub: to_npub(&session.requester_pubkey),
+                    requester_pubkey_hex: session.requester_pubkey.clone(),
+                    target_npub: to_npub(&session.target_pubkey),
+                    target_pubkey_hex: session.target_pubkey.clone(),
+                    requester_ingress_endpoint: session.requester_ingress_endpoint.clone(),
+                    target_ingress_endpoint: session.target_ingress_endpoint.clone(),
+                    started_text: compact_age_text(now.saturating_sub(session.started_at)),
+                    expires_text: compact_remaining_text(session.expires_at.saturating_sub(now)),
+                    bytes_from_requester: session.bytes_from_requester,
+                    bytes_from_target: session.bytes_from_target,
+                    total_forwarded_bytes: session
+                        .bytes_from_requester
+                        .saturating_add(session.bytes_from_target),
+                })
+                .collect(),
+        })
+    }
+
     fn npub_or_none(&self, value: &str) -> Option<String> {
         PublicKey::from_hex(value)
             .ok()
@@ -3271,6 +3470,41 @@ impl NvpnBackend {
             advertise_exit_node: self.config.node.advertise_exit_node,
             advertised_routes: self.config.node.advertised_routes.clone(),
             effective_advertised_routes: self.config.effective_advertised_routes(),
+            use_public_relay_fallback: self.config.use_public_relay_fallback,
+            relay_for_others: self.config.relay_for_others,
+            provide_nat_assist: self.config.provide_nat_assist,
+            relay_operator_running: self
+                .daemon_state
+                .as_ref()
+                .map(|state| state.relay_operator_running)
+                .unwrap_or(false),
+            relay_operator_status: self
+                .daemon_state
+                .as_ref()
+                .map(|state| state.relay_operator_status.clone())
+                .unwrap_or_else(|| {
+                    if self.config.relay_for_others {
+                        "Relay operator starts with the daemon".to_string()
+                    } else {
+                        "Relay operator disabled".to_string()
+                    }
+                }),
+            nat_assist_running: self
+                .daemon_state
+                .as_ref()
+                .map(|state| state.nat_assist_running)
+                .unwrap_or(false),
+            nat_assist_status: self
+                .daemon_state
+                .as_ref()
+                .map(|state| state.nat_assist_status.clone())
+                .unwrap_or_else(|| {
+                    if self.config.provide_nat_assist {
+                        "NAT assist starts with the daemon".to_string()
+                    } else {
+                        "NAT assist disabled".to_string()
+                    }
+                }),
             magic_dns_suffix: self.config.magic_dns_suffix.clone(),
             magic_dns_status: self.magic_dns_status.clone(),
             auto_disconnect_relays_when_mesh_ready: self
@@ -3290,6 +3524,7 @@ impl NvpnBackend {
             networks,
             relays,
             relay_summary,
+            relay_operator: self.relay_operator_view(),
             lan_peers: self.lan_peer_rows(),
         }
     }
@@ -3344,6 +3579,38 @@ impl NvpnBackend {
             network_groups: tray_network_groups(&networks),
             exit_nodes: tray_exit_node_entries(&networks, &self.config.exit_node),
         }
+    }
+}
+
+fn parse_service_operator_state(
+    raw: &[u8],
+) -> Result<SharedServiceOperatorState, serde_json::Error> {
+    match serde_json::from_slice::<SharedServiceOperatorState>(raw) {
+        Ok(state)
+            if state.relay.is_some()
+                || state.nat_assist.is_some()
+                || !state.operator_pubkey.trim().is_empty() =>
+        {
+            Ok(state)
+        }
+        Err(service_error) => match serde_json::from_slice::<SharedRelayOperatorState>(raw) {
+            Ok(relay_state) => Ok(SharedServiceOperatorState {
+                updated_at: relay_state.updated_at,
+                operator_pubkey: relay_state.relay_pubkey.clone(),
+                relay: Some(relay_state),
+                nat_assist: None,
+            }),
+            Err(_) => Err(service_error),
+        },
+        Ok(_) => match serde_json::from_slice::<SharedRelayOperatorState>(raw) {
+            Ok(relay_state) => Ok(SharedServiceOperatorState {
+                updated_at: relay_state.updated_at,
+                operator_pubkey: relay_state.relay_pubkey.clone(),
+                relay: Some(relay_state),
+                nat_assist: None,
+            }),
+            Err(service_error) => Err(service_error),
+        },
     }
 }
 
@@ -4129,6 +4396,19 @@ fn compact_age_text(age_secs: u64) -> String {
     }
 }
 
+fn compact_remaining_text(remaining_secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    match remaining_secs {
+        0..MINUTE => format!("{remaining_secs}s left"),
+        MINUTE..HOUR => format!("{}m left", remaining_secs / MINUTE),
+        HOUR..DAY => format!("{}h left", remaining_secs / HOUR),
+        _ => format!("{}d left", remaining_secs / DAY),
+    }
+}
+
 fn join_request_age_text(requested_at: u64) -> String {
     let age_secs = epoch_secs_to_system_time(requested_at)
         .and_then(|requested_at| requested_at.elapsed().ok())
@@ -4154,6 +4434,21 @@ fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
             .rev()
             .collect::<String>()
     )
+}
+
+fn peer_link_uses_relay_path(link: &PeerLinkStatus) -> bool {
+    let Some(runtime_endpoint) = link
+        .runtime_endpoint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+
+    link.endpoint
+        .as_deref()
+        .map(|endpoint| endpoint != runtime_endpoint)
+        .unwrap_or(true)
 }
 
 fn expected_peer_count(config: &AppConfig) -> usize {
@@ -5991,9 +6286,9 @@ mod tests {
         ConfiguredPeerStatus, DaemonPeerState, DaemonRuntimeState, GuiLaunchDisposition,
         IOS_TAURI_ORIGIN, LAN_PAIRING_ANNOUNCEMENT_VERSION, LAN_PAIRING_DURATION_SECS,
         NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend, ParticipantView,
-        PeerPresenceStatus, PendingLaunchAction, RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID,
-        TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_THIS_DEVICE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID,
-        TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
+        PeerPresenceStatus, PendingLaunchAction, RuntimePlatform, SettingsPatch,
+        TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_THIS_DEVICE_MENU_ID,
+        TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
         apply_network_invite_to_active_network, bundled_nvpn_candidate_paths,
         cli_binary_installed_at, config_path_from_roots, decode_lan_pairing_announcement,
         desktop_config_path_from_roots, epoch_secs_to_system_time, expected_peer_count,
@@ -6017,9 +6312,10 @@ mod tests {
     use nostr_vpn_core::config::{
         AppConfig, PendingInboundJoinRequest, PendingOutboundJoinRequest,
     };
+    use nostr_vpn_core::relay::{RelayOperatorSessionState, RelayOperatorState};
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::runtime::Runtime;
@@ -6033,6 +6329,10 @@ mod tests {
                 .expect("epoch")
                 .as_nanos()
         ))
+    }
+
+    fn relay_state_path(config_path: &Path) -> PathBuf {
+        config_path.with_file_name("relay.operator.json")
     }
 
     fn test_backend(participant: &str) -> NvpnBackend {
@@ -6056,6 +6356,7 @@ mod tests {
             service_status_detail: String::new(),
             last_service_status_refresh_at: None,
             daemon_state: None,
+            relay_operator_state: None,
             launch_start_pending: false,
             force_connect_pending: false,
             relay_status: HashMap::new(),
@@ -6089,6 +6390,9 @@ mod tests {
             node_id: "peer-a".to_string(),
             tunnel_ip: "10.44.0.2/32".to_string(),
             endpoint: endpoint.to_string(),
+            runtime_endpoint: None,
+            tx_bytes: 0,
+            rx_bytes: 0,
             public_key: "peer-public-key".to_string(),
             advertised_routes: Vec::new(),
             presence_timestamp: signal_age_secs.map(epoch_secs_ago).unwrap_or(0),
@@ -6124,6 +6428,10 @@ mod tests {
             health: Vec::new(),
             network: Default::default(),
             port_mapping: Default::default(),
+            relay_operator_running: false,
+            relay_operator_status: "Relay operator disabled".to_string(),
+            nat_assist_running: false,
+            nat_assist_status: "NAT assist disabled".to_string(),
             peers: peer.into_iter().collect(),
         }
     }
@@ -6789,6 +7097,63 @@ mod tests {
     }
 
     #[test]
+    fn refresh_relay_operator_state_loads_snapshot_for_ui() {
+        let participant = "66".repeat(32);
+        let mut backend = test_backend(&participant);
+        let state_path = relay_state_path(&backend.config_path);
+        let now = super::current_unix_timestamp();
+        let snapshot = RelayOperatorState {
+            updated_at: now.saturating_sub(2),
+            relay_pubkey: "aa".repeat(32),
+            advertised_endpoint: "198.51.100.23:0".to_string(),
+            total_sessions_served: 7,
+            total_forwarded_bytes: 9_216,
+            current_forward_bps: 1_024,
+            unique_peer_count: 4,
+            known_peer_pubkeys: vec!["bb".repeat(32), "cc".repeat(32)],
+            active_sessions: vec![RelayOperatorSessionState {
+                request_id: "relay-req-1".to_string(),
+                network_id: "mesh-home".to_string(),
+                requester_pubkey: "bb".repeat(32),
+                target_pubkey: "cc".repeat(32),
+                requester_ingress_endpoint: "198.51.100.23:41001".to_string(),
+                target_ingress_endpoint: "198.51.100.23:41002".to_string(),
+                started_at: now.saturating_sub(8),
+                expires_at: now + 52,
+                bytes_from_requester: 2_048,
+                bytes_from_target: 1_024,
+            }],
+        };
+
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&snapshot).expect("serialize relay snapshot"),
+        )
+        .expect("write relay snapshot");
+
+        backend.refresh_relay_operator_state();
+        let ui = backend.ui_state();
+        let relay = ui.relay_operator.expect("relay operator view");
+
+        assert_eq!(relay.relay_pubkey_hex, snapshot.relay_pubkey);
+        assert_eq!(relay.advertised_endpoint, "198.51.100.23:0");
+        assert_eq!(relay.total_sessions_served, 7);
+        assert_eq!(relay.total_forwarded_bytes, 9_216);
+        assert_eq!(relay.current_forward_bps, 1_024);
+        assert_eq!(relay.unique_peer_count, 4);
+        assert_eq!(relay.active_session_count, 1);
+        assert_eq!(relay.active_sessions.len(), 1);
+        assert_eq!(relay.active_sessions[0].request_id, "relay-req-1");
+        assert_eq!(relay.active_sessions[0].total_forwarded_bytes, 3_072);
+        assert!(relay.active_sessions[0].started_text.ends_with("ago"));
+        assert!(relay.active_sessions[0].expires_text.ends_with("left"));
+        assert!(relay.updated_text.ends_with("ago"));
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(backend.config_path.clone());
+    }
+
+    #[test]
     fn tick_keeps_pending_outbound_join_request_when_connection_predates_request() {
         let inviter = "88".repeat(32);
         let mut backend = test_backend(&inviter);
@@ -7110,6 +7475,10 @@ mod tests {
                         tunnel_ip: "10.44.0.10".to_string(),
                         magic_dns_alias: "self".to_string(),
                         magic_dns_name: "self.nvpn".to_string(),
+                        relay_path_active: false,
+                        runtime_endpoint: String::new(),
+                        tx_bytes: 0,
+                        rx_bytes: 0,
                         advertised_routes: Vec::new(),
                         offers_exit_node: false,
                         state: "local".to_string(),
@@ -7123,6 +7492,10 @@ mod tests {
                         tunnel_ip: "10.44.0.11".to_string(),
                         magic_dns_alias: "alice".to_string(),
                         magic_dns_name: "alice.nvpn".to_string(),
+                        relay_path_active: false,
+                        runtime_endpoint: String::new(),
+                        tx_bytes: 0,
+                        rx_bytes: 0,
                         advertised_routes: Vec::new(),
                         offers_exit_node: false,
                         state: "online".to_string(),
@@ -7149,6 +7522,10 @@ mod tests {
                     tunnel_ip: "10.44.0.12".to_string(),
                     magic_dns_alias: "bob".to_string(),
                     magic_dns_name: "bob.nvpn".to_string(),
+                    relay_path_active: false,
+                    runtime_endpoint: String::new(),
+                    tx_bytes: 0,
+                    rx_bytes: 0,
                     advertised_routes: Vec::new(),
                     offers_exit_node: false,
                     state: "offline".to_string(),
@@ -7185,6 +7562,10 @@ mod tests {
                         tunnel_ip: "10.44.0.11".to_string(),
                         magic_dns_alias: "alice".to_string(),
                         magic_dns_name: "alice.nvpn".to_string(),
+                        relay_path_active: false,
+                        runtime_endpoint: String::new(),
+                        tx_bytes: 0,
+                        rx_bytes: 0,
                         advertised_routes: vec!["0.0.0.0/0".to_string()],
                         offers_exit_node: true,
                         state: "online".to_string(),
@@ -7211,6 +7592,10 @@ mod tests {
                             tunnel_ip: "10.44.0.11".to_string(),
                             magic_dns_alias: "alice".to_string(),
                             magic_dns_name: "alice.nvpn".to_string(),
+                            relay_path_active: false,
+                            runtime_endpoint: String::new(),
+                            tx_bytes: 0,
+                            rx_bytes: 0,
                             advertised_routes: vec!["0.0.0.0/0".to_string()],
                             offers_exit_node: true,
                             state: "online".to_string(),
@@ -7224,6 +7609,10 @@ mod tests {
                             tunnel_ip: "10.44.0.12".to_string(),
                             magic_dns_alias: "bob".to_string(),
                             magic_dns_name: "bob.nvpn".to_string(),
+                            relay_path_active: false,
+                            runtime_endpoint: String::new(),
+                            tx_bytes: 0,
+                            rx_bytes: 0,
                             advertised_routes: vec!["::/0".to_string()],
                             offers_exit_node: true,
                             state: "offline".to_string(),
@@ -7271,6 +7660,10 @@ mod tests {
                     tunnel_ip: "10.44.0.11".to_string(),
                     magic_dns_alias: "alice".to_string(),
                     magic_dns_name: "alice.nvpn".to_string(),
+                    relay_path_active: false,
+                    runtime_endpoint: String::new(),
+                    tx_bytes: 0,
+                    rx_bytes: 0,
                     advertised_routes: Vec::new(),
                     offers_exit_node: false,
                     state: "online".to_string(),
@@ -7450,6 +7843,123 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
         assert!(!network.contains_key("listenForJoinRequests"));
+    }
+
+    #[test]
+    fn ui_state_enables_public_relay_fallback_by_default() {
+        let backend = test_backend(&"44".repeat(32));
+        let state = backend.ui_state();
+
+        assert!(state.use_public_relay_fallback);
+    }
+
+    #[test]
+    fn ui_state_disables_relay_for_others_by_default() {
+        let backend = test_backend(&"44".repeat(32));
+        let state = backend.ui_state();
+
+        assert!(!state.relay_for_others);
+        assert!(!state.provide_nat_assist);
+        assert!(!state.relay_operator_running);
+        assert_eq!(state.relay_operator_status, "Relay operator disabled");
+        assert!(!state.nat_assist_running);
+        assert_eq!(state.nat_assist_status, "NAT assist disabled");
+    }
+
+    #[test]
+    fn update_settings_can_disable_public_relay_fallback() {
+        let mut backend = test_backend(&"44".repeat(32));
+
+        backend
+            .update_settings(SettingsPatch {
+                use_public_relay_fallback: Some(false),
+                ..SettingsPatch::default()
+            })
+            .expect("update settings");
+
+        assert!(!backend.ui_state().use_public_relay_fallback);
+    }
+
+    #[test]
+    fn update_settings_can_enable_relay_for_others() {
+        let mut backend = test_backend(&"44".repeat(32));
+
+        backend
+            .update_settings(SettingsPatch {
+                relay_for_others: Some(true),
+                ..SettingsPatch::default()
+            })
+            .expect("update settings");
+
+        let state = backend.ui_state();
+        assert!(state.relay_for_others);
+        assert_eq!(
+            state.relay_operator_status,
+            "Relay operator starts with the daemon"
+        );
+    }
+
+    #[test]
+    fn update_settings_can_enable_nat_assist() {
+        let mut backend = test_backend(&"44".repeat(32));
+
+        backend
+            .update_settings(SettingsPatch {
+                provide_nat_assist: Some(true),
+                ..SettingsPatch::default()
+            })
+            .expect("update settings");
+
+        let state = backend.ui_state();
+        assert!(state.provide_nat_assist);
+        assert_eq!(state.nat_assist_status, "NAT assist starts with the daemon");
+    }
+
+    #[test]
+    fn ui_state_uses_daemon_relay_operator_runtime_status() {
+        let mut backend = test_backend(&"44".repeat(32));
+        backend.config.relay_for_others = true;
+        let mut daemon_state = daemon_state_with_peer(None, false);
+        daemon_state.relay_operator_running = true;
+        daemon_state.relay_operator_status =
+            "Relaying for others on 198.51.100.7 (pid 4242)".to_string();
+        daemon_state.nat_assist_running = true;
+        daemon_state.nat_assist_status = "Providing NAT assist on 198.51.100.7:3478".to_string();
+        backend.daemon_state = Some(daemon_state);
+
+        let state = backend.ui_state();
+        assert!(state.relay_for_others);
+        assert!(state.relay_operator_running);
+        assert_eq!(
+            state.relay_operator_status,
+            "Relaying for others on 198.51.100.7 (pid 4242)"
+        );
+        assert!(state.nat_assist_running);
+        assert_eq!(
+            state.nat_assist_status,
+            "Providing NAT assist on 198.51.100.7:3478"
+        );
+    }
+
+    #[test]
+    fn peer_status_line_reports_when_runtime_uses_relay_endpoint() {
+        let participant = "44".repeat(32);
+        let mut backend = test_backend(&participant);
+        let mut peer = daemon_peer(&participant, true, Some(3), None, "203.0.113.10:51820");
+        peer.runtime_endpoint = Some("198.51.100.9:45000".to_string());
+        peer.tx_bytes = 4_096;
+        peer.rx_bytes = 8_192;
+        backend.daemon_state = Some(daemon_state_with_peer(Some(peer), true));
+        backend.session_active = true;
+        backend.refresh_peer_runtime_status();
+
+        let view = backend.participant_view(&participant, "mesh-test", None);
+        assert!(view.status_text.contains("relay"));
+        assert!(view.status_text.contains("198.51.100.9:45000"));
+        assert!(view.relay_path_active);
+        assert_eq!(view.runtime_endpoint, "198.51.100.9:45000");
+        assert_eq!(view.tx_bytes, 4_096);
+        assert_eq!(view.rx_bytes, 8_192);
     }
 
     #[test]
