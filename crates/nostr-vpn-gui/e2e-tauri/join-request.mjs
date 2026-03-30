@@ -436,6 +436,39 @@ async function main() {
       30_000,
     )
 
+    await clickSelector(
+      OWNER_DRIVER_BASE,
+      ownerSessionId,
+      '[data-testid="participant-toggle-admin"]',
+    )
+
+    await Promise.all([
+      waitForSelectorText(
+        OWNER_DRIVER_BASE,
+        ownerSessionId,
+        '[data-testid="network-admin-summary"]',
+        /2 admins configured/i,
+        'owner admin summary after promotion',
+        40_000,
+      ),
+      waitForSelectorText(
+        OWNER_DRIVER_BASE,
+        ownerSessionId,
+        '[data-testid="participant-admin-badge"]',
+        /admin/i,
+        'owner promoted participant admin badge',
+        40_000,
+      ),
+      waitForSelectorText(
+        REQUESTER_DRIVER_BASE,
+        requesterSessionId,
+        '[data-testid="network-admin-summary"]',
+        /you can manage members/i,
+        'requester promoted to admin',
+        70_000,
+      ),
+    ])
+
     const requesterStatusText = await source(REQUESTER_DRIVER_BASE, requesterSessionId)
     if (!/Mesh connection received/i.test(requesterStatusText)) {
       throw new Error('requester did not show "Mesh connection received" after the real connection arrived')
@@ -456,7 +489,7 @@ async function main() {
     log(`requester screenshot written: ${REQUESTER_SCREENSHOT_PATH}`)
 
     log(
-      `tauri-driver join-request e2e passed: requester ${requesterNpub} stayed Requested until owner ${ownerNpub} accepted and the real mesh came up`,
+      `tauri-driver join-request e2e passed: requester ${requesterNpub} stayed Requested until owner ${ownerNpub} accepted, the real mesh came up, and admin promotion propagated back into the UI`,
     )
   } catch (error) {
     await captureFailureScreenshots(ownerSessionId, requesterSessionId)

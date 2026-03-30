@@ -118,6 +118,27 @@ fn successful_local_path_stops_sticking_after_subnet_change() {
 }
 
 #[test]
+fn benchmark_net_local_path_stops_sticking_after_public_reflector_path_appears() {
+    let mut paths = PeerPathBook::default();
+    let announcement = announcement(
+        "10.254.241.10:51820",
+        Some("198.19.241.3:51820"),
+        Some("10.254.241.10:51820"),
+        10,
+    );
+
+    paths.refresh_from_announcement("peer-a", &announcement, 10);
+    paths.note_selected("peer-a", "198.19.241.3:51820", 10);
+    paths.note_success("peer-a", "198.19.241.3:51820", 11);
+
+    let selected = paths
+        .select_endpoint("peer-a", &announcement, Some("10.44.202.86:51820"), 12, 5)
+        .expect("public reflector path after local-only route change");
+
+    assert_eq!(selected, "10.254.241.10:51820");
+}
+
+#[test]
 fn cached_endpoint_survives_flap_until_pruned() {
     let mut paths = PeerPathBook::default();
     let original = announcement(

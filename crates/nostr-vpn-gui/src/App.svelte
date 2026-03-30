@@ -31,6 +31,7 @@
   } from './lib/mesh-id.js'
   import { nodeNameDnsPreview } from './lib/node-name.js'
   import {
+    addAdmin,
     addNetwork,
     addParticipant,
     addRelay,
@@ -44,6 +45,7 @@
     installSystemService,
     isAutostartEnabled,
     removeNetwork,
+    removeAdmin,
     removeParticipant,
     removeRelay,
     renameNetwork,
@@ -701,6 +703,17 @@
       return `${saved} • ${onlineDeviceSummary(network.onlineCount, network.expectedCount)}`
     }
     return saved
+  }
+
+  const networkAdminSummary = (network: NetworkView) => {
+    const count = network.adminNpubs.length
+    if (count === 0) {
+      return 'No admins configured'
+    }
+    if (network.localIsAdmin) {
+      return `You can manage members • ${count} admin${count === 1 ? '' : 's'} configured`
+    }
+    return `Managed by ${short(network.inviteInviterNpub || network.adminNpubs[0] || '')} • ${count} admin${count === 1 ? '' : 's'} configured`
   }
 
   const onlineDeviceSummary = (onlineCount: number, expectedCount: number) =>
@@ -1459,6 +1472,14 @@
     }
   }
 
+  async function onToggleAdmin(networkId: string, participant: ParticipantView) {
+    if (participant.isAdmin) {
+      await runAction(() => removeAdmin(networkId, participant.npub))
+      return
+    }
+    await runAction(() => addAdmin(networkId, participant.npub))
+  }
+
   async function onJoinLanPeer(invite: string) {
     await importInviteCode(invite)
   }
@@ -1958,10 +1979,14 @@
           <div class="config-path">
             Includes the Mesh ID, your npub, and the relay list for {activeNetworkView.name}.
           </div>
+          <div class="config-path" data-testid="network-admin-summary">
+            {networkAdminSummary(activeNetworkView)}
+          </div>
           <label class="toggle-row">
             <input
               type="checkbox"
               checked={activeNetworkView.joinRequestsEnabled}
+              disabled={!activeNetworkView.localIsAdmin}
               on:change={(event) =>
                 onToggleJoinRequests(
                   activeNetworkView.id,
@@ -2008,6 +2033,7 @@
                   <button
                     class="btn"
                     data-testid="accept-join-request"
+                    disabled={!activeNetworkView.localIsAdmin}
                     on:click={() => onAcceptJoinRequest(activeNetworkView.id, request.requesterNpub)}
                   >
                     Accept
@@ -2102,6 +2128,9 @@
         <div class="invite-help">
           Fastest: paste an invite from another device. LAN pairing can also broadcast yours nearby for 15 minutes.
         </div>
+        {#if !activeNetworkView.localIsAdmin}
+          <div class="config-path">Only admins can change the participant list for this network.</div>
+        {/if}
         {#if activeNetworkView.inviteInviterNpub}
           <div class="mesh-share-actions">
             <button
@@ -2185,6 +2214,7 @@
             class="text-input participant-add-npub"
             placeholder="Participant npub"
             data-testid="participant-input"
+            disabled={!activeNetworkView.localIsAdmin}
             value={participantInputDrafts[activeNetworkView.id] ?? ''}
             on:input={(event) =>
               (participantInputDrafts = {
@@ -2197,6 +2227,7 @@
             class="text-input participant-add-alias"
             placeholder="Alias (optional)"
             data-testid="participant-add-alias-input"
+            disabled={!activeNetworkView.localIsAdmin}
             value={participantAddAliasDrafts[activeNetworkView.id] ?? ''}
             on:input={(event) =>
               (participantAddAliasDrafts = {
@@ -2208,6 +2239,7 @@
           <button
             class="btn participant-add-btn"
             data-testid="participant-add"
+            disabled={!activeNetworkView.localIsAdmin}
             on:click={() => onAddParticipant(activeNetworkView.id)}
           >
             Add
@@ -2286,6 +2318,11 @@
                 >
                   {participantPresenceBadgeText(participant)}
                 </span>
+                {#if participant.isAdmin}
+                  <span class="badge participant-badge ok" data-testid="participant-admin-badge">
+                    Admin
+                  </span>
+                {/if}
                 {#if participant.relayPathActive}
                   <span class="badge participant-badge warn">Relay fallback</span>
                 {/if}
@@ -2296,11 +2333,21 @@
                   <span class="badge participant-badge ok">Selected exit</span>
                 {/if}
               </div>
+              {#if activeNetworkView.localIsAdmin}
+                <button
+                  class="btn ghost"
+                  data-testid="participant-toggle-admin"
+                  on:click={() => onToggleAdmin(activeNetworkView.id, participant)}
+                >
+                  {participant.isAdmin ? 'Remove admin' : 'Make admin'}
+                </button>
+              {/if}
               <button
                 class="btn ghost icon-btn"
                 data-testid="participant-remove"
                 title="Delete participant"
                 aria-label="Delete participant"
+                disabled={!activeNetworkView.localIsAdmin}
                 on:click={() => runAction(() => removeParticipant(activeNetworkView.id, participant.npub))}
               >
                 <Trash2 size={16} strokeWidth={2.2} />
@@ -2522,6 +2569,9 @@
                     <div class="config-path saved-network-note">
                       Activate this saved network when you want to switch the current mesh to it.
                     </div>
+                    <div class="config-path" data-testid="network-admin-summary">
+                      {networkAdminSummary(network)}
+                    </div>
                   </div>
 
                   <div class="participant-add-panel">
@@ -2530,6 +2580,7 @@
                       <input
                         type="checkbox"
                         checked={network.joinRequestsEnabled}
+                        disabled={!network.localIsAdmin}
                         on:change={(event) =>
                           onToggleJoinRequests(
                             network.id,
@@ -2572,7 +2623,11 @@
                                 requested {request.requestedAtText}
                               </div>
                             </div>
-                            <button class="btn" on:click={() => onAcceptJoinRequest(network.id, request.requesterNpub)}>
+                            <button
+                              class="btn"
+                              disabled={!network.localIsAdmin}
+                              on:click={() => onAcceptJoinRequest(network.id, request.requesterNpub)}
+                            >
                               Accept
                             </button>
                           </div>
@@ -2588,6 +2643,7 @@
                         class="text-input participant-add-npub"
                         placeholder="Participant npub"
                         data-testid="participant-input"
+                        disabled={!network.localIsAdmin}
                         value={participantInputDrafts[network.id] ?? ''}
                         on:input={(event) =>
                           (participantInputDrafts = {
@@ -2600,6 +2656,7 @@
                         class="text-input participant-add-alias"
                         placeholder="Alias (optional)"
                         data-testid="participant-add-alias-input"
+                        disabled={!network.localIsAdmin}
                         value={participantAddAliasDrafts[network.id] ?? ''}
                         on:input={(event) =>
                           (participantAddAliasDrafts = {
@@ -2611,6 +2668,7 @@
                       <button
                         class="btn participant-add-btn"
                         data-testid="participant-add"
+                        disabled={!network.localIsAdmin}
                         on:click={() => onAddParticipant(network.id)}
                       >
                         Add
@@ -2666,6 +2724,9 @@
                             </div>
                             <div class="item-sub">
                               {participant.magicDnsName || participant.magicDnsAlias || 'No alias'} | {participant.tunnelIp}
+                              {#if participant.isAdmin}
+                                | admin
+                              {/if}
                               {#if participant.offersExitNode}
                                 | exit routes advertised
                               {/if}
@@ -2675,6 +2736,7 @@
                             class="btn ghost icon-btn"
                             title="Delete participant"
                             aria-label="Delete participant"
+                            disabled={!network.localIsAdmin}
                             on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
                           >
                             <Trash2 size={16} strokeWidth={2.2} />

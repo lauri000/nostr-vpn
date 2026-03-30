@@ -20,6 +20,7 @@ export interface RelayView {
 export interface ParticipantView {
   npub: string
   pubkeyHex: string
+  isAdmin: boolean
   tunnelIp: string
   magicDnsAlias: string
   magicDnsName: string
@@ -82,6 +83,8 @@ export interface NetworkView {
   name: string
   enabled: boolean
   networkId: string
+  localIsAdmin: boolean
+  adminNpubs: string[]
   joinRequestsEnabled: boolean
   inviteInviterNpub: string
   outboundJoinRequest: OutboundJoinRequestView | null

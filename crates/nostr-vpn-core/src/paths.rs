@@ -381,7 +381,14 @@ fn endpoint_is_local_only(endpoint: &str) -> bool {
         .trim_start_matches('[')
         .trim_end_matches(']');
     match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let octets = ip.octets();
+            ip.is_private()
+                || ip.is_link_local()
+                || ip.is_loopback()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+        }
         Ok(std::net::IpAddr::V6(ip)) => {
             ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local()
         }

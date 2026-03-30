@@ -100,7 +100,7 @@ const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const IOS_TAURI_ORIGIN: &str = "tauri://localhost";
 const NETWORK_INVITE_PREFIX: &str = "nvpn://invite/";
 const DEBUG_AUTOMATION_DEEP_LINK_PREFIX: &str = "nvpn://debug/";
-const NETWORK_INVITE_VERSION: u8 = 1;
+const NETWORK_INVITE_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Default)]
 struct RelayStatus {
@@ -283,6 +283,7 @@ struct RelayView {
 struct ParticipantView {
     npub: String,
     pubkey_hex: String,
+    is_admin: bool,
     tunnel_ip: String,
     magic_dns_alias: String,
     magic_dns_name: String,
@@ -355,6 +356,8 @@ struct NetworkView {
     name: String,
     enabled: bool,
     network_id: String,
+    local_is_admin: bool,
+    admin_npubs: Vec<String>,
     #[serde(rename = "joinRequestsEnabled")]
     listen_for_join_requests: bool,
     invite_inviter_npub: String,
@@ -472,6 +475,10 @@ struct NetworkInvite {
     inviter_npub: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     inviter_node_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    admins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    participants: Vec<String>,
     relays: Vec<String>,
 }
 
@@ -790,10 +797,11 @@ impl NvpnBackend {
         let runtime_capabilities = current_runtime_capabilities();
         let wants_autoconnect =
             backend.config.autoconnect && !backend.config.participant_pubkeys_hex().is_empty();
+        let wants_join_request_listener = local_join_request_listener_enabled(&backend.config);
+        let wants_background_start = wants_autoconnect || wants_join_request_listener;
         let should_start_on_launch = should_start_gui_daemon_on_launch(
             runtime_capabilities.vpn_session_control_supported,
-            backend.config.autoconnect,
-            !backend.config.participant_pubkeys_hex().is_empty(),
+            wants_background_start,
             backend.gui_requires_service_action(),
         );
         let defer_to_installed_service = should_defer_gui_daemon_start_to_service_on_autostart(
@@ -803,8 +811,9 @@ impl NvpnBackend {
         );
         #[cfg(target_os = "ios")]
         write_ios_probe(format!(
-            "backend: launch autoconnect wants={} should_start={} defer_to_service={} has_participants={} service_action_required={}",
+            "backend: launch background_start wants_autoconnect={} wants_join_listener={} should_start={} defer_to_service={} has_participants={} service_action_required={}",
             wants_autoconnect,
+            wants_join_request_listener,
             should_start_on_launch,
             defer_to_installed_service,
             !backend.config.participant_pubkeys_hex().is_empty(),
@@ -826,12 +835,12 @@ impl NvpnBackend {
             backend.sync_daemon_state();
             #[cfg(target_os = "ios")]
             write_ios_probe("backend: launch daemon sync complete");
-        } else if wants_autoconnect && defer_to_installed_service && !backend.daemon_running {
+        } else if wants_background_start && defer_to_installed_service && !backend.daemon_running {
             backend.session_status = "Waiting for background service to start".to_string();
-        } else if wants_autoconnect && backend.gui_requires_service_install() {
-            backend.session_status = gui_service_setup_status_text(true).to_string();
-        } else if wants_autoconnect && backend.gui_requires_service_enable() {
-            backend.session_status = gui_service_enable_status_text(true).to_string();
+        } else if wants_background_start && backend.gui_requires_service_install() {
+            backend.session_status = gui_service_setup_status_text(wants_autoconnect).to_string();
+        } else if wants_background_start && backend.gui_requires_service_enable() {
+            backend.session_status = gui_service_enable_status_text(wants_autoconnect).to_string();
         }
 
         #[cfg(target_os = "ios")]
@@ -957,7 +966,16 @@ impl NvpnBackend {
         Ok(())
     }
 
+    fn ensure_network_admin(&self, network_id: &str) -> Result<()> {
+        let own_pubkey = self.config.own_nostr_pubkey_hex()?;
+        if self.config.is_network_admin(network_id, &own_pubkey) {
+            return Ok(());
+        }
+        Err(anyhow!("only network admins can manage members"))
+    }
+
     fn add_participant(&mut self, network_id: &str, npub: &str, alias: Option<&str>) -> Result<()> {
+        self.ensure_network_admin(network_id)?;
         let input = npub.trim();
         if input.is_empty() {
             return Err(anyhow!("participant npub is empty"));
@@ -991,6 +1009,27 @@ impl NvpnBackend {
         Ok(())
     }
 
+    fn add_admin(&mut self, network_id: &str, npub: &str) -> Result<()> {
+        self.ensure_network_admin(network_id)?;
+        let normalized = self.config.add_admin_to_network(network_id, npub)?;
+        self.peer_status.entry(normalized).or_default();
+
+        self.config.ensure_defaults();
+        maybe_autoconfigure_node(&mut self.config);
+        let persist_outcome = self.persist_config()?;
+
+        self.ensure_peer_status_entries();
+        if self.daemon_running {
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_process()?;
+            }
+            self.session_status = "Admin saved and applied.".to_string();
+        }
+        self.sync_daemon_state();
+
+        Ok(())
+    }
+
     fn import_network_invite(&mut self, invite_code: &str) -> Result<()> {
         let invite = parse_network_invite(invite_code)?;
         apply_network_invite_to_active_network(&mut self.config, &invite)?;
@@ -1017,6 +1056,7 @@ impl NvpnBackend {
     }
 
     fn remove_participant(&mut self, network_id: &str, npub_or_hex: &str) -> Result<()> {
+        self.ensure_network_admin(network_id)?;
         let normalized = normalize_nostr_pubkey(npub_or_hex)?;
         self.config
             .remove_participant_from_network(network_id, &normalized)?;
@@ -1054,10 +1094,46 @@ impl NvpnBackend {
         Ok(())
     }
 
+    fn remove_admin(&mut self, network_id: &str, npub_or_hex: &str) -> Result<()> {
+        self.ensure_network_admin(network_id)?;
+        let normalized = normalize_nostr_pubkey(npub_or_hex)?;
+        self.config
+            .remove_admin_from_network(network_id, &normalized)?;
+
+        self.config.ensure_defaults();
+        maybe_autoconfigure_node(&mut self.config);
+        let persist_outcome = self.persist_config()?;
+
+        self.ensure_peer_status_entries();
+        if self.daemon_running {
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_process()?;
+            }
+            self.session_status = "Admin removed and applied.".to_string();
+        }
+        self.sync_daemon_state();
+
+        Ok(())
+    }
+
     fn set_network_join_requests_enabled(&mut self, network_id: &str, enabled: bool) -> Result<()> {
+        let listener_was_enabled = local_join_request_listener_enabled(&self.config);
+        self.ensure_network_admin(network_id)?;
         self.config
             .set_network_join_requests_enabled(network_id, enabled)?;
         self.persist_config_without_daemon_reload()?;
+        let listener_is_enabled = local_join_request_listener_enabled(&self.config);
+        if self.daemon_running {
+            self.reload_daemon_process()?;
+            if listener_is_enabled && !self.session_active {
+                self.resume_daemon_process()?;
+            } else if listener_was_enabled && !listener_is_enabled && !self.session_active {
+                self.pause_daemon_process()?;
+            }
+        } else if listener_is_enabled {
+            self.start_daemon_process()?;
+        }
+        self.sync_daemon_state();
         self.session_status = if enabled {
             "Join requests enabled.".to_string()
         } else {
@@ -1071,33 +1147,39 @@ impl NvpnBackend {
             .config
             .network_by_id(network_id)
             .ok_or_else(|| anyhow!("network not found"))?;
-        if network.invite_inviter.trim().is_empty() {
+        let mut recipients = network.admins.clone();
+        recipients.sort();
+        recipients.dedup();
+        if recipients.is_empty() {
             return Err(anyhow!("this network was not imported from an invite"));
         }
+        let primary_recipient = preferred_join_request_recipient(network)
+            .or_else(|| recipients.first().cloned())
+            .ok_or_else(|| anyhow!("this network was not imported from an invite"))?;
         if let Some(request) = &network.outbound_join_request
-            && request.recipient == network.invite_inviter
+            && request.recipient == primary_recipient
         {
             return Ok(());
         }
 
         let keys = self.config.nostr_keys()?;
         let relays = self.config.nostr.relays.clone();
-        let recipient = network.invite_inviter.clone();
         let request = MeshJoinRequest {
             network_id: normalize_runtime_network_id(&network.network_id),
             requester_node_name: self.config.node_name.trim().to_string(),
         };
         let should_connect_session = !self.session_active;
-        self.runtime.block_on(publish_join_request(
-            keys,
-            &relays,
-            recipient.clone(),
-            request,
-        ))?;
+        self.runtime.block_on(async {
+            for recipient in &recipients {
+                publish_join_request(keys.clone(), &relays, recipient.clone(), request.clone())
+                    .await?;
+            }
+            Result::<(), anyhow::Error>::Ok(())
+        })?;
 
         if let Some(network) = self.config.network_by_id_mut(network_id) {
             network.outbound_join_request = Some(PendingOutboundJoinRequest {
-                recipient: recipient.clone(),
+                recipient: primary_recipient.clone(),
                 requested_at: current_unix_timestamp(),
             });
         }
@@ -1109,7 +1191,7 @@ impl NvpnBackend {
             None
         };
 
-        let recipient_npub = shorten_middle(&to_npub(&recipient), 18, 12);
+        let recipient_npub = shorten_middle(&to_npub(&primary_recipient), 18, 12);
         self.session_status = match connect_error {
             Some(error) => {
                 format!("Join request sent to {recipient_npub}, but VPN start failed: {error}")
@@ -1123,6 +1205,7 @@ impl NvpnBackend {
     }
 
     fn accept_join_request(&mut self, network_id: &str, requester_npub: &str) -> Result<()> {
+        self.ensure_network_admin(network_id)?;
         let requester = normalize_nostr_pubkey(requester_npub)?;
         let should_connect_session = !self.session_active;
         let requester_node_name = self
@@ -2786,6 +2869,7 @@ impl NvpnBackend {
         participant: &str,
         network_id: &str,
         own_pubkey_hex: Option<&str>,
+        is_admin: bool,
     ) -> ParticipantView {
         let tunnel_ip =
             derive_mesh_tunnel_ip(network_id, participant).unwrap_or_else(|| "-".to_string());
@@ -2834,6 +2918,7 @@ impl NvpnBackend {
         ParticipantView {
             npub: to_npub(participant),
             pubkey_hex: participant.to_string(),
+            is_admin,
             tunnel_ip,
             magic_dns_alias,
             magic_dns_name,
@@ -2884,6 +2969,17 @@ impl NvpnBackend {
             let mut participants = network.participants.clone();
             participants.sort();
             participants.dedup();
+            let own_is_admin = own_pubkey_hex
+                .as_deref()
+                .map(|pubkey| network.admins.iter().any(|admin| admin == pubkey))
+                .unwrap_or(false);
+            let mut admin_npubs = network
+                .admins
+                .iter()
+                .map(|admin| to_npub(admin))
+                .collect::<Vec<_>>();
+            admin_npubs.sort();
+            admin_npubs.dedup();
 
             let participant_rows = participants
                 .iter()
@@ -2892,6 +2988,7 @@ impl NvpnBackend {
                         participant,
                         &network.network_id,
                         own_pubkey_hex.as_deref(),
+                        network.admins.iter().any(|admin| admin == participant),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2932,6 +3029,8 @@ impl NvpnBackend {
                 name: network.name.clone(),
                 enabled: network.enabled,
                 network_id: normalize_runtime_network_id(&network.network_id),
+                local_is_admin: own_is_admin,
+                admin_npubs,
                 listen_for_join_requests: network.listen_for_join_requests,
                 invite_inviter_npub: if network.invite_inviter.is_empty() {
                     String::new()
@@ -3639,12 +3738,32 @@ fn peer_offers_exit_node(routes: &[String]) -> bool {
 }
 
 fn active_network_invite_code(config: &AppConfig) -> Result<String> {
+    let active_network = config.active_network();
+    let roster = config.shared_network_roster(&active_network.id)?;
+    let own_pubkey = config.own_nostr_pubkey_hex().ok();
+    let inviter_pubkey = own_pubkey
+        .as_deref()
+        .filter(|pubkey| config.is_network_admin(&active_network.id, pubkey))
+        .map(|pubkey| pubkey.to_string())
+        .or_else(|| preferred_join_request_recipient(active_network))
+        .or_else(|| active_network.admins.first().cloned())
+        .ok_or_else(|| anyhow!("active network has no admin configured"))?;
     let invite = NetworkInvite {
         v: NETWORK_INVITE_VERSION,
-        network_name: config.active_network().name.trim().to_string(),
-        network_id: config.effective_network_id(),
-        inviter_npub: to_npub(&config.own_nostr_pubkey_hex()?),
-        inviter_node_name: config.node_name.trim().to_string(),
+        network_name: active_network.name.trim().to_string(),
+        network_id: roster.network_id,
+        inviter_npub: to_npub(&inviter_pubkey),
+        inviter_node_name: if own_pubkey.as_deref() == Some(inviter_pubkey.as_str()) {
+            config.node_name.trim().to_string()
+        } else {
+            config.peer_alias(&inviter_pubkey).unwrap_or_default()
+        },
+        admins: roster.admins.iter().map(|admin| to_npub(admin)).collect(),
+        participants: roster
+            .participants
+            .iter()
+            .map(|participant| to_npub(participant))
+            .collect(),
         relays: normalized_invite_relays(&config.nostr.relays)?,
     };
     let encoded = URL_SAFE_NO_PAD
@@ -3672,9 +3791,9 @@ fn parse_network_invite(value: &str) -> Result<NetworkInvite> {
             .context("failed to parse network invite payload")?
     };
 
-    if invite.v != NETWORK_INVITE_VERSION {
+    if invite.v != 1 && invite.v != NETWORK_INVITE_VERSION {
         return Err(anyhow!(
-            "unsupported invite version {}; expected {}",
+            "unsupported invite version {}; expected 1 or {}",
             invite.v,
             NETWORK_INVITE_VERSION
         ));
@@ -3692,6 +3811,20 @@ fn parse_network_invite(value: &str) -> Result<NetworkInvite> {
 
     invite.inviter_npub = to_npub(&normalize_nostr_pubkey(&invite.inviter_npub)?);
     invite.inviter_node_name = invite.inviter_node_name.trim().to_string();
+    invite.admins = normalized_invite_pubkeys(&invite.admins)?;
+    if !invite
+        .admins
+        .iter()
+        .any(|admin| admin == &invite.inviter_npub)
+    {
+        invite.admins.push(invite.inviter_npub.clone());
+        invite.admins.sort();
+        invite.admins.dedup();
+    }
+    invite.participants = normalized_invite_pubkeys(&invite.participants)?;
+    if invite.participants.is_empty() {
+        invite.participants.push(invite.inviter_npub.clone());
+    }
     invite.relays = normalized_invite_relays(&invite.relays)?;
 
     Ok(invite)
@@ -3703,16 +3836,28 @@ fn apply_network_invite_to_active_network(
 ) -> Result<()> {
     let normalized_invite_network_id = normalize_runtime_network_id(&invite.network_id);
     let normalized_inviter_pubkey = normalize_nostr_pubkey(&invite.inviter_npub)?;
-    let target_network_entry_id = if let Some(existing) = config.networks.iter().find(|network| {
-        normalize_runtime_network_id(&network.network_id) == normalized_invite_network_id
-    }) {
-        existing.id.clone()
+    let own_pubkey = config.own_nostr_pubkey_hex().ok();
+    let invite_admins = invite
+        .admins
+        .iter()
+        .map(|admin| normalize_nostr_pubkey(admin))
+        .collect::<Result<Vec<_>>>()?;
+    let invite_participants = invite
+        .participants
+        .iter()
+        .map(|participant| normalize_nostr_pubkey(participant))
+        .collect::<Result<Vec<_>>>()?;
+    let (target_network_entry_id, reset_membership_from_invite) = if let Some(existing) =
+        config.networks.iter().find(|network| {
+            normalize_runtime_network_id(&network.network_id) == normalized_invite_network_id
+        }) {
+        (existing.id.clone(), false)
     } else if network_should_adopt_invite(config.active_network()) {
-        config.active_network().id.clone()
+        (config.active_network().id.clone(), true)
     } else {
         let network_id = config.add_network(&invite.network_name);
         config.set_network_enabled(&network_id, true)?;
-        network_id
+        (network_id, true)
     };
     let should_adopt_name = config
         .network_by_id(&target_network_entry_id)
@@ -3725,30 +3870,77 @@ fn apply_network_invite_to_active_network(
                 .participants
                 .iter()
                 .any(|participant| participant == &normalized_inviter_pubkey)
+                || network
+                    .admins
+                    .iter()
+                    .any(|admin| admin == &normalized_inviter_pubkey)
         })
         .unwrap_or(false);
 
     config.set_network_enabled(&target_network_entry_id, true)?;
     config.set_network_mesh_id(&target_network_entry_id, &invite.network_id)?;
-    let normalized_inviter =
-        config.add_participant_to_network(&target_network_entry_id, &normalized_inviter_pubkey)?;
-    if !inviter_already_configured && !invite.inviter_node_name.trim().is_empty() {
-        let _ = config.set_peer_alias(&normalized_inviter, &invite.inviter_node_name);
-    }
     if let Some(network) = config.network_by_id_mut(&target_network_entry_id) {
-        network.invite_inviter = normalized_inviter.clone();
+        if reset_membership_from_invite {
+            network.participants.clear();
+            network.admins.clear();
+            network.shared_roster_updated_at = 0;
+            network.shared_roster_signed_by.clear();
+        }
+
+        for participant in &invite_participants {
+            if own_pubkey.as_deref() == Some(participant.as_str()) {
+                continue;
+            }
+            network.participants.push(participant.clone());
+        }
+        network.participants.sort();
+        network.participants.dedup();
+
+        for admin in &invite_admins {
+            network.admins.push(admin.clone());
+        }
+        if !network
+            .admins
+            .iter()
+            .any(|admin| admin == &normalized_inviter_pubkey)
+        {
+            network.admins.push(normalized_inviter_pubkey.clone());
+        }
+        network.admins.sort();
+        network.admins.dedup();
+
+        network.invite_inviter = if network
+            .admins
+            .iter()
+            .any(|admin| admin == &normalized_inviter_pubkey)
+        {
+            normalized_inviter_pubkey.clone()
+        } else {
+            network.admins.first().cloned().unwrap_or_default()
+        };
         if network
             .outbound_join_request
             .as_ref()
-            .map(|request| request.recipient != normalized_inviter)
+            .map(|request| {
+                !network
+                    .admins
+                    .iter()
+                    .any(|admin| admin == &request.recipient)
+            })
             .unwrap_or(false)
         {
             network.outbound_join_request = None;
         }
     }
 
+    if !inviter_already_configured && !invite.inviter_node_name.trim().is_empty() {
+        let _ = config.set_peer_alias(&normalized_inviter_pubkey, &invite.inviter_node_name);
+    }
+
     if should_adopt_name {
-        config.rename_network(&target_network_entry_id, &invite.network_name)?;
+        if let Some(network) = config.network_by_id_mut(&target_network_entry_id) {
+            network.name = invite.network_name.trim().to_string();
+        }
     }
 
     for relay in &invite.relays {
@@ -3763,6 +3955,31 @@ fn apply_network_invite_to_active_network(
 fn network_should_adopt_invite(network: &nostr_vpn_core::config::NetworkConfig) -> bool {
     let trimmed = network.name.trim();
     network.participants.is_empty() && (trimmed.is_empty() || trimmed.starts_with("Network "))
+}
+
+fn preferred_join_request_recipient(
+    network: &nostr_vpn_core::config::NetworkConfig,
+) -> Option<String> {
+    if !network.invite_inviter.is_empty()
+        && network
+            .admins
+            .iter()
+            .any(|admin| admin == &network.invite_inviter)
+    {
+        return Some(network.invite_inviter.clone());
+    }
+
+    network.admins.first().cloned()
+}
+
+fn normalized_invite_pubkeys(pubkeys: &[String]) -> Result<Vec<String>> {
+    let mut normalized = pubkeys
+        .iter()
+        .map(|pubkey| normalize_nostr_pubkey(pubkey).map(|value| to_npub(&value)))
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 fn normalized_invite_relays(relays: &[String]) -> Result<Vec<String>> {
@@ -3991,11 +4208,10 @@ fn gui_requires_service_enable(
 
 fn should_start_gui_daemon_on_launch(
     vpn_session_control_supported: bool,
-    autoconnect: bool,
-    has_participants: bool,
+    wants_background_start: bool,
     service_setup_required: bool,
 ) -> bool {
-    vpn_session_control_supported && autoconnect && has_participants && !service_setup_required
+    vpn_session_control_supported && wants_background_start && !service_setup_required
 }
 
 fn should_defer_gui_daemon_start_to_service_on_autostart(
@@ -4048,6 +4264,15 @@ fn gui_service_enable_status_text(autoconnect: bool) -> &'static str {
     } else {
         "Background service is disabled in launchd; enable it to turn VPN on from the app"
     }
+}
+
+fn local_join_request_listener_enabled(config: &AppConfig) -> bool {
+    let Ok(own_pubkey) = config.own_nostr_pubkey_hex() else {
+        return false;
+    };
+    config.networks.iter().any(|network| {
+        network.listen_for_join_requests && network.admins.iter().any(|admin| admin == &own_pubkey)
+    })
 }
 
 impl Drop for NvpnBackend {
@@ -5730,6 +5955,22 @@ async fn add_participant(
 }
 
 #[tauri::command]
+async fn add_admin(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    network_id: String,
+    npub: String,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, move |backend| {
+        backend.add_admin(&network_id, &npub)?;
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
 async fn import_network_invite(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -5783,6 +6024,22 @@ async fn remove_participant(
 ) -> Result<UiState, String> {
     let ui = with_backend_async(state, move |backend| {
         backend.remove_participant(&network_id, &npub)?;
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+async fn remove_admin(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    network_id: String,
+    npub: String,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, move |backend| {
+        backend.remove_admin(&network_id, &npub)?;
         Ok(backend.ui_state())
     })
     .await?;
@@ -6250,10 +6507,12 @@ pub fn run() {
             set_network_join_requests_enabled,
             request_network_join,
             add_participant,
+            add_admin,
             import_network_invite,
             start_lan_pairing,
             stop_lan_pairing,
             remove_participant,
+            remove_admin,
             accept_join_request,
             set_participant_alias,
             add_relay,
@@ -6734,6 +6993,7 @@ mod tests {
         config.node_name = "sirius-mini".to_string();
         config.networks[0].name = "Home".to_string();
         config.networks[0].network_id = "mesh-home".to_string();
+        config.networks[0].admins = vec![inviter_hex.clone()];
         config.nostr.relays = vec![
             "wss://relay.one.example".to_string(),
             "wss://relay.two.example".to_string(),
@@ -6746,11 +7006,13 @@ mod tests {
         assert_eq!(
             parsed,
             NetworkInvite {
-                v: 1,
+                v: 2,
                 network_name: "Home".to_string(),
                 network_id: "mesh-home".to_string(),
                 inviter_npub,
                 inviter_node_name: "sirius-mini".to_string(),
+                admins: vec![to_npub(&inviter_hex)],
+                participants: vec![to_npub(&inviter_hex)],
                 relays: vec![
                     "wss://relay.one.example".to_string(),
                     "wss://relay.two.example".to_string(),
@@ -6764,11 +7026,13 @@ mod tests {
         let inviter_hex =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let invite = NetworkInvite {
-            v: 1,
+            v: 2,
             network_name: "Home".to_string(),
             network_id: "mesh-home".to_string(),
             inviter_npub: to_npub(&inviter_hex),
             inviter_node_name: "macbook-pro".to_string(),
+            admins: vec![to_npub(&inviter_hex)],
+            participants: vec![to_npub(&inviter_hex)],
             relays: vec![
                 "wss://existing.example".to_string(),
                 "wss://invite.example".to_string(),
@@ -6813,11 +7077,13 @@ mod tests {
         let inviter_hex =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let invite = NetworkInvite {
-            v: 1,
+            v: 2,
             network_name: "Home".to_string(),
             network_id: "mesh-home".to_string(),
             inviter_npub: to_npub(&inviter_hex),
             inviter_node_name: String::new(),
+            admins: vec![to_npub(&inviter_hex)],
+            participants: vec![to_npub(&inviter_hex)],
             relays: vec!["wss://invite.example".to_string()],
         };
         let mut config = AppConfig::generated();
@@ -6865,11 +7131,13 @@ mod tests {
         let inviter_hex =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let invite = NetworkInvite {
-            v: 1,
+            v: 2,
             network_name: "Home".to_string(),
             network_id: "mesh-home".to_string(),
             inviter_npub: to_npub(&inviter_hex),
             inviter_node_name: String::new(),
+            admins: vec![to_npub(&inviter_hex)],
+            participants: vec![to_npub(&inviter_hex)],
             relays: vec!["wss://invite.example".to_string()],
         };
         let mut config = AppConfig::generated();
@@ -6910,11 +7178,13 @@ mod tests {
         let inviter_hex =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let invite = NetworkInvite {
-            v: 1,
+            v: 2,
             network_name: "Home".to_string(),
             network_id: "mesh-home".to_string(),
             inviter_npub: to_npub(&inviter_hex),
             inviter_node_name: String::new(),
+            admins: vec![to_npub(&inviter_hex)],
+            participants: vec![to_npub(&inviter_hex)],
             relays: vec!["wss://invite.example".to_string()],
         };
         let mut config = AppConfig::generated();
@@ -6940,6 +7210,8 @@ mod tests {
                     network_id: "mesh-home".to_string(),
                     inviter_npub: inviter_npub.clone(),
                     inviter_node_name: String::new(),
+                    admins: Vec::new(),
+                    participants: Vec::new(),
                     relays: vec!["wss://relay.one.example".to_string()],
                 })
                 .expect("invite payload"),
@@ -6986,6 +7258,8 @@ mod tests {
                         network_id: "mesh-home".to_string(),
                         inviter_npub: to_npub(&other_hex),
                         inviter_node_name: String::new(),
+                        admins: Vec::new(),
+                        participants: Vec::new(),
                         relays: vec!["wss://relay.one.example".to_string()],
                     })
                     .expect("invite payload"),
@@ -7462,6 +7736,8 @@ mod tests {
                 name: "Home".to_string(),
                 enabled: true,
                 network_id: "mesh-home".to_string(),
+                local_is_admin: false,
+                admin_npubs: Vec::new(),
                 listen_for_join_requests: true,
                 invite_inviter_npub: String::new(),
                 outbound_join_request: None,
@@ -7472,6 +7748,7 @@ mod tests {
                     ParticipantView {
                         npub: "npub1local".to_string(),
                         pubkey_hex: "local".to_string(),
+                        is_admin: false,
                         tunnel_ip: "10.44.0.10".to_string(),
                         magic_dns_alias: "self".to_string(),
                         magic_dns_name: "self.nvpn".to_string(),
@@ -7489,6 +7766,7 @@ mod tests {
                     ParticipantView {
                         npub: "npub1alice".to_string(),
                         pubkey_hex: "alice".to_string(),
+                        is_admin: false,
                         tunnel_ip: "10.44.0.11".to_string(),
                         magic_dns_alias: "alice".to_string(),
                         magic_dns_name: "alice.nvpn".to_string(),
@@ -7510,6 +7788,8 @@ mod tests {
                 name: "Lab".to_string(),
                 enabled: false,
                 network_id: "mesh-lab".to_string(),
+                local_is_admin: false,
+                admin_npubs: Vec::new(),
                 listen_for_join_requests: true,
                 invite_inviter_npub: String::new(),
                 outbound_join_request: None,
@@ -7519,6 +7799,7 @@ mod tests {
                 participants: vec![ParticipantView {
                     npub: "npub1bob".to_string(),
                     pubkey_hex: "bob".to_string(),
+                    is_admin: false,
                     tunnel_ip: "10.44.0.12".to_string(),
                     magic_dns_alias: "bob".to_string(),
                     magic_dns_name: "bob.nvpn".to_string(),
@@ -7550,6 +7831,8 @@ mod tests {
                     name: "Home".to_string(),
                     enabled: true,
                     network_id: "mesh-home".to_string(),
+                    local_is_admin: false,
+                    admin_npubs: Vec::new(),
                     listen_for_join_requests: true,
                     invite_inviter_npub: String::new(),
                     outbound_join_request: None,
@@ -7559,6 +7842,7 @@ mod tests {
                     participants: vec![ParticipantView {
                         npub: "npub1alice".to_string(),
                         pubkey_hex: "alice".to_string(),
+                        is_admin: false,
                         tunnel_ip: "10.44.0.11".to_string(),
                         magic_dns_alias: "alice".to_string(),
                         magic_dns_name: "alice.nvpn".to_string(),
@@ -7579,6 +7863,8 @@ mod tests {
                     name: "Work".to_string(),
                     enabled: true,
                     network_id: "mesh-work".to_string(),
+                    local_is_admin: false,
+                    admin_npubs: Vec::new(),
                     listen_for_join_requests: true,
                     invite_inviter_npub: String::new(),
                     outbound_join_request: None,
@@ -7589,6 +7875,7 @@ mod tests {
                         ParticipantView {
                             npub: "npub1alice".to_string(),
                             pubkey_hex: "alice".to_string(),
+                            is_admin: false,
                             tunnel_ip: "10.44.0.11".to_string(),
                             magic_dns_alias: "alice".to_string(),
                             magic_dns_name: "alice.nvpn".to_string(),
@@ -7606,6 +7893,7 @@ mod tests {
                         ParticipantView {
                             npub: "npub1bob".to_string(),
                             pubkey_hex: "bob".to_string(),
+                            is_admin: false,
                             tunnel_ip: "10.44.0.12".to_string(),
                             magic_dns_alias: "bob".to_string(),
                             magic_dns_name: "bob.nvpn".to_string(),
@@ -7648,6 +7936,8 @@ mod tests {
                 name: "Home".to_string(),
                 enabled: true,
                 network_id: "mesh-home".to_string(),
+                local_is_admin: false,
+                admin_npubs: Vec::new(),
                 listen_for_join_requests: true,
                 invite_inviter_npub: String::new(),
                 outbound_join_request: None,
@@ -7657,6 +7947,7 @@ mod tests {
                 participants: vec![ParticipantView {
                     npub: "npub1alice".to_string(),
                     pubkey_hex: "alice".to_string(),
+                    is_admin: false,
                     tunnel_ip: "10.44.0.11".to_string(),
                     magic_dns_alias: "alice".to_string(),
                     magic_dns_name: "alice.nvpn".to_string(),
@@ -7953,7 +8244,7 @@ mod tests {
         backend.session_active = true;
         backend.refresh_peer_runtime_status();
 
-        let view = backend.participant_view(&participant, "mesh-test", None);
+        let view = backend.participant_view(&participant, "mesh-test", None, false);
         assert!(view.status_text.contains("relay"));
         assert!(view.status_text.contains("198.51.100.9:45000"));
         assert!(view.relay_path_active);
@@ -8101,11 +8392,28 @@ mod tests {
 
     #[test]
     fn gui_launch_autoconnect_skips_direct_start_until_service_exists() {
-        assert!(!should_start_gui_daemon_on_launch(true, true, true, true));
-        assert!(should_start_gui_daemon_on_launch(true, true, true, false));
-        assert!(!should_start_gui_daemon_on_launch(true, true, false, false));
-        assert!(!should_start_gui_daemon_on_launch(true, false, true, false));
-        assert!(!should_start_gui_daemon_on_launch(false, true, true, false));
+        assert!(!should_start_gui_daemon_on_launch(true, true, true));
+        assert!(should_start_gui_daemon_on_launch(true, true, false));
+        assert!(!should_start_gui_daemon_on_launch(true, false, false));
+        assert!(!should_start_gui_daemon_on_launch(false, true, false));
+    }
+
+    #[test]
+    fn local_join_request_listener_requires_local_admin() {
+        let mut config = AppConfig::generated();
+        let own_pubkey = config
+            .own_nostr_pubkey_hex()
+            .expect("generated config own pubkey");
+        config.networks[0].listen_for_join_requests = true;
+        config.networks[0].admins = vec![own_pubkey.clone()];
+        assert!(super::local_join_request_listener_enabled(&config));
+
+        config.networks[0].admins = vec!["11".repeat(32)];
+        assert!(!super::local_join_request_listener_enabled(&config));
+
+        config.networks[0].admins = vec![own_pubkey];
+        config.networks[0].listen_for_join_requests = false;
+        assert!(!super::local_join_request_listener_enabled(&config));
     }
 
     #[test]

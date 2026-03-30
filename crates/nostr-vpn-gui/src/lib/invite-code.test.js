@@ -10,10 +10,12 @@ import {
 
 test('encodeInvitePayload emits the app invite prefix and round-trips decoded values', () => {
   const payload = {
-    v: 1,
+    v: 2,
     networkName: 'Home',
     networkId: 'mesh-home',
     inviterNpub: 'npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m',
+    admins: ['npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m'],
+    participants: ['npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m'],
     relays: ['wss://relay.one.example', 'wss://relay.two.example'],
   }
 
@@ -33,10 +35,12 @@ test('decodeInvitePayload accepts JSON invite payloads from the real backend for
   })
 
   assert.deepEqual(decodeInvitePayload(invite), {
-    v: 1,
+    v: 2,
     networkName: 'Home',
     networkId: 'mesh-home',
     inviterNpub: 'npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m',
+    admins: ['npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m'],
+    participants: ['npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m'],
     relays: ['wss://relay.one.example'],
   })
 })

@@ -147,5 +147,9 @@ fn endpoints_share_private_ipv4_subnet(left: &str, right: &str) -> bool {
 }
 
 fn is_private_ipv4(ip: Ipv4Addr) -> bool {
-    ip.is_private() || ip.is_link_local()
+    let octets = ip.octets();
+    ip.is_private()
+        || ip.is_link_local()
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 198 && matches!(octets[1], 18 | 19))
 }

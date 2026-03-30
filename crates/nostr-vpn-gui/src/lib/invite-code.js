@@ -1,4 +1,4 @@
-const INVITE_VERSION = 1
+const INVITE_VERSION = 2
 
 export const NETWORK_INVITE_PREFIX = 'nvpn://invite/'
 
@@ -8,6 +8,8 @@ export const NETWORK_INVITE_PREFIX = 'nvpn://invite/'
  *   networkName: string
  *   networkId: string
  *   inviterNpub: string
+ *   admins: string[]
+ *   participants: string[]
  *   relays: string[]
  * }} InvitePayload
  */
@@ -49,16 +51,29 @@ const normalizeInvitePayload = (payload) => {
   if (!Number.isInteger(version)) {
     throw new Error('Invite version is invalid')
   }
-  if (version !== INVITE_VERSION) {
+  if (version !== 1 && version !== INVITE_VERSION) {
     throw new Error(`Unsupported invite version ${version}`)
   }
 
   const relays = Array.isArray(payload.relays)
     ? [...new Set(payload.relays.map((relay) => String(relay).trim()).filter(Boolean))]
     : []
+  const inviterNpub = normalizeInviteString(
+    payload.inviterNpub ?? payload.inviter_npub,
+    'inviter pubkey',
+  )
+  const admins = Array.isArray(payload.admins)
+    ? [...new Set(payload.admins.map((value) => String(value).trim()).filter(Boolean))]
+    : []
+  if (!admins.includes(inviterNpub)) {
+    admins.push(inviterNpub)
+  }
+  const participants = Array.isArray(payload.participants)
+    ? [...new Set(payload.participants.map((value) => String(value).trim()).filter(Boolean))]
+    : [inviterNpub]
 
   return {
-    v: version,
+    v: version === 1 ? INVITE_VERSION : version,
     networkName: normalizeInviteString(
       payload.networkName ?? payload.network_name,
       'network name',
@@ -67,10 +82,9 @@ const normalizeInvitePayload = (payload) => {
       payload.networkId ?? payload.network_id,
       'network id',
     ),
-    inviterNpub: normalizeInviteString(
-      payload.inviterNpub ?? payload.inviter_npub,
-      'inviter pubkey',
-    ),
+    inviterNpub,
+    admins,
+    participants,
     relays,
   }
 }

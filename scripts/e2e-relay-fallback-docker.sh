@@ -230,13 +230,16 @@ grep -q '"reachable":true' <<<"$BOB_COMPACT"
 
 ASYM_SERVICE_STATE="$("${COMPOSE[@]}" exec -T relay-asym sh -lc "cat /root/.config/nvpn/relay.operator.json" | tr -d '\r')"
 GOOD_SERVICE_STATE="$("${COMPOSE[@]}" exec -T relay-good sh -lc "cat /root/.config/nvpn/relay.operator.json" | tr -d '\r')"
+ALICE_DAEMON_LOG="$("${COMPOSE[@]}" exec -T node-a sh -lc "cat /root/.config/nvpn/daemon.log 2>/dev/null || true" | tr -d '\r')"
+BOB_DAEMON_LOG="$("${COMPOSE[@]}" exec -T node-b sh -lc "cat /root/.config/nvpn/daemon.log 2>/dev/null || true" | tr -d '\r')"
 
 grep -Eq '"total_sessions_served"[[:space:]]*:[[:space:]]*[1-9]' <<<"$ASYM_SERVICE_STATE"
 grep -Eq '"total_sessions_served"[[:space:]]*:[[:space:]]*[1-9]' <<<"$GOOD_SERVICE_STATE"
+grep -q 'relay: proactive probe verified' <<<"$ALICE_DAEMON_LOG$BOB_DAEMON_LOG"
 
 echo "--- Ping A -> B ---"
 cat /tmp/nvpn-relay-ping-a.log
 echo "--- Ping B -> A ---"
 cat /tmp/nvpn-relay-ping-b.log
 
-echo "relay fallback docker e2e passed: direct peer UDP was blocked, one relay only spoke to alice, both peers still converged on the mutually reachable relay ingress, and tunnel ping succeeded through the relay operator"
+echo "relay fallback docker e2e passed: direct peer UDP was blocked, proactive relay verification ran, both relay operators were exercised, both peers converged on the mutually reachable relay ingress, and tunnel ping succeeded through the relay operator"

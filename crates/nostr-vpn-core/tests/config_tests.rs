@@ -201,6 +201,78 @@ fn join_requests_enabled_is_true_when_any_network_listens() {
 }
 
 #[test]
+fn generated_network_defaults_local_identity_to_admin() {
+    let config = AppConfig::generated();
+    let own_pubkey = config.own_nostr_pubkey_hex().expect("own pubkey");
+
+    assert_eq!(config.active_network_admin_pubkeys_hex(), vec![own_pubkey]);
+}
+
+#[test]
+fn apply_admin_signed_shared_roster_replaces_members_from_known_admin() {
+    let own = Keys::generate();
+    let current_admin = Keys::generate();
+    let new_admin = Keys::generate();
+    let member = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+    let current_admin_hex = current_admin.public_key().to_hex();
+    let new_admin_hex = new_admin.public_key().to_hex();
+    let member_hex = member.public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex.clone();
+    config.networks[0].network_id = "mesh-home".to_string();
+    config.networks[0].admins = vec![current_admin_hex.clone()];
+    config.networks[0].participants = vec![current_admin_hex.clone()];
+    config.ensure_defaults();
+
+    let changed = config
+        .apply_admin_signed_shared_roster(
+            "mesh-home",
+            "Home",
+            vec![current_admin_hex.clone(), member_hex.clone(), own_hex],
+            vec![current_admin_hex.clone(), new_admin_hex.clone()],
+            1_726_000_000,
+            &current_admin_hex,
+        )
+        .expect("apply shared roster");
+
+    assert!(changed);
+    assert_eq!(config.networks[0].name, "Home");
+    let mut expected_participants = vec![current_admin_hex.clone(), member_hex.clone()];
+    expected_participants.sort();
+    assert_eq!(config.networks[0].participants, expected_participants);
+    let mut expected_admins = vec![new_admin_hex, current_admin.public_key().to_hex()];
+    expected_admins.sort();
+    assert_eq!(config.networks[0].admins, expected_admins);
+    assert_eq!(config.networks[0].shared_roster_updated_at, 1_726_000_000);
+}
+
+#[test]
+fn apply_admin_signed_shared_roster_ignores_unknown_signer() {
+    let known_admin = Keys::generate();
+    let unknown_admin = Keys::generate();
+    let mut config = AppConfig::generated();
+    config.networks[0].network_id = "mesh-home".to_string();
+    config.networks[0].admins = vec![known_admin.public_key().to_hex()];
+    config.ensure_defaults();
+
+    let changed = config
+        .apply_admin_signed_shared_roster(
+            "mesh-home",
+            "Home",
+            vec![known_admin.public_key().to_hex()],
+            vec![known_admin.public_key().to_hex()],
+            1_726_000_000,
+            &unknown_admin.public_key().to_hex(),
+        )
+        .expect("ignore unknown signer");
+
+    assert!(!changed);
+}
+
+#[test]
 fn record_inbound_join_request_ignores_mismatched_mesh_id() {
     let requester = Keys::generate().public_key().to_hex();
     let mut config = AppConfig::generated();
@@ -612,10 +684,13 @@ fn active_network_helpers_ignore_inactive_networks() {
             enabled: true,
             network_id: "mesh-home".to_string(),
             participants: vec![peer_a.clone()],
+            admins: Vec::new(),
             listen_for_join_requests: true,
             invite_inviter: String::new(),
             outbound_join_request: None,
             inbound_join_requests: Vec::new(),
+            shared_roster_updated_at: 0,
+            shared_roster_signed_by: String::new(),
         },
         NetworkConfig {
             id: "network-2".to_string(),
@@ -623,10 +698,13 @@ fn active_network_helpers_ignore_inactive_networks() {
             enabled: false,
             network_id: "mesh-work".to_string(),
             participants: vec![peer_b.clone()],
+            admins: Vec::new(),
             listen_for_join_requests: true,
             invite_inviter: String::new(),
             outbound_join_request: None,
             inbound_join_requests: Vec::new(),
+            shared_roster_updated_at: 0,
+            shared_roster_signed_by: String::new(),
         },
     ];
     config.ensure_defaults();

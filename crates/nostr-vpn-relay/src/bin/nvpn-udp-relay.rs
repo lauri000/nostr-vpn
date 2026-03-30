@@ -15,8 +15,9 @@ use nostr_vpn_core::node_record::{
     publish_node_record,
 };
 use nostr_vpn_core::relay::{
-    NatAssistOperatorState, RelayAllocationGranted, RelayOperatorSessionState, RelayOperatorState,
-    ServiceOperatorState,
+    NatAssistOperatorState, RelayAllocationGranted, RelayAllocationRejectReason,
+    RelayAllocationRejected, RelayOperatorSessionState, RelayOperatorState, RelayProbeGranted,
+    RelayProbeRejected, ServiceOperatorState,
 };
 use nostr_vpn_core::service_signaling::{RelayServiceClient, ServicePayload};
 use tokio::net::UdpSocket;
@@ -24,8 +25,12 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 const DEFAULT_LEASE_SECS: u64 = 120;
+const DEFAULT_PROBE_LEASE_SECS: u64 = 8;
 const DEFAULT_PUBLISH_INTERVAL_SECS: u64 = 30;
 const DEFAULT_NAT_ASSIST_PORT: u16 = 3478;
+const DEFAULT_MAX_ACTIVE_RELAY_SESSIONS: usize = 64;
+const DEFAULT_MAX_SESSIONS_PER_REQUESTER: usize = 8;
+const DEFAULT_MAX_BYTES_PER_SESSION: u64 = 128 * 1024 * 1024;
 const DEFAULT_STATE_FILE_NAME: &str = "relay.operator.json";
 const STATE_WRITE_INTERVAL_SECS: u64 = 1;
 
@@ -51,6 +56,14 @@ struct Args {
     lease_secs: u64,
     #[arg(long, default_value_t = DEFAULT_PUBLISH_INTERVAL_SECS)]
     publish_interval_secs: u64,
+    #[arg(long, default_value_t = DEFAULT_MAX_ACTIVE_RELAY_SESSIONS)]
+    max_active_sessions: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_SESSIONS_PER_REQUESTER)]
+    max_sessions_per_requester: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_BYTES_PER_SESSION)]
+    max_bytes_per_session: u64,
+    #[arg(long)]
+    max_forward_bps: Option<u64>,
     #[arg(long)]
     price_hint_msats: Option<u64>,
     #[arg(long)]
@@ -66,6 +79,39 @@ struct SessionLeg {
 struct SessionState {
     requester: SessionLeg,
     target: SessionLeg,
+    forwarding: SessionForwardingState,
+}
+
+#[derive(Debug, Clone)]
+struct RelayServiceLimits {
+    max_active_sessions: usize,
+    max_sessions_per_requester: usize,
+    max_bytes_per_session: u64,
+    max_forward_bps: Option<u64>,
+}
+
+struct RelayLegTask {
+    rx_socket: Arc<UdpSocket>,
+    tx_socket: Arc<UdpSocket>,
+    state: Arc<Mutex<SessionState>>,
+    service_runtime_state: Arc<Mutex<ServiceRuntimeState>>,
+    relay_limits: RelayServiceLimits,
+    request_id: String,
+    requester_leg: bool,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct SessionForwardingState {
+    forward_window: Option<ForwardWindow>,
+    total_forwarded_bytes: u64,
+    closed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForwardWindow {
+    last_refill: Instant,
+    available_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -82,7 +128,40 @@ struct RelayRuntimeState {
 }
 
 impl RelayRuntimeState {
+    fn prune_expired_sessions(&mut self, now: u64) {
+        self.active_sessions
+            .retain(|_, session| session.expires_at > now);
+    }
+
+    fn allocation_rejection_for_requester(
+        &mut self,
+        requester_pubkey: &str,
+        now: u64,
+        limits: &RelayServiceLimits,
+    ) -> Option<(RelayAllocationRejectReason, Option<u64>)> {
+        self.prune_expired_sessions(now);
+
+        if self.active_sessions.len() >= limits.max_active_sessions {
+            return Some((RelayAllocationRejectReason::OverCapacity, Some(30)));
+        }
+
+        let requester_sessions = self
+            .active_sessions
+            .values()
+            .filter(|session| session.requester_pubkey == requester_pubkey)
+            .count();
+        if requester_sessions >= limits.max_sessions_per_requester {
+            return Some((
+                RelayAllocationRejectReason::TooManySessionsForRequester,
+                Some(60),
+            ));
+        }
+
+        None
+    }
+
     fn note_session_started(&mut self, session: RelayOperatorSessionState) {
+        self.prune_expired_sessions(unix_timestamp());
         self.total_sessions_served = self.total_sessions_served.saturating_add(1);
         self.known_peer_pubkeys
             .insert(session.requester_pubkey.clone());
@@ -104,8 +183,7 @@ impl RelayRuntimeState {
     }
 
     fn snapshot(&mut self, now: u64) -> RelayOperatorState {
-        self.active_sessions
-            .retain(|_, session| session.expires_at > now);
+        self.prune_expired_sessions(now);
 
         let elapsed = now.saturating_sub(self.last_rate_sample_at);
         if elapsed > 0 {
@@ -141,6 +219,48 @@ impl RelayRuntimeState {
             known_peer_pubkeys,
             active_sessions,
         }
+    }
+}
+
+impl SessionForwardingState {
+    fn allow_forward(
+        &mut self,
+        limits: &RelayServiceLimits,
+        now: Instant,
+        bytes: usize,
+    ) -> Result<(), RelayAllocationRejectReason> {
+        if self.closed {
+            return Err(RelayAllocationRejectReason::ByteLimitExceeded);
+        }
+
+        let bytes = bytes as u64;
+        if self.total_forwarded_bytes.saturating_add(bytes) > limits.max_bytes_per_session {
+            self.closed = true;
+            return Err(RelayAllocationRejectReason::ByteLimitExceeded);
+        }
+
+        if let Some(max_forward_bps) = limits.max_forward_bps {
+            let burst = max_forward_bps.max(bytes);
+            let window = self.forward_window.get_or_insert(ForwardWindow {
+                last_refill: now,
+                available_bytes: burst,
+            });
+            let elapsed = now
+                .saturating_duration_since(window.last_refill)
+                .as_secs_f64();
+            if elapsed > 0.0 {
+                let refill = (elapsed * max_forward_bps as f64) as u64;
+                window.available_bytes = window.available_bytes.saturating_add(refill).min(burst);
+                window.last_refill = now;
+            }
+            if window.available_bytes < bytes {
+                return Err(RelayAllocationRejectReason::RateLimited);
+            }
+            window.available_bytes = window.available_bytes.saturating_sub(bytes);
+        }
+
+        self.total_forwarded_bytes = self.total_forwarded_bytes.saturating_add(bytes);
+        Ok(())
     }
 }
 
@@ -484,6 +604,80 @@ fn spawn_nat_assist_listener(
     });
 }
 
+async fn send_allocation_rejection(
+    service_client: &RelayServiceClient,
+    recipient_pubkey: &str,
+    request_id: String,
+    network_id: String,
+    reason: RelayAllocationRejectReason,
+    retry_after_secs: Option<u64>,
+) -> Result<()> {
+    service_client
+        .publish_to(
+            ServicePayload::RelayAllocationRejected(RelayAllocationRejected {
+                request_id,
+                network_id,
+                relay_pubkey: service_client.own_pubkey().to_string(),
+                reason,
+                retry_after_secs,
+            }),
+            recipient_pubkey,
+        )
+        .await
+}
+
+async fn send_probe_rejection(
+    service_client: &RelayServiceClient,
+    recipient_pubkey: &str,
+    request_id: String,
+    reason: RelayAllocationRejectReason,
+    retry_after_secs: Option<u64>,
+) -> Result<()> {
+    service_client
+        .publish_to(
+            ServicePayload::RelayProbeRejected(RelayProbeRejected {
+                request_id,
+                relay_pubkey: service_client.own_pubkey().to_string(),
+                reason,
+                retry_after_secs,
+            }),
+            recipient_pubkey,
+        )
+        .await
+}
+
+async fn bind_relay_leg_pair(
+    bind_ip: IpAddr,
+    advertise_host: &str,
+) -> Result<(Arc<UdpSocket>, Arc<UdpSocket>, String, String)> {
+    let requester_socket = Arc::new(
+        UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+            .await
+            .with_context(|| format!("failed to bind requester leg on {bind_ip}"))?,
+    );
+    let target_socket = Arc::new(
+        UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+            .await
+            .with_context(|| format!("failed to bind target leg on {bind_ip}"))?,
+    );
+    let requester_addr = requester_socket
+        .local_addr()
+        .context("failed to read requester leg addr")?;
+    let target_addr = target_socket
+        .local_addr()
+        .context("failed to read target leg addr")?;
+    let advertise_ip = parse_advertise_ip(advertise_host)?;
+    let requester_ingress_endpoint =
+        SocketAddr::new(advertise_ip, requester_addr.port()).to_string();
+    let target_ingress_endpoint = SocketAddr::new(advertise_ip, target_addr.port()).to_string();
+    Ok((
+        requester_socket,
+        target_socket,
+        requester_ingress_endpoint,
+        target_ingress_endpoint,
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -531,6 +725,12 @@ async fn main() -> Result<()> {
         relay_endpoint,
         nat_assist_endpoint,
     )));
+    let relay_limits = RelayServiceLimits {
+        max_active_sessions: args.max_active_sessions.max(1),
+        max_sessions_per_requester: args.max_sessions_per_requester.max(1),
+        max_bytes_per_session: args.max_bytes_per_session.max(1),
+        max_forward_bps: args.max_forward_bps.filter(|value| *value > 0),
+    };
     spawn_state_writer(state_file, service_runtime_state.clone());
     spawn_node_record_publisher(&args)?;
     if args.enable_nat_assist {
@@ -546,116 +746,232 @@ async fn main() -> Result<()> {
         let Some(message) = service_client.recv().await else {
             break;
         };
-        let ServicePayload::RelayAllocationRequest(request) = message.payload else {
-            continue;
-        };
+        match message.payload {
+            ServicePayload::RelayAllocationRequest(request) => {
+                if let Some((reason, retry_after_secs)) = service_runtime_state
+                    .lock()
+                    .await
+                    .relay
+                    .as_mut()
+                    .and_then(|relay| {
+                        relay.allocation_rejection_for_requester(
+                            &message.sender_pubkey,
+                            unix_timestamp(),
+                            &relay_limits,
+                        )
+                    })
+                {
+                    send_allocation_rejection(
+                        &service_client,
+                        &message.sender_pubkey,
+                        request.request_id.clone(),
+                        request.network_id.clone(),
+                        reason,
+                        retry_after_secs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to send allocation rejection to {}",
+                            message.sender_pubkey
+                        )
+                    })?;
+                    continue;
+                }
 
-        let requester_socket = Arc::new(
-            UdpSocket::bind(SocketAddr::new(bind_ip, 0))
-                .await
-                .with_context(|| format!("failed to bind requester leg on {bind_ip}"))?,
-        );
-        let target_socket = Arc::new(
-            UdpSocket::bind(SocketAddr::new(bind_ip, 0))
-                .await
-                .with_context(|| format!("failed to bind target leg on {bind_ip}"))?,
-        );
-        let requester_addr = requester_socket
-            .local_addr()
-            .context("failed to read requester leg addr")?;
-        let target_addr = target_socket
-            .local_addr()
-            .context("failed to read target leg addr")?;
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let lease_secs = args.lease_secs.max(30);
-        let started_at = unix_timestamp();
-        let expires_at = started_at + lease_secs;
-        let expires_at_instant = Instant::now() + Duration::from_secs(lease_secs);
-        let request_id = request.request_id.clone();
-        let network_id = request.network_id.clone();
-        let target_pubkey = request.target_pubkey.clone();
-        let requester_pubkey = message.sender_pubkey.clone();
-        let requester_ingress_endpoint = SocketAddr::new(
-            parse_advertise_ip(&args.advertise_host)?,
-            requester_addr.port(),
-        )
-        .to_string();
-        let target_ingress_endpoint = SocketAddr::new(
-            parse_advertise_ip(&args.advertise_host)?,
-            target_addr.port(),
-        )
-        .to_string();
+                let (
+                    requester_socket,
+                    target_socket,
+                    requester_ingress_endpoint,
+                    target_ingress_endpoint,
+                ) = bind_relay_leg_pair(bind_ip, &args.advertise_host).await?;
+                let state = Arc::new(Mutex::new(SessionState::default()));
+                let lease_secs = args.lease_secs.max(30);
+                let started_at = unix_timestamp();
+                let expires_at = started_at + lease_secs;
+                let expires_at_instant = Instant::now() + Duration::from_secs(lease_secs);
+                let request_id = request.request_id.clone();
+                let network_id = request.network_id.clone();
+                let target_pubkey = request.target_pubkey.clone();
+                let requester_pubkey = message.sender_pubkey.clone();
 
-        let response = RelayAllocationGranted {
-            request_id: request_id.clone(),
-            network_id: network_id.clone(),
-            relay_pubkey: service_client.own_pubkey().to_string(),
-            requester_ingress_endpoint: requester_ingress_endpoint.clone(),
-            target_ingress_endpoint: target_ingress_endpoint.clone(),
-            expires_at,
-        };
-        service_client
-            .publish_to(
-                ServicePayload::RelayAllocationGranted(response),
-                &message.sender_pubkey,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to send allocation response to {}",
-                    message.sender_pubkey
-                )
-            })?;
+                let response = RelayAllocationGranted {
+                    request_id: request_id.clone(),
+                    network_id: network_id.clone(),
+                    relay_pubkey: service_client.own_pubkey().to_string(),
+                    requester_ingress_endpoint: requester_ingress_endpoint.clone(),
+                    target_ingress_endpoint: target_ingress_endpoint.clone(),
+                    expires_at,
+                };
+                service_client
+                    .publish_to(
+                        ServicePayload::RelayAllocationGranted(response),
+                        &message.sender_pubkey,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to send allocation response to {}",
+                            message.sender_pubkey
+                        )
+                    })?;
 
-        {
-            let mut stats = service_runtime_state.lock().await;
-            stats.note_session_started(RelayOperatorSessionState {
-                request_id: request_id.clone(),
-                network_id,
-                requester_pubkey,
-                target_pubkey,
-                requester_ingress_endpoint,
-                target_ingress_endpoint,
-                started_at,
-                expires_at,
-                bytes_from_requester: 0,
-                bytes_from_target: 0,
-            });
+                {
+                    let mut stats = service_runtime_state.lock().await;
+                    stats.note_session_started(RelayOperatorSessionState {
+                        request_id: request_id.clone(),
+                        network_id,
+                        requester_pubkey,
+                        target_pubkey,
+                        requester_ingress_endpoint,
+                        target_ingress_endpoint,
+                        started_at,
+                        expires_at,
+                        bytes_from_requester: 0,
+                        bytes_from_target: 0,
+                    });
+                }
+
+                spawn_leg(RelayLegTask {
+                    rx_socket: requester_socket.clone(),
+                    tx_socket: target_socket.clone(),
+                    state: state.clone(),
+                    service_runtime_state: service_runtime_state.clone(),
+                    relay_limits: relay_limits.clone(),
+                    request_id: request_id.clone(),
+                    requester_leg: true,
+                    expires_at: expires_at_instant,
+                });
+                spawn_leg(RelayLegTask {
+                    rx_socket: target_socket.clone(),
+                    tx_socket: requester_socket.clone(),
+                    state,
+                    service_runtime_state: service_runtime_state.clone(),
+                    relay_limits: relay_limits.clone(),
+                    request_id,
+                    requester_leg: false,
+                    expires_at: expires_at_instant,
+                });
+            }
+            ServicePayload::RelayProbeRequest(request) => {
+                if let Some((reason, retry_after_secs)) = service_runtime_state
+                    .lock()
+                    .await
+                    .relay
+                    .as_mut()
+                    .and_then(|relay| {
+                        relay.allocation_rejection_for_requester(
+                            &message.sender_pubkey,
+                            unix_timestamp(),
+                            &relay_limits,
+                        )
+                    })
+                {
+                    send_probe_rejection(
+                        &service_client,
+                        &message.sender_pubkey,
+                        request.request_id.clone(),
+                        reason,
+                        retry_after_secs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to send probe rejection to {}",
+                            message.sender_pubkey
+                        )
+                    })?;
+                    continue;
+                }
+
+                let (
+                    requester_socket,
+                    target_socket,
+                    requester_ingress_endpoint,
+                    target_ingress_endpoint,
+                ) = bind_relay_leg_pair(bind_ip, &args.advertise_host).await?;
+                let state = Arc::new(Mutex::new(SessionState::default()));
+                let lease_secs = DEFAULT_PROBE_LEASE_SECS;
+                let started_at = unix_timestamp();
+                let expires_at = started_at + lease_secs;
+                let expires_at_instant = Instant::now() + Duration::from_secs(lease_secs);
+                let request_id = request.request_id.clone();
+
+                service_client
+                    .publish_to(
+                        ServicePayload::RelayProbeGranted(RelayProbeGranted {
+                            request_id: request_id.clone(),
+                            relay_pubkey: service_client.own_pubkey().to_string(),
+                            requester_ingress_endpoint: requester_ingress_endpoint.clone(),
+                            target_ingress_endpoint: target_ingress_endpoint.clone(),
+                            expires_at,
+                        }),
+                        &message.sender_pubkey,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to send probe grant to {}", message.sender_pubkey)
+                    })?;
+
+                {
+                    let mut stats = service_runtime_state.lock().await;
+                    stats.note_session_started(RelayOperatorSessionState {
+                        request_id: request_id.clone(),
+                        network_id: "__probe__".to_string(),
+                        requester_pubkey: message.sender_pubkey.clone(),
+                        target_pubkey: message.sender_pubkey.clone(),
+                        requester_ingress_endpoint,
+                        target_ingress_endpoint,
+                        started_at,
+                        expires_at,
+                        bytes_from_requester: 0,
+                        bytes_from_target: 0,
+                    });
+                }
+
+                spawn_leg(RelayLegTask {
+                    rx_socket: requester_socket.clone(),
+                    tx_socket: target_socket.clone(),
+                    state: state.clone(),
+                    service_runtime_state: service_runtime_state.clone(),
+                    relay_limits: relay_limits.clone(),
+                    request_id: request_id.clone(),
+                    requester_leg: true,
+                    expires_at: expires_at_instant,
+                });
+                spawn_leg(RelayLegTask {
+                    rx_socket: target_socket.clone(),
+                    tx_socket: requester_socket.clone(),
+                    state,
+                    service_runtime_state: service_runtime_state.clone(),
+                    relay_limits: relay_limits.clone(),
+                    request_id,
+                    requester_leg: false,
+                    expires_at: expires_at_instant,
+                });
+            }
+            ServicePayload::RelayAllocationGranted(_)
+            | ServicePayload::RelayAllocationRejected(_)
+            | ServicePayload::RelayProbeGranted(_)
+            | ServicePayload::RelayProbeRejected(_) => {}
         }
-
-        spawn_leg(
-            requester_socket.clone(),
-            target_socket.clone(),
-            state.clone(),
-            service_runtime_state.clone(),
-            request_id.clone(),
-            true,
-            expires_at_instant,
-        );
-        spawn_leg(
-            target_socket.clone(),
-            requester_socket.clone(),
-            state,
-            service_runtime_state.clone(),
-            request_id,
-            false,
-            expires_at_instant,
-        );
     }
 
     service_client.disconnect().await;
     Ok(())
 }
 
-fn spawn_leg(
-    rx_socket: Arc<UdpSocket>,
-    tx_socket: Arc<UdpSocket>,
-    state: Arc<Mutex<SessionState>>,
-    service_runtime_state: Arc<Mutex<ServiceRuntimeState>>,
-    request_id: String,
-    requester_leg: bool,
-    expires_at: Instant,
-) {
+fn spawn_leg(task: RelayLegTask) {
+    let RelayLegTask {
+        rx_socket,
+        tx_socket,
+        state,
+        service_runtime_state,
+        relay_limits,
+        request_id,
+        requester_leg,
+        expires_at,
+    } = task;
     tokio::spawn(async move {
         let mut buffer = [0_u8; 65_535];
         loop {
@@ -667,7 +983,13 @@ fn spawn_leg(
                     };
                     let maybe_dest = {
                         let mut state = state.lock().await;
-                        if requester_leg {
+                        if state
+                            .forwarding
+                            .allow_forward(&relay_limits, Instant::now(), len)
+                            .is_err()
+                        {
+                            None
+                        } else if requester_leg {
                             match state.requester.bound_addr {
                                 Some(bound) if bound != src => None,
                                 Some(_) => state.target.bound_addr,
@@ -687,11 +1009,11 @@ fn spawn_leg(
                             }
                         }
                     };
-                    if let Some(dest) = maybe_dest {
-                        if let Ok(sent) = tx_socket.send_to(&buffer[..len], dest).await {
-                            let mut stats = service_runtime_state.lock().await;
-                            stats.note_forwarded_bytes(&request_id, requester_leg, sent as u64);
-                        }
+                    if let Some(dest) = maybe_dest
+                        && let Ok(sent) = tx_socket.send_to(&buffer[..len], dest).await
+                    {
+                        let mut stats = service_runtime_state.lock().await;
+                        stats.note_forwarded_bytes(&request_id, requester_leg, sent as u64);
                     }
                 }
             }
@@ -797,12 +1119,17 @@ mod tests {
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{NatAssistRuntimeState, RelayRuntimeState, unix_timestamp};
-    use nostr_vpn_core::relay::{
-        NatAssistOperatorState, RelayOperatorSessionState, RelayOperatorState, ServiceOperatorState,
+    use super::{
+        NatAssistRuntimeState, RelayRuntimeState, RelayServiceLimits, SessionForwardingState,
+        unix_timestamp,
     };
+    use nostr_vpn_core::relay::{
+        NatAssistOperatorState, RelayAllocationRejectReason, RelayOperatorSessionState,
+        RelayOperatorState, ServiceOperatorState,
+    };
+    use tokio::time::Instant;
 
     fn unique_state_path() -> PathBuf {
         env::temp_dir().join(format!(
@@ -873,6 +1200,108 @@ mod tests {
 
         let snapshot = state.snapshot(now);
         assert!(snapshot.active_sessions.is_empty());
+    }
+
+    #[test]
+    fn relay_runtime_state_rejects_when_over_capacity() {
+        let now = unix_timestamp();
+        let mut state = RelayRuntimeState {
+            relay_pubkey: "relay".to_string(),
+            advertised_endpoint: "198.51.100.9:0".to_string(),
+            active_sessions: HashMap::from([
+                (
+                    "req-1".to_string(),
+                    RelayOperatorSessionState {
+                        request_id: "req-1".to_string(),
+                        network_id: "mesh-1".to_string(),
+                        requester_pubkey: "requester-a".to_string(),
+                        target_pubkey: "target-b".to_string(),
+                        requester_ingress_endpoint: "198.51.100.9:40001".to_string(),
+                        target_ingress_endpoint: "198.51.100.9:40002".to_string(),
+                        started_at: now.saturating_sub(2),
+                        expires_at: now + 60,
+                        bytes_from_requester: 0,
+                        bytes_from_target: 0,
+                    },
+                ),
+                (
+                    "req-2".to_string(),
+                    RelayOperatorSessionState {
+                        request_id: "req-2".to_string(),
+                        network_id: "mesh-1".to_string(),
+                        requester_pubkey: "requester-c".to_string(),
+                        target_pubkey: "target-d".to_string(),
+                        requester_ingress_endpoint: "198.51.100.9:40003".to_string(),
+                        target_ingress_endpoint: "198.51.100.9:40004".to_string(),
+                        started_at: now.saturating_sub(2),
+                        expires_at: now + 60,
+                        bytes_from_requester: 0,
+                        bytes_from_target: 0,
+                    },
+                ),
+            ]),
+            ..RelayRuntimeState::default()
+        };
+
+        let rejection = state.allocation_rejection_for_requester(
+            "requester-z",
+            now,
+            &RelayServiceLimits {
+                max_active_sessions: 2,
+                max_sessions_per_requester: 4,
+                max_bytes_per_session: 1_024,
+                max_forward_bps: None,
+            },
+        );
+
+        assert_eq!(
+            rejection,
+            Some((RelayAllocationRejectReason::OverCapacity, Some(30)))
+        );
+    }
+
+    #[test]
+    fn relay_runtime_state_rejects_requester_when_session_cap_reached() {
+        let now = unix_timestamp();
+        let mut state = RelayRuntimeState {
+            relay_pubkey: "relay".to_string(),
+            advertised_endpoint: "198.51.100.9:0".to_string(),
+            active_sessions: HashMap::from([(
+                "req-1".to_string(),
+                RelayOperatorSessionState {
+                    request_id: "req-1".to_string(),
+                    network_id: "mesh-1".to_string(),
+                    requester_pubkey: "requester-a".to_string(),
+                    target_pubkey: "target-b".to_string(),
+                    requester_ingress_endpoint: "198.51.100.9:40001".to_string(),
+                    target_ingress_endpoint: "198.51.100.9:40002".to_string(),
+                    started_at: now.saturating_sub(2),
+                    expires_at: now + 60,
+                    bytes_from_requester: 0,
+                    bytes_from_target: 0,
+                },
+            )]),
+            ..RelayRuntimeState::default()
+        };
+
+        let rejection = state.allocation_rejection_for_requester(
+            "requester-a",
+            now,
+            &RelayServiceLimits {
+                max_active_sessions: 8,
+                max_sessions_per_requester: 1,
+                max_bytes_per_session: 1_024,
+                max_forward_bps: None,
+            },
+        );
+
+        assert_eq!(
+            rejection,
+            Some((
+                RelayAllocationRejectReason::TooManySessionsForRequester,
+                Some(60)
+            ))
+        );
     }
 
     #[test]
@@ -948,6 +1377,48 @@ mod tests {
         assert_eq!(snapshot.total_punch_requests, 1);
         assert_eq!(snapshot.unique_client_count, 2);
         assert_eq!(snapshot.advertised_endpoint, "198.51.100.9:3478");
+    }
+
+    #[test]
+    fn session_forwarding_state_enforces_byte_cap() {
+        let mut state = SessionForwardingState::default();
+        let limits = RelayServiceLimits {
+            max_active_sessions: 8,
+            max_sessions_per_requester: 2,
+            max_bytes_per_session: 512,
+            max_forward_bps: None,
+        };
+        let now = Instant::now();
+
+        assert!(state.allow_forward(&limits, now, 256).is_ok());
+        assert!(state.allow_forward(&limits, now, 256).is_ok());
+        assert_eq!(
+            state.allow_forward(&limits, now, 1),
+            Err(RelayAllocationRejectReason::ByteLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn session_forwarding_state_enforces_rate_limit() {
+        let mut state = SessionForwardingState::default();
+        let limits = RelayServiceLimits {
+            max_active_sessions: 8,
+            max_sessions_per_requester: 2,
+            max_bytes_per_session: 4_096,
+            max_forward_bps: Some(512),
+        };
+        let now = Instant::now();
+
+        assert!(state.allow_forward(&limits, now, 512).is_ok());
+        assert_eq!(
+            state.allow_forward(&limits, now, 1),
+            Err(RelayAllocationRejectReason::RateLimited)
+        );
+        assert!(
+            state
+                .allow_forward(&limits, now + Duration::from_secs(1), 256)
+                .is_ok()
+        );
     }
 
     #[test]

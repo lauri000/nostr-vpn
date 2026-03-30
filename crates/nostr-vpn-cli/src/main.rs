@@ -35,7 +35,7 @@ use hex::encode as encode_hex;
 use netdev::get_interfaces;
 use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, maybe_autoconfigure_node, normalize_advertised_route,
-    normalize_nostr_pubkey,
+    normalize_nostr_pubkey, normalize_runtime_network_id,
 };
 use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint_from_local_endpoints};
 use nostr_vpn_core::crypto::generate_keypair;
@@ -58,14 +58,17 @@ use nostr_vpn_core::platform_paths::{
     windows_service_config_path_from_sc_qc_output,
 };
 use nostr_vpn_core::presence::PeerPresenceBook;
-use nostr_vpn_core::relay::{RelayAllocationGranted, RelayAllocationRequest};
+use nostr_vpn_core::relay::{
+    RelayAllocationGranted, RelayAllocationRejected, RelayAllocationRequest, RelayProbeRequest,
+};
 use nostr_vpn_core::service_signaling::{RelayServiceClient, ServicePayload};
 use nostr_vpn_core::signaling::{
-    NostrSignalingClient, SignalEnvelope, SignalPayload, SignalingNetwork,
+    NetworkRoster, NostrSignalingClient, SignalEnvelope, SignalPayload, SignalingNetwork,
 };
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::net::UdpSocket;
 #[cfg(target_os = "windows")]
 use windows_service::define_windows_service;
 #[cfg(target_os = "windows")]
@@ -133,6 +136,10 @@ const RELAY_REQUEST_RETRY_AFTER_SECS: u64 = 30;
 const RELAY_REQUEST_TIMEOUT_SECS: u64 = 120;
 const RELAY_SESSION_VERIFY_TIMEOUT_SECS: u64 = 8;
 const RELAY_FAILED_RETRY_AFTER_SECS: u64 = 60;
+const RELAY_PROVIDER_FAILURE_MAX_COOLDOWN_SECS: u64 = 900;
+const RELAY_PROVIDER_PROBE_TIMEOUT_SECS: u64 = 4;
+const RELAY_PROVIDER_PROBE_RETRY_AFTER_SECS: u64 = 60;
+const MAX_PARALLEL_RELAY_PROVIDER_PROBES: usize = 2;
 const MAX_PARALLEL_RELAY_REQUESTS_PER_PARTICIPANT: usize = 3;
 const MIN_PERSISTED_PEER_CACHE_TIMEOUT_SECS: u64 = 600;
 const PERSISTED_PEER_CACHE_TIMEOUT_MULTIPLIER: u64 = 30;
@@ -1559,14 +1566,16 @@ fn signaling_networks_for_app(app: &AppConfig) -> Vec<SignalingNetwork> {
         .into_iter()
         .map(|network| SignalingNetwork {
             network_id: network.network_id,
-            participants: network.participants,
+            participants: app
+                .network_signal_pubkeys_hex(&network.id)
+                .unwrap_or(network.participants),
         })
         .collect::<Vec<_>>();
 
     if networks.is_empty() {
         return vec![SignalingNetwork {
             network_id: app.effective_network_id(),
-            participants: app.participant_pubkeys_hex(),
+            participants: app.active_network_signal_pubkeys_hex(),
         }];
     }
 
@@ -1591,6 +1600,53 @@ fn build_daemon_reload_config(
         own_pubkey,
         relays,
     }
+}
+
+async fn publish_active_network_roster(
+    client: &NostrSignalingClient,
+    app: &AppConfig,
+    recipients: Option<&[String]>,
+) -> Result<usize> {
+    let network = app.active_network();
+    let own_pubkey = match app.own_nostr_pubkey_hex() {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(0),
+    };
+    if !app.is_network_admin(&network.id, &own_pubkey) {
+        return Ok(0);
+    }
+
+    let roster = app.shared_network_roster(&network.id)?;
+    let allowed = app.active_network_signal_pubkeys_hex();
+    let allowed_set = allowed.iter().cloned().collect::<HashSet<_>>();
+    let mut recipients = recipients
+        .map(|recipients| {
+            recipients
+                .iter()
+                .filter(|recipient| allowed_set.contains(recipient.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or(allowed);
+    recipients.retain(|recipient| recipient != &own_pubkey);
+    recipients.sort();
+    recipients.dedup();
+    if recipients.is_empty() {
+        return Ok(0);
+    }
+
+    let payload = SignalPayload::Roster(NetworkRoster {
+        network_name: roster.name,
+        participants: roster.participants,
+        admins: roster.admins,
+        signed_at: if roster.updated_at > 0 {
+            roster.updated_at
+        } else {
+            unix_timestamp()
+        },
+    });
+    client.publish_to(payload, &recipients).await?;
+    Ok(recipients.len())
 }
 
 async fn publish_announcement(request: AnnounceRequest) -> Result<PublishedAnnouncement> {
@@ -1694,6 +1750,7 @@ async fn discover_peers(
                 SignalPayload::Disconnect { node_id } => {
                     peers.remove(&node_id);
                 }
+                SignalPayload::Roster(_) => {}
                 SignalPayload::JoinRequest { .. } => {}
             },
             Ok(None) => break,
@@ -1745,12 +1802,29 @@ struct OutboundAnnounceBook {
 }
 
 type RelayFailureCooldowns = HashMap<String, u64>;
+type RelayProviderVerificationBook = HashMap<String, RelayProviderVerification>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RelayGrantAction {
     Activated(String),
     QueuedStandby(String),
     Ignored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayProviderProbeOutcome {
+    Verified,
+    Rejected(Option<u64>),
+    Failed,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RelayProviderVerification {
+    verified_at: Option<u64>,
+    failure_cooldown_until: Option<u64>,
+    last_failure_at: Option<u64>,
+    last_probe_attempt_at: Option<u64>,
+    consecutive_failures: u32,
 }
 
 impl OutboundAnnounceBook {
@@ -1823,6 +1897,142 @@ fn prune_relay_failure_cooldowns(relay_failures: &mut RelayFailureCooldowns, now
     let before = relay_failures.len();
     relay_failures.retain(|_, cooldown_until| *cooldown_until > now);
     relay_failures.len() != before
+}
+
+fn relay_provider_in_failure_cooldown(
+    relay_provider_verifications: &RelayProviderVerificationBook,
+    relay_pubkey: &str,
+    now: u64,
+) -> bool {
+    relay_provider_verifications
+        .get(relay_pubkey)
+        .and_then(|verification| verification.failure_cooldown_until)
+        .is_some_and(|cooldown_until| cooldown_until > now)
+}
+
+fn note_verified_relay_provider(
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
+    relay_pubkey: &str,
+    now: u64,
+) {
+    let verification = relay_provider_verifications
+        .entry(relay_pubkey.to_string())
+        .or_default();
+    verification.verified_at = Some(now);
+    verification.failure_cooldown_until = None;
+    verification.last_failure_at = None;
+    verification.last_probe_attempt_at = Some(now);
+    verification.consecutive_failures = 0;
+}
+
+fn note_relay_provider_probe_attempt(
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
+    relay_pubkey: &str,
+    now: u64,
+) {
+    relay_provider_verifications
+        .entry(relay_pubkey.to_string())
+        .or_default()
+        .last_probe_attempt_at = Some(now);
+}
+
+fn note_failed_relay_provider(
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
+    relay_pubkey: &str,
+    now: u64,
+    retry_after_secs: Option<u64>,
+) {
+    let verification = relay_provider_verifications
+        .entry(relay_pubkey.to_string())
+        .or_default();
+    verification.last_failure_at = Some(now);
+    verification.last_probe_attempt_at = Some(now);
+    verification.consecutive_failures = verification.consecutive_failures.saturating_add(1);
+    let base = retry_after_secs
+        .unwrap_or(RELAY_FAILED_RETRY_AFTER_SECS)
+        .max(1);
+    let multiplier_shift = verification.consecutive_failures.saturating_sub(1).min(4);
+    let multiplier = 1_u64 << multiplier_shift;
+    let cooldown = base
+        .saturating_mul(multiplier)
+        .min(RELAY_PROVIDER_FAILURE_MAX_COOLDOWN_SECS);
+    verification.failure_cooldown_until = Some(now + cooldown);
+}
+
+fn relay_provider_probe_due(
+    relay_provider_verifications: &RelayProviderVerificationBook,
+    relay_pubkey: &str,
+    now: u64,
+) -> bool {
+    let Some(verification) = relay_provider_verifications.get(relay_pubkey) else {
+        return true;
+    };
+    if verification.verified_at.is_some() {
+        return false;
+    }
+    if verification
+        .failure_cooldown_until
+        .is_some_and(|cooldown_until| cooldown_until > now)
+    {
+        return false;
+    }
+    verification
+        .last_probe_attempt_at
+        .is_none_or(|last_probe_at| {
+            now.saturating_sub(last_probe_at) >= RELAY_PROVIDER_PROBE_RETRY_AFTER_SECS
+        })
+}
+
+fn prune_relay_provider_verifications(
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
+    now: u64,
+) -> bool {
+    let before = relay_provider_verifications.len();
+    relay_provider_verifications.retain(|_, verification| {
+        if verification
+            .failure_cooldown_until
+            .is_some_and(|cooldown_until| cooldown_until <= now)
+        {
+            verification.failure_cooldown_until = None;
+        }
+        verification.verified_at.is_some()
+            || verification.failure_cooldown_until.is_some()
+            || verification.last_failure_at.is_some()
+            || verification.last_probe_attempt_at.is_some()
+    });
+    relay_provider_verifications.len() != before
+}
+
+fn relay_provider_sort_key(
+    relay_provider_verifications: &RelayProviderVerificationBook,
+    relay_pubkey: &str,
+    now: u64,
+) -> (u8, std::cmp::Reverse<u64>, u64) {
+    if let Some(verification) = relay_provider_verifications.get(relay_pubkey) {
+        if verification
+            .failure_cooldown_until
+            .is_some_and(|cooldown_until| cooldown_until > now)
+        {
+            return (
+                2,
+                std::cmp::Reverse(0),
+                verification.last_failure_at.unwrap_or(0),
+            );
+        }
+        if let Some(verified_at) = verification.verified_at {
+            return (
+                0,
+                std::cmp::Reverse(verified_at),
+                verification.last_failure_at.unwrap_or(0),
+            );
+        }
+        return (
+            1,
+            std::cmp::Reverse(0),
+            verification.last_failure_at.unwrap_or(0),
+        );
+    }
+    (1, std::cmp::Reverse(0), 0)
 }
 
 fn prune_active_relay_sessions(
@@ -1935,12 +2145,14 @@ fn runtime_peer_verifies_relay_session(
     (handshake_at >= session.granted_at).then_some(handshake_at)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_active_relay_sessions(
     presence: &PeerPresenceBook,
     runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
     relay_sessions: &mut HashMap<String, ActiveRelaySession>,
     standby_relay_sessions: &mut HashMap<String, Vec<ActiveRelaySession>>,
     relay_failures: &mut RelayFailureCooldowns,
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
     pending_requests: &mut HashMap<String, PendingRelayRequest>,
     now: u64,
 ) -> Vec<String> {
@@ -1975,6 +2187,11 @@ fn reconcile_active_relay_sessions(
             &session_snapshot,
             now,
         ) {
+            note_verified_relay_provider(
+                relay_provider_verifications,
+                &session_snapshot.relay_pubkey,
+                verified_at,
+            );
             if let Some(session) = relay_sessions.get_mut(&participant)
                 && session.verified_at.is_none()
             {
@@ -1993,6 +2210,12 @@ fn reconcile_active_relay_sessions(
             &participant,
             &session_snapshot.relay_pubkey,
             now,
+        );
+        note_failed_relay_provider(
+            relay_provider_verifications,
+            &session_snapshot.relay_pubkey,
+            now,
+            None,
         );
         pending_requests.retain(|_, request| request.participant != participant);
         if let Some(next_session) = pop_next_standby_relay_session(
@@ -2091,7 +2314,199 @@ fn participants_needing_relay(
         .collect()
 }
 
-async fn discover_relay_operator_pubkeys(relays: &[String]) -> Result<Vec<String>> {
+async fn probe_relay_provider_datapath(
+    requester_ingress_endpoint: &str,
+    target_ingress_endpoint: &str,
+) -> Result<()> {
+    let requester_ingress = requester_ingress_endpoint
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid requester ingress {requester_ingress_endpoint}"))?;
+    let target_ingress = target_ingress_endpoint
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid target ingress {target_ingress_endpoint}"))?;
+    let requester_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+        .await
+        .context("failed to bind requester probe socket")?;
+    let target_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+        .await
+        .context("failed to bind target probe socket")?;
+    let nonce_b_to_a = format!("nvpn-relay-probe-b-to-a:{requester_ingress}:{target_ingress}");
+    let nonce_a_to_b = format!("nvpn-relay-probe-a-to-b:{target_ingress}:{requester_ingress}");
+    let mut buf = [0_u8; 512];
+
+    requester_socket
+        .send_to(b"nvpn-relay-probe-bind", requester_ingress)
+        .await
+        .context("failed to bind requester probe leg")?;
+    target_socket
+        .send_to(nonce_b_to_a.as_bytes(), target_ingress)
+        .await
+        .context("failed to send target-side relay probe")?;
+    let (read, src) = tokio::time::timeout(
+        Duration::from_millis(750),
+        requester_socket.recv_from(&mut buf),
+    )
+    .await
+    .context("timed out waiting for requester-side relay probe")?
+    .context("failed to receive requester-side relay probe")?;
+    if src != requester_ingress || &buf[..read] != nonce_b_to_a.as_bytes() {
+        return Err(anyhow!(
+            "requester-side relay probe did not loop through the expected ingress"
+        ));
+    }
+
+    requester_socket
+        .send_to(nonce_a_to_b.as_bytes(), requester_ingress)
+        .await
+        .context("failed to send requester-side relay probe")?;
+    let (read, src) = tokio::time::timeout(
+        Duration::from_millis(750),
+        target_socket.recv_from(&mut buf),
+    )
+    .await
+    .context("timed out waiting for target-side relay probe")?
+    .context("failed to receive target-side relay probe")?;
+    if src != target_ingress || &buf[..read] != nonce_a_to_b.as_bytes() {
+        return Err(anyhow!(
+            "target-side relay probe did not loop through the expected ingress"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn probe_relay_provider(
+    relays: &[String],
+    secret_key: &str,
+    relay_pubkey: &str,
+    now: u64,
+) -> Result<RelayProviderProbeOutcome> {
+    let probe_client = RelayServiceClient::from_secret_key(secret_key)?;
+    probe_client.connect(relays).await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let request_id = format!("probe:{relay_pubkey}:{now}");
+    let request = RelayProbeRequest {
+        request_id: request_id.clone(),
+        requested_at: now,
+    };
+    let publish_result = probe_client
+        .publish_to(ServicePayload::RelayProbeRequest(request), relay_pubkey)
+        .await;
+    if let Err(error) = publish_result {
+        probe_client.disconnect().await;
+        return Err(error);
+    }
+
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(RELAY_PROVIDER_PROBE_TIMEOUT_SECS);
+    let outcome = loop {
+        let wait_for = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if wait_for.is_zero() {
+            break RelayProviderProbeOutcome::Failed;
+        }
+        let Some(message) = tokio::time::timeout(wait_for, probe_client.recv())
+            .await
+            .ok()
+            .flatten()
+        else {
+            break RelayProviderProbeOutcome::Failed;
+        };
+        match message.payload {
+            ServicePayload::RelayProbeGranted(granted)
+                if granted.request_id == request_id && granted.relay_pubkey == relay_pubkey =>
+            {
+                let probe = probe_relay_provider_datapath(
+                    &granted.requester_ingress_endpoint,
+                    &granted.target_ingress_endpoint,
+                )
+                .await;
+                break if probe.is_ok() {
+                    RelayProviderProbeOutcome::Verified
+                } else {
+                    RelayProviderProbeOutcome::Failed
+                };
+            }
+            ServicePayload::RelayProbeRejected(rejected)
+                if rejected.request_id == request_id && rejected.relay_pubkey == relay_pubkey =>
+            {
+                break RelayProviderProbeOutcome::Rejected(rejected.retry_after_secs);
+            }
+            _ => continue,
+        }
+    };
+
+    probe_client.disconnect().await;
+    Ok(outcome)
+}
+
+async fn proactively_probe_relay_providers(
+    relays: &[String],
+    secret_key: &str,
+    relay_pubkeys: &[String],
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
+    now: u64,
+) -> Result<usize> {
+    let candidates = relay_pubkeys
+        .iter()
+        .map(String::as_str)
+        .filter(|relay_pubkey| {
+            relay_provider_probe_due(relay_provider_verifications, relay_pubkey, now)
+        })
+        .take(MAX_PARALLEL_RELAY_PROVIDER_PROBES)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut probed = 0usize;
+
+    for relay_pubkey in candidates {
+        note_relay_provider_probe_attempt(relay_provider_verifications, &relay_pubkey, now);
+        match probe_relay_provider(relays, secret_key, &relay_pubkey, now).await {
+            Ok(RelayProviderProbeOutcome::Verified) => {
+                eprintln!("relay: proactive probe verified {relay_pubkey}");
+                note_verified_relay_provider(relay_provider_verifications, &relay_pubkey, now);
+                probed = probed.saturating_add(1);
+            }
+            Ok(RelayProviderProbeOutcome::Rejected(retry_after_secs)) => {
+                eprintln!("relay: proactive probe rejected by {relay_pubkey}");
+                note_failed_relay_provider(
+                    relay_provider_verifications,
+                    &relay_pubkey,
+                    now,
+                    retry_after_secs,
+                );
+                probed = probed.saturating_add(1);
+            }
+            Ok(RelayProviderProbeOutcome::Failed) => {
+                eprintln!("relay: proactive probe failed for {relay_pubkey}");
+                note_failed_relay_provider(
+                    relay_provider_verifications,
+                    &relay_pubkey,
+                    now,
+                    Some(RELAY_PROVIDER_PROBE_RETRY_AFTER_SECS),
+                );
+                probed = probed.saturating_add(1);
+            }
+            Err(error) => {
+                eprintln!("relay: proactive probe failed for {relay_pubkey}: {error}");
+                note_failed_relay_provider(
+                    relay_provider_verifications,
+                    &relay_pubkey,
+                    now,
+                    Some(RELAY_PROVIDER_PROBE_RETRY_AFTER_SECS),
+                );
+                probed = probed.saturating_add(1);
+            }
+        }
+    }
+
+    Ok(probed)
+}
+
+async fn discover_relay_operator_pubkeys(
+    relays: &[String],
+    relay_provider_verifications: &RelayProviderVerificationBook,
+    now: u64,
+) -> Result<Vec<String>> {
     let mut candidates = discover_node_records(
         relays,
         NODE_RECORD_RELAY_TAG,
@@ -2100,8 +2515,10 @@ async fn discover_relay_operator_pubkeys(relays: &[String]) -> Result<Vec<String
     .await?
     .into_iter()
     .filter_map(|(pubkey, record)| record.has_service(NodeServiceKind::Relay).then_some(pubkey))
+    .filter(|pubkey| !relay_provider_in_failure_cooldown(relay_provider_verifications, pubkey, now))
     .collect::<Vec<_>>();
-    candidates.sort();
+    candidates
+        .sort_by_key(|pubkey| relay_provider_sort_key(relay_provider_verifications, pubkey, now));
     candidates.dedup();
     Ok(candidates)
 }
@@ -2111,19 +2528,28 @@ fn relay_candidates_for_participant<'a>(
     participant: &str,
     own_pubkey: Option<&str>,
     relay_failures: &RelayFailureCooldowns,
+    relay_provider_verifications: &RelayProviderVerificationBook,
     now: u64,
 ) -> Vec<&'a str> {
-    relay_pubkeys
+    let mut candidates = relay_pubkeys
         .iter()
         .map(String::as_str)
         .filter(|candidate| *candidate != participant && Some(*candidate) != own_pubkey)
         .filter(|candidate| {
             !relay_is_in_failure_cooldown(relay_failures, participant, candidate, now)
         })
-        .take(MAX_PARALLEL_RELAY_REQUESTS_PER_PARTICIPANT)
-        .collect()
+        .filter(|candidate| {
+            !relay_provider_in_failure_cooldown(relay_provider_verifications, candidate, now)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| {
+        relay_provider_sort_key(relay_provider_verifications, candidate, now)
+    });
+    candidates.truncate(MAX_PARALLEL_RELAY_REQUESTS_PER_PARTICIPANT);
+    candidates
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_request_public_relay_fallback(
     service_client: &RelayServiceClient,
     relays: &[String],
@@ -2133,6 +2559,7 @@ async fn maybe_request_public_relay_fallback(
     tunnel_runtime: &CliTunnelRuntime,
     relay_sessions: &HashMap<String, ActiveRelaySession>,
     relay_failures: &RelayFailureCooldowns,
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
     pending_requests: &mut HashMap<String, PendingRelayRequest>,
     now: u64,
 ) -> Result<usize> {
@@ -2149,7 +2576,25 @@ async fn maybe_request_public_relay_fallback(
         return Ok(0);
     }
 
-    let relay_pubkeys = discover_relay_operator_pubkeys(relays).await?;
+    let mut relay_pubkeys =
+        discover_relay_operator_pubkeys(relays, relay_provider_verifications, now).await?;
+    if relay_pubkeys.is_empty() {
+        return Ok(0);
+    }
+    let _ = proactively_probe_relay_providers(
+        relays,
+        &app.nostr.secret_key,
+        &relay_pubkeys,
+        relay_provider_verifications,
+        now,
+    )
+    .await?;
+    relay_pubkeys.retain(|pubkey| {
+        !relay_provider_in_failure_cooldown(relay_provider_verifications, pubkey, now)
+    });
+    relay_pubkeys
+        .sort_by_key(|pubkey| relay_provider_sort_key(relay_provider_verifications, pubkey, now));
+    relay_pubkeys.dedup();
     if relay_pubkeys.is_empty() {
         return Ok(0);
     }
@@ -2161,6 +2606,7 @@ async fn maybe_request_public_relay_fallback(
             &participant,
             own_pubkey,
             relay_failures,
+            relay_provider_verifications,
             now,
         );
         if relay_candidates.is_empty() {
@@ -2241,6 +2687,32 @@ fn accept_relay_allocation_grant(
         relay_sessions.insert(participant.clone(), session);
         RelayGrantAction::Activated(participant)
     }
+}
+
+fn accept_relay_allocation_rejection(
+    rejected: RelayAllocationRejected,
+    pending_requests: &mut HashMap<String, PendingRelayRequest>,
+    relay_failures: &mut RelayFailureCooldowns,
+    relay_provider_verifications: &mut RelayProviderVerificationBook,
+    now: u64,
+) -> Option<String> {
+    let pending = pending_requests.remove(&rejected.request_id)?;
+    if pending.relay_pubkey != rejected.relay_pubkey {
+        return None;
+    }
+    note_failed_relay(
+        relay_failures,
+        &pending.participant,
+        &pending.relay_pubkey,
+        now,
+    );
+    note_failed_relay_provider(
+        relay_provider_verifications,
+        &pending.relay_pubkey,
+        now,
+        rejected.retry_after_secs,
+    );
+    Some(pending.participant)
 }
 
 fn maybe_reset_targeted_announce_cache_for_hello(
@@ -2538,10 +3010,12 @@ impl CliTunnelRuntime {
         let configured_listen_port = app.node.listen_port;
         let listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
         let own_local_endpoints = runtime_local_signal_endpoints(app, listen_port);
+        let runtime_peers = self.peer_status().ok();
         record_successful_runtime_paths(
             peer_announcements,
-            self.peer_status().ok().as_ref(),
+            runtime_peers.as_ref(),
             path_book,
+            &own_local_endpoints,
             now,
         );
         let planned_peers = planned_tunnel_peers_for_local_endpoints(
@@ -2569,7 +3043,16 @@ impl CliTunnelRuntime {
             &local_address,
             &peers,
         );
-        if self.last_fingerprint.as_deref() == Some(fingerprint.as_str()) && self.is_running() {
+        let needs_endpoint_refresh = runtime_peer_endpoints_require_refresh(
+            &planned_peers,
+            peer_announcements,
+            runtime_peers.as_ref(),
+            &own_local_endpoints,
+        );
+        if self.last_fingerprint.as_deref() == Some(fingerprint.as_str())
+            && self.is_running()
+            && !needs_endpoint_refresh
+        {
             return Ok(());
         }
 
@@ -3263,11 +3746,16 @@ fn runtime_local_signal_endpoint(
     endpoint_with_listen_port(endpoint, listen_port)
 }
 
+fn runtime_signal_ipv4(detected_ipv4: Option<Ipv4Addr>, tunnel_ip: &str) -> Option<Ipv4Addr> {
+    let tunnel_ipv4 = strip_cidr(tunnel_ip).parse::<Ipv4Addr>().ok();
+    detected_ipv4.filter(|ip| Some(*ip) != tunnel_ipv4)
+}
+
 fn local_signal_endpoint(app: &AppConfig, listen_port: u16) -> String {
     runtime_local_signal_endpoint(
         &app.node.endpoint,
         listen_port,
-        detect_runtime_primary_ipv4(),
+        runtime_signal_ipv4(detect_runtime_primary_ipv4(), &app.node.tunnel_ip),
     )
 }
 
@@ -3300,12 +3788,17 @@ fn runtime_local_signal_endpoints(app: &AppConfig, listen_port: u16) -> Vec<Stri
     endpoints
 }
 
-fn discover_public_signal_endpoint(app: &AppConfig, listen_port: u16) -> Option<String> {
+fn discover_public_signal_endpoint(
+    app: &AppConfig,
+    listen_port: u16,
+    existing_endpoint: Option<&DiscoveredPublicSignalEndpoint>,
+) -> Option<String> {
     if !app.nat.enabled {
         return None;
     }
 
     let timeout = Duration::from_secs(app.nat.discovery_timeout_secs.max(1));
+    let mut saw_invalid_reflector_response = false;
 
     for reflector in &app.nat.reflectors {
         let Ok(reflector_addr) = reflector.parse::<SocketAddr>() else {
@@ -3319,9 +3812,18 @@ fn discover_public_signal_endpoint(app: &AppConfig, listen_port: u16) -> Option<
                 return Some(endpoint);
             }
             Err(error) => {
+                if existing_endpoint.is_some()
+                    && error.to_string().starts_with("invalid discovery response:")
+                {
+                    saw_invalid_reflector_response = true;
+                }
                 eprintln!("nat: reflector discovery failed via {reflector}: {error}");
             }
         }
+    }
+
+    if existing_endpoint.is_some() && saw_invalid_reflector_response {
+        return None;
     }
 
     for server in &app.nat.stun_servers {
@@ -3345,17 +3847,25 @@ struct DiscoveredPublicSignalEndpoint {
     endpoint: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RelayAnnouncementDetails {
+    relay_endpoint: Option<String>,
+    relay_pubkey: Option<String>,
+    relay_expires_at: Option<u64>,
+}
+
 fn refresh_public_signal_endpoint(
     app: &AppConfig,
     listen_port: u16,
     public_signal_endpoint: &mut Option<DiscoveredPublicSignalEndpoint>,
 ) {
-    *public_signal_endpoint = discover_public_signal_endpoint(app, listen_port).map(|endpoint| {
-        DiscoveredPublicSignalEndpoint {
+    let previous = public_signal_endpoint.clone();
+    *public_signal_endpoint = discover_public_signal_endpoint(app, listen_port, previous.as_ref())
+        .map(|endpoint| DiscoveredPublicSignalEndpoint {
             listen_port,
             endpoint,
-        }
-    });
+        })
+        .or_else(|| previous.filter(|endpoint| endpoint.listen_port == listen_port));
 }
 
 fn sync_public_signal_endpoint_from_mapping_or_stun(
@@ -3471,9 +3981,7 @@ fn build_explicit_peer_announcement(
         local_endpoint,
         tunnel_ip,
         advertised_routes,
-        None,
-        None,
-        None,
+        RelayAnnouncementDetails::default(),
     )
 }
 
@@ -3484,11 +3992,9 @@ fn build_explicit_peer_announcement_with_relay(
     local_endpoint: String,
     tunnel_ip: String,
     advertised_routes: Vec<String>,
-    relay_endpoint: Option<String>,
-    relay_pubkey: Option<String>,
-    relay_expires_at: Option<u64>,
+    relay: RelayAnnouncementDetails,
 ) -> PeerAnnouncement {
-    let public_endpoint = (!endpoint_is_local_only(&endpoint) && endpoint != local_endpoint)
+    let public_endpoint = endpoint_can_advertise_public_override(&endpoint, &local_endpoint)
         .then_some(endpoint.clone());
     let endpoint = if public_endpoint.is_some() {
         endpoint
@@ -3502,9 +4008,9 @@ fn build_explicit_peer_announcement_with_relay(
         endpoint,
         local_endpoint: Some(local_endpoint),
         public_endpoint,
-        relay_endpoint,
-        relay_pubkey,
-        relay_expires_at,
+        relay_endpoint: relay.relay_endpoint,
+        relay_pubkey: relay.relay_pubkey,
+        relay_expires_at: relay.relay_expires_at,
         tunnel_ip,
         advertised_routes,
         timestamp: unix_timestamp(),
@@ -3681,6 +4187,7 @@ fn record_successful_runtime_paths(
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
     path_book: &mut PeerPathBook,
+    own_local_endpoints: &[String],
     now: u64,
 ) -> bool {
     let Some(runtime_peers) = runtime_peers else {
@@ -3701,12 +4208,96 @@ fn record_successful_runtime_paths(
         let Some(endpoint) = runtime_peer.endpoint.as_deref() else {
             continue;
         };
+        if !runtime_endpoint_is_viable_for_peer(endpoint, announcement, own_local_endpoints) {
+            continue;
+        }
 
         let success_at = runtime_peer.last_handshake_at(now).unwrap_or(now);
         changed |= path_book.note_success(participant.clone(), endpoint, success_at);
     }
 
     changed
+}
+
+fn runtime_endpoint_requires_refresh(
+    runtime_endpoint: &str,
+    planned_endpoint: &str,
+    announcement: &PeerAnnouncement,
+    own_local_endpoints: &[String],
+) -> bool {
+    runtime_endpoint != planned_endpoint
+        && !runtime_endpoint_is_viable_for_peer(runtime_endpoint, announcement, own_local_endpoints)
+}
+
+fn runtime_endpoint_is_viable_for_peer(
+    runtime_endpoint: &str,
+    announcement: &PeerAnnouncement,
+    own_local_endpoints: &[String],
+) -> bool {
+    if !endpoint_is_local_only(runtime_endpoint) {
+        return true;
+    }
+
+    if announcement
+        .relay_endpoint
+        .as_deref()
+        .is_some_and(|endpoint| endpoint == runtime_endpoint)
+    {
+        return true;
+    }
+
+    if announcement
+        .public_endpoint
+        .as_deref()
+        .is_some_and(|endpoint| endpoint == runtime_endpoint)
+    {
+        return true;
+    }
+
+    if announcement.endpoint == runtime_endpoint {
+        return own_local_endpoints
+            .iter()
+            .any(|own| endpoints_share_local_only_ipv4_subnet(runtime_endpoint, own));
+    }
+
+    announcement
+        .local_endpoint
+        .as_deref()
+        .is_some_and(|local_endpoint| {
+            local_endpoint == runtime_endpoint
+                && own_local_endpoints
+                    .iter()
+                    .any(|own| endpoints_share_local_only_ipv4_subnet(local_endpoint, own))
+        })
+}
+
+fn runtime_peer_endpoints_require_refresh(
+    planned_peers: &[PlannedTunnelPeer],
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    own_local_endpoints: &[String],
+) -> bool {
+    let Some(runtime_peers) = runtime_peers else {
+        return false;
+    };
+
+    planned_peers.iter().any(|planned| {
+        let Some(announcement) = peer_announcements.get(&planned.participant) else {
+            return false;
+        };
+        runtime_peers
+            .get(&planned.peer.pubkey_hex)
+            .filter(|runtime| runtime.has_handshake())
+            .and_then(|runtime| runtime.endpoint.as_deref())
+            .is_some_and(|runtime_endpoint| {
+                runtime_endpoint_requires_refresh(
+                    runtime_endpoint,
+                    &planned.endpoint,
+                    announcement,
+                    own_local_endpoints,
+                )
+            })
+    })
 }
 
 fn peer_runtime_lookup<'a>(
@@ -3878,6 +4469,41 @@ fn persist_inbound_join_request(
     }
 }
 
+fn persist_shared_network_roster(
+    app: &mut AppConfig,
+    config_path: &Path,
+    sender_pubkey: &str,
+    network_id: &str,
+    roster: &NetworkRoster,
+    session_status: &mut String,
+) -> Result<Option<String>> {
+    let changed = app.apply_admin_signed_shared_roster(
+        network_id,
+        &roster.network_name,
+        roster.participants.clone(),
+        roster.admins.clone(),
+        roster.signed_at,
+        sender_pubkey,
+    )?;
+    if !changed {
+        return Ok(None);
+    }
+
+    maybe_autoconfigure_node(app);
+    app.save(config_path)?;
+    let network_name = app
+        .networks
+        .iter()
+        .find(|network| {
+            normalize_runtime_network_id(&network.network_id)
+                == normalize_runtime_network_id(network_id)
+        })
+        .map(|network| network.name.clone())
+        .unwrap_or_else(|| network_id.to_string());
+    *session_status = format!("Roster updated for {network_name}.");
+    Ok(Some(network_name))
+}
+
 fn mesh_ready_for_tunnel_runtime(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -4040,6 +4666,7 @@ fn write_daemon_peer_cache_if_changed(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_private_announce_to_participants(
     client: &NostrSignalingClient,
     app: &AppConfig,
@@ -4081,14 +4708,12 @@ async fn publish_private_announce_to_participants(
         let relay_session = relay_sessions.get(&participant);
         let relay_fields = relay_session
             .filter(|session| relay_session_is_active(session, unix_timestamp()))
-            .map(|session| {
-                (
-                    Some(session.advertised_ingress_endpoint.clone()),
-                    Some(session.relay_pubkey.clone()),
-                    Some(session.expires_at),
-                )
+            .map(|session| RelayAnnouncementDetails {
+                relay_endpoint: Some(session.advertised_ingress_endpoint.clone()),
+                relay_pubkey: Some(session.relay_pubkey.clone()),
+                relay_expires_at: Some(session.expires_at),
             })
-            .unwrap_or((None, None, None));
+            .unwrap_or_default();
         let announcement = build_explicit_peer_announcement_with_relay(
             app.node.id.clone(),
             app.node.public_key.clone(),
@@ -4096,9 +4721,7 @@ async fn publish_private_announce_to_participants(
             local_endpoint,
             app.node.tunnel_ip.clone(),
             app.effective_advertised_routes(),
-            relay_fields.0,
-            relay_fields.1,
-            relay_fields.2,
+            relay_fields,
         );
         let fingerprint = announcement_fingerprint(&announcement);
         if !outbound_announces.needs_send(&participant, &fingerprint) {
@@ -4119,6 +4742,7 @@ async fn publish_private_announce_to_participants(
     Ok(sent)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_private_announce_to_active_peers(
     client: &NostrSignalingClient,
     app: &AppConfig,
@@ -4328,6 +4952,12 @@ fn endpoints_share_local_only_ipv4_subnet(left: &str, right: &str) -> bool {
     ipv4_is_local_only(left_ip)
         && ipv4_is_local_only(right_ip)
         && left_ip.octets()[0..3] == right_ip.octets()[0..3]
+}
+
+fn endpoint_can_advertise_public_override(endpoint: &str, local_endpoint: &str) -> bool {
+    endpoint != local_endpoint
+        && (!endpoint_is_local_only(endpoint)
+            || !endpoints_share_local_only_ipv4_subnet(endpoint, local_endpoint))
 }
 
 fn peer_endpoint_requires_public_signal(
@@ -4678,6 +5308,7 @@ fn persisted_path_cache_timeout_secs(announce_interval_secs: u64) -> u64 {
         .max(MIN_PERSISTED_PATH_CACHE_TIMEOUT_SECS)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_presence_runtime_update(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -4782,6 +5413,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
         signaling_networks_for_app(&app),
     )?;
     client.connect(&relays).await?;
+    if let Err(error) = publish_active_network_roster(&client, &app, None).await {
+        eprintln!("signal: initial roster publish failed: {error}");
+    }
     let mut relay_connected = true;
 
     apply_presence_runtime_update(
@@ -4851,7 +5485,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     app.auto_disconnect_relays_when_mesh_ready,
                     relay_connected,
                     mesh_ready,
-                    app.join_requests_enabled(),
+                    false,
                 ) {
                     RelayConnectionAction::StayPausedForMesh => {
                         reconnect_attempt = 0;
@@ -4883,6 +5517,10 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                         relay_connected = true;
                         reconnect_attempt = 0;
                         outbound_announces.clear();
+                        if let Err(error) = publish_active_network_roster(&client, &app, None).await
+                        {
+                            eprintln!("signal: roster publish failed after reconnect: {error}");
+                        }
                         if let Err(error) = publish_private_announce_to_active_peers(
                             &client,
                             &app,
@@ -4936,6 +5574,18 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 {
                     eprintln!("nat: cached peer hole-punch failed: {error}");
                 }
+                if let Err(error) = apply_presence_runtime_update(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &presence,
+                    &relay_sessions,
+                    &mut path_book,
+                    unix_timestamp(),
+                    &mut tunnel_runtime,
+                    magic_dns_runtime.as_ref(),
+                ) {
+                    eprintln!("connect: tunnel heartbeat refresh failed: {error}");
+                }
                 if let Err(error) = heartbeat_pending_tunnel_peers(
                     &app,
                     own_pubkey.as_deref(),
@@ -4943,6 +5593,32 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed: {error}");
+                }
+                let mesh_ready = should_pause_relays_for_mesh(
+                    &app,
+                    own_pubkey.as_deref(),
+                    expected_peers,
+                    &presence,
+                    &tunnel_runtime,
+                    unix_timestamp(),
+                );
+                if matches!(
+                    relay_connection_action(
+                        app.auto_disconnect_relays_when_mesh_ready,
+                        relay_connected,
+                        mesh_ready,
+                        false,
+                    ),
+                    RelayConnectionAction::PauseForMesh
+                ) {
+                    client.disconnect().await;
+                    relay_connected = false;
+                    reconnect_attempt = 0;
+                    reconnect_due = Instant::now();
+                    if !relays_paused_for_mesh {
+                        println!("connect: {MESH_READY_RELAYS_PAUSED_STATUS}");
+                        relays_paused_for_mesh = true;
+                    }
                 }
             }
             _ = network_interval.tick() => {
@@ -5125,7 +5801,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     app.auto_disconnect_relays_when_mesh_ready,
                     relay_connected,
                     mesh_ready,
-                    app.join_requests_enabled(),
+                    false,
                 ) {
                     RelayConnectionAction::PauseForMesh => {
                         client.disconnect().await;
@@ -5215,6 +5891,16 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     outbound_announces.forget(&sender_pubkey);
                 }
                 if !changed {
+                    if matches!(&payload, SignalPayload::Hello | SignalPayload::Announce(_))
+                        && let Err(error) = publish_active_network_roster(
+                            &client,
+                            &app,
+                            Some(std::slice::from_ref(&sender_pubkey)),
+                        )
+                        .await
+                    {
+                        eprintln!("signal: targeted roster publish failed: {error}");
+                    }
                     maybe_reset_targeted_announce_cache_for_hello(
                         &mut outbound_announces,
                         &sender_pubkey,
@@ -5267,6 +5953,16 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
+                }
+                if matches!(&payload, SignalPayload::Hello | SignalPayload::Announce(_))
+                    && let Err(error) = publish_active_network_roster(
+                        &client,
+                        &app,
+                        Some(std::slice::from_ref(&sender_pubkey)),
+                    )
+                    .await
+                {
+                    eprintln!("signal: targeted roster publish failed: {error}");
                 }
                 if matches!(&payload, SignalPayload::Hello | SignalPayload::Announce(_))
                     && let Err(error) = publish_private_announce_to_participants(
@@ -5336,6 +6032,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut relay_sessions: HashMap<String, ActiveRelaySession> = HashMap::new();
     let mut standby_relay_sessions: HashMap<String, Vec<ActiveRelaySession>> = HashMap::new();
     let mut relay_failures: RelayFailureCooldowns = HashMap::new();
+    let mut relay_provider_verifications: RelayProviderVerificationBook = HashMap::new();
     let mut pending_relay_requests: HashMap<String, PendingRelayRequest> = HashMap::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
@@ -5580,6 +6277,10 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                 false
                             }
                         };
+                        if let Err(error) = publish_active_network_roster(&client, &app, None).await
+                        {
+                            eprintln!("daemon: roster publish failed after reconnect: {error}");
+                        }
                         session_status = if session_active {
                             "Connected".to_string()
                         } else {
@@ -5638,7 +6339,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 let relay_sessions_changed =
                     prune_active_relay_sessions(&mut relay_sessions, now)
                     | prune_standby_relay_sessions(&mut standby_relay_sessions, now)
-                    | prune_relay_failure_cooldowns(&mut relay_failures, now);
+                    | prune_relay_failure_cooldowns(&mut relay_failures, now)
+                    | prune_relay_provider_verifications(&mut relay_provider_verifications, now);
                 if relay_sessions_changed {
                     outbound_announces.clear();
                     last_nat_punch_attempt = None;
@@ -5668,8 +6370,9 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     eprintln!("nat: periodic hole-punch failed: {error}");
                         }
                         let _ = prune_pending_relay_requests(&mut pending_relay_requests, now);
-                        if app.use_public_relay_fallback && relay_service_connected {
-                            if let Err(error) = maybe_request_public_relay_fallback(
+                        if app.use_public_relay_fallback
+                            && relay_service_connected
+                            && let Err(error) = maybe_request_public_relay_fallback(
                                 &service_client,
                                 &relays,
                                 &app,
@@ -5678,13 +6381,13 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                 &tunnel_runtime,
                                 &relay_sessions,
                                 &relay_failures,
+                                &mut relay_provider_verifications,
                                 &mut pending_relay_requests,
                                 now,
                             )
                             .await
-                            {
-                                eprintln!("relay: allocation request failed: {error}");
-                            }
+                        {
+                            eprintln!("relay: allocation request failed: {error}");
                         }
                         if let Err(error) = publish_private_announce_to_active_peers(
                             &client,
@@ -5736,6 +6439,18 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     )
                 {
                     eprintln!("nat: cached peer hole-punch failed: {error}");
+                }
+                if let Err(error) = apply_presence_runtime_update(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &presence,
+                    &relay_sessions,
+                    &mut path_book,
+                    unix_timestamp(),
+                    &mut tunnel_runtime,
+                    magic_dns_runtime.as_ref(),
+                ) {
+                    session_status = format!("Tunnel heartbeat refresh failed ({error})");
                 }
                 if let Err(error) = heartbeat_pending_tunnel_peers(
                     &app,
@@ -5886,6 +6601,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &mut relay_sessions,
                     &mut standby_relay_sessions,
                     &mut relay_failures,
+                    &mut relay_provider_verifications,
                     &mut pending_relay_requests,
                     now,
                 );
@@ -5949,6 +6665,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             relay_sessions.clear();
                             standby_relay_sessions.clear();
                             relay_failures.clear();
+                            relay_provider_verifications.clear();
                             pending_relay_requests.clear();
                             outbound_announces.clear();
                             last_nat_punch_attempt = None;
@@ -6102,6 +6819,18 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                                         relays_paused_for_mesh = false;
                                                         reconnect_attempt = 0;
                                                         reconnect_due = Instant::now();
+                                                        if let Err(error) =
+                                                            publish_active_network_roster(
+                                                                &client,
+                                                                &app,
+                                                                None,
+                                                            )
+                                                            .await
+                                                        {
+                                                            eprintln!(
+                                                                "daemon: roster publish failed after config reload: {error}"
+                                                            );
+                                                        }
                                                         session_status = if session_active {
                                                             "Config reloaded".to_string()
                                                         } else {
@@ -6429,6 +7158,133 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     continue;
                 }
 
+                if let SignalPayload::Roster(roster) = &payload {
+                    match persist_shared_network_roster(
+                        &mut app,
+                        &config_path,
+                        &sender_pubkey,
+                        &message.network_id,
+                        roster,
+                        &mut session_status,
+                    ) {
+                        Ok(Some(_)) => {
+                            let reload = build_daemon_reload_config(
+                                app.clone(),
+                                app.effective_network_id(),
+                                &args.relay,
+                            );
+                            let configured_set = reload
+                                .configured_participants
+                                .iter()
+                                .cloned()
+                                .collect::<HashSet<_>>();
+                            app = reload.app;
+                            network_id = reload.network_id;
+                            expected_peers = reload.expected_peers;
+                            own_pubkey = reload.own_pubkey;
+                            relays = reload.relays;
+
+                            presence.retain_participants(&configured_set);
+                            path_book.retain_participants(&configured_set);
+                            outbound_announces.retain_participants(&configured_set);
+                            outbound_announces.clear();
+                            last_nat_punch_attempt = None;
+                            client.disconnect().await;
+                            match NostrSignalingClient::from_secret_key_with_networks(
+                                &app.nostr.secret_key,
+                                signaling_networks_for_app(&app),
+                            ) {
+                                Ok(new_client) => {
+                                    client = new_client;
+                                    let join_requests_active = app.join_requests_enabled();
+                                    if relay_session_active(
+                                        session_enabled,
+                                        expected_peers,
+                                        join_requests_active,
+                                    ) {
+                                        match client.connect(&relays).await {
+                                            Ok(()) => {
+                                                relay_connected = true;
+                                                relays_paused_for_mesh = false;
+                                                reconnect_attempt = 0;
+                                                reconnect_due = Instant::now();
+                                                if let Err(error) = apply_presence_runtime_update(
+                                                    &app,
+                                                    own_pubkey.as_deref(),
+                                                    &presence,
+                                                    &relay_sessions,
+                                                    &mut path_book,
+                                                    unix_timestamp(),
+                                                    &mut tunnel_runtime,
+                                                    magic_dns_runtime.as_ref(),
+                                                ) {
+                                                    session_status = format!(
+                                                        "Roster applied, but tunnel reload failed ({error})"
+                                                    );
+                                                }
+                                                if let Err(error) =
+                                                    publish_active_network_roster(
+                                                        &client,
+                                                        &app,
+                                                        None,
+                                                    )
+                                                    .await
+                                                {
+                                                    eprintln!(
+                                                        "daemon: roster publish failed after roster apply: {error}"
+                                                    );
+                                                }
+                                                if daemon_session_active(session_enabled, expected_peers)
+                                                    && let Err(error) = client.publish(SignalPayload::Hello).await
+                                                {
+                                                    eprintln!(
+                                                        "daemon: hello publish failed after roster apply: {error}"
+                                                    );
+                                                }
+                                            }
+                                            Err(error) => {
+                                                relay_connected = false;
+                                                reconnect_attempt =
+                                                    reconnect_attempt.saturating_add(1);
+                                                let delay =
+                                                    daemon_reconnect_backoff_delay(reconnect_attempt);
+                                                reconnect_due = Instant::now() + delay;
+                                                session_status = format!(
+                                                    "Roster applied; relay reconnect failed (retry in {}s: {error})",
+                                                    delay.as_secs(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    relay_connected = false;
+                                    session_status =
+                                        format!("Roster applied, but signaling reload failed ({error})");
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "daemon: ignoring invalid shared roster from {sender_pubkey}: {error}"
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                if matches!(&payload, SignalPayload::Hello | SignalPayload::Announce(_))
+                    && let Err(error) = publish_active_network_roster(
+                        &client,
+                        &app,
+                        Some(std::slice::from_ref(&sender_pubkey)),
+                    )
+                    .await
+                {
+                    eprintln!("daemon: targeted roster publish failed: {error}");
+                }
+
                 if !session_active {
                     continue;
                 }
@@ -6590,7 +7446,21 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             RelayGrantAction::QueuedStandby(_) | RelayGrantAction::Ignored => {}
                         }
                     }
-                    ServicePayload::RelayAllocationRequest(_) => {}
+                    ServicePayload::RelayAllocationRejected(rejected) => {
+                        if let Some(participant) = accept_relay_allocation_rejection(
+                            rejected,
+                            &mut pending_relay_requests,
+                            &mut relay_failures,
+                            &mut relay_provider_verifications,
+                            now,
+                        ) {
+                            outbound_announces.forget(&participant);
+                        }
+                    }
+                    ServicePayload::RelayAllocationRequest(_)
+                    | ServicePayload::RelayProbeRequest(_)
+                    | ServicePayload::RelayProbeGranted(_)
+                    | ServicePayload::RelayProbeRejected(_) => {}
                 }
             }
         }
@@ -11100,10 +11970,10 @@ fn parse_wg_peer_status(response: &str) -> HashMap<String, WireGuardPeerStatus> 
             continue;
         }
 
-        if let Some(value) = line.strip_prefix("rx_bytes=") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                current.rx_bytes = parsed;
-            }
+        if let Some(value) = line.strip_prefix("rx_bytes=")
+            && let Ok(parsed) = value.trim().parse::<u64>()
+        {
+            current.rx_bytes = parsed;
         }
     }
 
@@ -11143,33 +12013,34 @@ mod tests {
         ActiveRelaySession, AppConfig, Cli, DaemonPeerCacheEntry, DaemonPeerCacheRestore,
         DaemonPeerCacheState, DaemonRuntimeState, DiscoveredPublicSignalEndpoint, InstallCliArgs,
         LinuxExitNodeIpFamily, OutboundAnnounceBook, PeerAnnouncement, PendingRelayRequest,
-        RelayAllocationGranted, RelayGrantAction, TunnelPeer, UninstallCliArgs,
-        WireGuardPeerStatus, announcement_fingerprint, apply_config_file,
-        apply_participants_override, build_daemon_reload_config, build_peer_announcement,
-        build_runtime_magic_dns_records, can_reuse_active_listen_port,
-        connected_peer_count_for_runtime, daemon_control_file_path, daemon_peer_cache_file_path,
-        daemon_peer_transport_state, daemon_pids_from_ps_output, daemon_reconnect_backoff_delay,
-        daemon_session_active, daemon_session_idle_status, daemon_staged_config_file_path,
-        default_cli_install_path, endpoint_with_listen_port, install_cli,
-        is_uapi_addr_in_use_error, key_b64_to_hex, kill_error_requires_control_fallback,
-        linux_default_route_device_from_output, linux_exit_node_default_route_families,
-        linux_exit_node_firewall_binary, linux_exit_node_forward_in_rule,
-        linux_exit_node_forward_out_rule, linux_exit_node_ipv4_masquerade_rule,
-        linux_exit_node_source_cidr, linux_ipv4_route_source, linux_route_get_spec_from_output,
-        linux_route_target_is_ipv4, linux_service_status_from_show_output,
-        load_config_with_overrides, local_interface_address_for_tunnel,
-        macos_service_disabled_from_print_disabled_output, nat_punch_targets,
-        nat_punch_targets_for_local_endpoint, nat_punch_targets_for_local_endpoints,
-        parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
-        peer_path_cache_timeout_secs, peer_runtime_lookup, peer_signal_timeout_secs,
-        pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
+        PlannedTunnelPeer, RelayAllocationGranted, RelayAllocationRejected, RelayGrantAction,
+        RelayProviderVerification, TunnelPeer, UninstallCliArgs, WireGuardPeerStatus,
+        announcement_fingerprint, apply_config_file, apply_participants_override,
+        build_daemon_reload_config, build_peer_announcement, build_runtime_magic_dns_records,
+        can_reuse_active_listen_port, connected_peer_count_for_runtime, daemon_control_file_path,
+        daemon_peer_cache_file_path, daemon_peer_transport_state, daemon_pids_from_ps_output,
+        daemon_reconnect_backoff_delay, daemon_session_active, daemon_session_idle_status,
+        daemon_staged_config_file_path, default_cli_install_path, endpoint_with_listen_port,
+        install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
+        kill_error_requires_control_fallback, linux_default_route_device_from_output,
+        linux_exit_node_default_route_families, linux_exit_node_firewall_binary,
+        linux_exit_node_forward_in_rule, linux_exit_node_forward_out_rule,
+        linux_exit_node_ipv4_masquerade_rule, linux_exit_node_source_cidr, linux_ipv4_route_source,
+        linux_route_get_spec_from_output, linux_route_target_is_ipv4,
+        linux_service_status_from_show_output, load_config_with_overrides,
+        local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
+        nat_punch_targets, nat_punch_targets_for_local_endpoint,
+        nat_punch_targets_for_local_endpoints, parse_exit_node_arg, parse_nonzero_pid,
+        peer_has_recent_handshake, peer_path_cache_timeout_secs, peer_runtime_lookup,
+        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
         persisted_peer_cache_timeout_secs, planned_tunnel_peers,
         planned_tunnel_peers_for_local_endpoints, public_endpoint_for_listen_port,
         public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
         read_daemon_peer_cache, read_daemon_state, record_successful_runtime_paths,
         relay_connection_action, request_daemon_reload, request_daemon_stop,
         restore_daemon_peer_cache, route_targets_for_tunnel_peers,
-        route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
+        route_targets_require_endpoint_bypass, runtime_endpoint_requires_refresh,
+        runtime_local_signal_endpoint, runtime_peer_endpoints_require_refresh, runtime_signal_ipv4,
         should_prune_stale_presence, stage_daemon_config_apply, take_daemon_control_request,
         uninstall_cli, update_daemon_config_from_staged_request, utun_interface_candidates,
         windows_service_bin_path, windows_service_disabled_from_qc_output,
@@ -11186,6 +12057,7 @@ mod tests {
     use nostr_vpn_core::crypto::generate_keypair;
     use nostr_vpn_core::paths::PeerPathBook;
     use nostr_vpn_core::presence::PeerPresenceBook;
+    use nostr_vpn_core::relay::RelayAllocationRejectReason;
     use nostr_vpn_core::signaling::SignalPayload;
 
     fn sample_peer_announcement(public_key: String) -> PeerAnnouncement {
@@ -11717,10 +12589,13 @@ errno=0\n";
                 enabled: false,
                 network_id: "mesh-home".to_string(),
                 participants: vec![alice.clone()],
+                admins: Vec::new(),
                 listen_for_join_requests: true,
                 invite_inviter: String::new(),
                 outbound_join_request: None,
                 inbound_join_requests: Vec::new(),
+                shared_roster_updated_at: 0,
+                shared_roster_signed_by: String::new(),
             },
             NetworkConfig {
                 id: "work".to_string(),
@@ -11728,10 +12603,13 @@ errno=0\n";
                 enabled: true,
                 network_id: "mesh-work".to_string(),
                 participants: vec![bob],
+                admins: Vec::new(),
                 listen_for_join_requests: true,
                 invite_inviter: String::new(),
                 outbound_join_request: None,
                 inbound_join_requests: Vec::new(),
+                shared_roster_updated_at: 0,
+                shared_roster_signed_by: String::new(),
             },
         ];
         config.ensure_defaults();
@@ -11770,10 +12648,13 @@ errno=0\n";
                 enabled: false,
                 network_id: "mesh-home".to_string(),
                 participants: vec!["11".repeat(32)],
+                admins: Vec::new(),
                 listen_for_join_requests: true,
                 invite_inviter: String::new(),
                 outbound_join_request: None,
                 inbound_join_requests: Vec::new(),
+                shared_roster_updated_at: 0,
+                shared_roster_signed_by: String::new(),
             },
             NetworkConfig {
                 id: "work".to_string(),
@@ -11781,10 +12662,13 @@ errno=0\n";
                 enabled: true,
                 network_id: "mesh-work".to_string(),
                 participants: vec!["22".repeat(32)],
+                admins: Vec::new(),
                 listen_for_join_requests: true,
                 invite_inviter: String::new(),
                 outbound_join_request: None,
                 inbound_join_requests: Vec::new(),
+                shared_roster_updated_at: 0,
+                shared_roster_signed_by: String::new(),
             },
         ];
         config.ensure_defaults();
@@ -12231,6 +13115,18 @@ errno=0\n";
     }
 
     #[test]
+    fn runtime_signal_ipv4_ignores_tunnel_address() {
+        assert_eq!(
+            runtime_signal_ipv4(Some(Ipv4Addr::new(10, 44, 110, 128)), "10.44.110.128/32"),
+            None
+        );
+        assert_eq!(
+            runtime_signal_ipv4(Some(Ipv4Addr::new(192, 168, 178, 80)), "10.44.110.128/32"),
+            Some(Ipv4Addr::new(192, 168, 178, 80))
+        );
+    }
+
+    #[test]
     fn public_endpoint_for_listen_port_requires_matching_discovery_port() {
         let endpoint = DiscoveredPublicSignalEndpoint {
             listen_port: 51820,
@@ -12592,6 +13488,7 @@ errno=0\n";
             &announcements,
             Some(&runtime_peers),
             &mut paths,
+            &["192.168.1.33:51820".to_string()],
             16,
         ));
 
@@ -12657,6 +13554,132 @@ errno=0\n";
     }
 
     #[test]
+    fn runtime_endpoint_refresh_requires_cross_subnet_local_drift() {
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: generate_keypair().public_key,
+            endpoint: "10.254.241.10:51820".to_string(),
+            local_endpoint: Some("198.19.241.3:51820".to_string()),
+            public_endpoint: Some("10.254.241.10:51820".to_string()),
+            relay_endpoint: None,
+            relay_pubkey: None,
+            relay_expires_at: None,
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            advertised_routes: vec!["0.0.0.0/0".to_string()],
+            timestamp: 10,
+        };
+
+        assert!(runtime_endpoint_requires_refresh(
+            "198.19.241.3:51820",
+            "10.254.241.10:51820",
+            &announcement,
+            &["198.19.242.3:51820".to_string()],
+        ));
+        assert!(!runtime_endpoint_requires_refresh(
+            "198.19.241.3:51820",
+            "10.254.241.10:51820",
+            &announcement,
+            &["198.19.241.4:51820".to_string()],
+        ));
+        assert!(runtime_endpoint_requires_refresh(
+            "198.19.242.1:6861",
+            "10.254.241.10:51820",
+            &announcement,
+            &["198.19.242.3:51820".to_string()],
+        ));
+        assert!(!runtime_endpoint_requires_refresh(
+            "203.0.113.20:51820",
+            "10.254.241.10:51820",
+            &announcement,
+            &["198.19.242.3:51820".to_string()],
+        ));
+    }
+
+    #[test]
+    fn record_successful_runtime_paths_ignores_cross_subnet_local_runtime_endpoint() {
+        let participant = "11".repeat(32);
+        let peer_keys = generate_keypair();
+        let announcements = HashMap::from([(
+            participant,
+            PeerAnnouncement {
+                node_id: "peer-a".to_string(),
+                public_key: peer_keys.public_key.clone(),
+                endpoint: "10.254.241.10:51820".to_string(),
+                local_endpoint: Some("198.19.241.3:51820".to_string()),
+                public_endpoint: Some("10.254.241.10:51820".to_string()),
+                relay_endpoint: None,
+                relay_pubkey: None,
+                relay_expires_at: None,
+                tunnel_ip: "10.44.0.2/32".to_string(),
+                advertised_routes: vec!["0.0.0.0/0".to_string()],
+                timestamp: 10,
+            },
+        )]);
+        let runtime_peers = HashMap::from([(
+            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
+            WireGuardPeerStatus {
+                endpoint: Some("198.19.241.3:51820".to_string()),
+                last_handshake_sec: Some(1),
+                last_handshake_nsec: Some(0),
+                ..WireGuardPeerStatus::default()
+            },
+        )]);
+        let mut paths = PeerPathBook::default();
+
+        assert!(!record_successful_runtime_paths(
+            &announcements,
+            Some(&runtime_peers),
+            &mut paths,
+            &["198.19.242.3:51820".to_string()],
+            12,
+        ));
+    }
+
+    #[test]
+    fn runtime_peer_endpoint_refresh_waits_for_handshake() {
+        let participant = "11".repeat(32);
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: generate_keypair().public_key,
+            endpoint: "10.254.241.10:51820".to_string(),
+            local_endpoint: Some("198.19.241.3:51820".to_string()),
+            public_endpoint: Some("10.254.241.10:51820".to_string()),
+            relay_endpoint: None,
+            relay_pubkey: None,
+            relay_expires_at: None,
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            advertised_routes: vec!["0.0.0.0/0".to_string()],
+            timestamp: 10,
+        };
+        let planned = vec![PlannedTunnelPeer {
+            participant: participant.clone(),
+            endpoint: "10.254.241.10:51820".to_string(),
+            peer: TunnelPeer {
+                pubkey_hex: key_b64_to_hex(&announcement.public_key).expect("peer pubkey hex"),
+                endpoint: "10.254.241.10:51820".to_string(),
+                allowed_ips: vec!["10.44.0.2/32".to_string()],
+            },
+        }];
+        let announcements = HashMap::from([(participant, announcement)]);
+        let runtime_peers = HashMap::from([(
+            planned[0].peer.pubkey_hex.clone(),
+            WireGuardPeerStatus {
+                endpoint: Some("198.19.241.3:51820".to_string()),
+                last_handshake_sec: None,
+                last_handshake_nsec: None,
+                ..WireGuardPeerStatus::default()
+            },
+        )]);
+
+        assert!(!runtime_peer_endpoints_require_refresh(
+            &planned,
+            &announcements,
+            Some(&runtime_peers),
+            &["198.19.242.3:51820".to_string()],
+        ));
+    }
+
+    #[test]
     fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expires() {
         let mut config = AppConfig::generated();
         let participant = "11".repeat(32);
@@ -12700,6 +13723,7 @@ errno=0\n";
             &original_announcements,
             Some(&runtime_peers),
             &mut paths,
+            &["10.0.0.33:51820".to_string()],
             12,
         ));
 
@@ -12955,6 +13979,28 @@ errno=0\n";
     }
 
     #[test]
+    fn explicit_announcement_preserves_reflected_private_endpoint_from_distinct_subnet() {
+        let announcement = super::build_explicit_peer_announcement(
+            "peer-a".to_string(),
+            generate_keypair().public_key,
+            "10.254.241.10:51820".to_string(),
+            "198.19.241.3:51820".to_string(),
+            "10.44.0.239/32".to_string(),
+            Vec::new(),
+        );
+
+        assert_eq!(announcement.endpoint, "10.254.241.10:51820");
+        assert_eq!(
+            announcement.local_endpoint.as_deref(),
+            Some("198.19.241.3:51820")
+        );
+        assert_eq!(
+            announcement.public_endpoint.as_deref(),
+            Some("10.254.241.10:51820")
+        );
+    }
+
+    #[test]
     fn explicit_announcement_can_attach_active_relay_endpoint() {
         let announcement = super::build_explicit_peer_announcement_with_relay(
             "peer-a".to_string(),
@@ -12963,9 +14009,11 @@ errno=0\n";
             "192.168.178.80:51820".to_string(),
             "10.44.0.239/32".to_string(),
             Vec::new(),
-            Some("198.51.100.30:40001".to_string()),
-            Some("relay-pubkey".to_string()),
-            Some(500),
+            super::RelayAnnouncementDetails {
+                relay_endpoint: Some("198.51.100.30:40001".to_string()),
+                relay_pubkey: Some("relay-pubkey".to_string()),
+                relay_expires_at: Some(500),
+            },
         );
 
         assert_eq!(
@@ -13175,6 +14223,7 @@ errno=0\n";
             &participant,
             Some(&own_pubkey),
             &HashMap::new(),
+            &HashMap::new(),
             100,
         );
 
@@ -13315,6 +14364,7 @@ errno=0\n";
             }],
         )]);
         let mut relay_failures = HashMap::new();
+        let mut relay_provider_verifications = HashMap::new();
         let mut pending_requests = HashMap::from([(
             "req-z".to_string(),
             PendingRelayRequest {
@@ -13330,6 +14380,7 @@ errno=0\n";
             &mut relay_sessions,
             &mut standby_relay_sessions,
             &mut relay_failures,
+            &mut relay_provider_verifications,
             &mut pending_requests,
             200 + super::RELAY_SESSION_VERIFY_TIMEOUT_SECS,
         );
@@ -13374,6 +14425,7 @@ errno=0\n";
             &participant,
             None,
             &relay_failures,
+            &HashMap::new(),
             400,
         );
 
@@ -13383,6 +14435,103 @@ errno=0\n";
                 "4444444444444444444444444444444444444444444444444444444444444444",
                 "5555555555555555555555555555555555555555555555555555555555555555",
             ]
+        );
+    }
+
+    #[test]
+    fn relay_candidates_prefer_recently_verified_providers() {
+        let participant = "11".repeat(32);
+        let relay_pubkeys = vec!["33".repeat(32), "44".repeat(32), "55".repeat(32)];
+        let relay_provider_verifications = HashMap::from([
+            (
+                "4444444444444444444444444444444444444444444444444444444444444444".to_string(),
+                RelayProviderVerification {
+                    verified_at: Some(250),
+                    failure_cooldown_until: None,
+                    last_failure_at: None,
+                    last_probe_attempt_at: Some(250),
+                    consecutive_failures: 0,
+                },
+            ),
+            (
+                "3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+                RelayProviderVerification {
+                    verified_at: Some(200),
+                    failure_cooldown_until: None,
+                    last_failure_at: None,
+                    last_probe_attempt_at: Some(200),
+                    consecutive_failures: 0,
+                },
+            ),
+        ]);
+
+        let selected = super::relay_candidates_for_participant(
+            &relay_pubkeys,
+            &participant,
+            None,
+            &HashMap::new(),
+            &relay_provider_verifications,
+            300,
+        );
+
+        assert_eq!(
+            selected,
+            vec![
+                "4444444444444444444444444444444444444444444444444444444444444444",
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                "5555555555555555555555555555555555555555555555555555555555555555",
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_rejection_marks_provider_and_participant_failed() {
+        let participant = "11".repeat(32);
+        let relay_pubkey = "33".repeat(32);
+        let now = 200;
+        let mut pending_requests = HashMap::from([(
+            "req-a".to_string(),
+            PendingRelayRequest {
+                participant: participant.clone(),
+                relay_pubkey: relay_pubkey.clone(),
+                requested_at: 100,
+            },
+        )]);
+        let mut relay_failures = HashMap::new();
+        let mut relay_provider_verifications = HashMap::new();
+
+        let changed = super::accept_relay_allocation_rejection(
+            RelayAllocationRejected {
+                request_id: "req-a".to_string(),
+                network_id: "mesh-1".to_string(),
+                relay_pubkey: relay_pubkey.clone(),
+                reason: RelayAllocationRejectReason::OverCapacity,
+                retry_after_secs: Some(90),
+            },
+            &mut pending_requests,
+            &mut relay_failures,
+            &mut relay_provider_verifications,
+            now,
+        );
+
+        assert_eq!(changed.as_deref(), Some(participant.as_str()));
+        assert!(pending_requests.is_empty());
+        assert!(super::relay_is_in_failure_cooldown(
+            &relay_failures,
+            &participant,
+            &relay_pubkey,
+            now
+        ));
+        assert!(super::relay_provider_in_failure_cooldown(
+            &relay_provider_verifications,
+            &relay_pubkey,
+            now
+        ));
+        assert_eq!(
+            relay_provider_verifications
+                .get(&relay_pubkey)
+                .and_then(|verification| verification.failure_cooldown_until),
+            Some(now + 90)
         );
     }
 

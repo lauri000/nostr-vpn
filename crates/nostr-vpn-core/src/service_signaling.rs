@@ -6,7 +6,10 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 
-use crate::relay::{RelayAllocationGranted, RelayAllocationRequest};
+use crate::relay::{
+    RelayAllocationGranted, RelayAllocationRejected, RelayAllocationRequest, RelayProbeGranted,
+    RelayProbeRejected, RelayProbeRequest,
+};
 use crate::signaling::NOSTR_KIND_NOSTR_VPN;
 
 const SIGNAL_EXPIRATION_SECS: u64 = 300;
@@ -17,6 +20,10 @@ const SIGNAL_PRIVATE_LOOKBACK_SECS: u64 = 120;
 pub enum ServicePayload {
     RelayAllocationRequest(RelayAllocationRequest),
     RelayAllocationGranted(RelayAllocationGranted),
+    RelayAllocationRejected(RelayAllocationRejected),
+    RelayProbeRequest(RelayProbeRequest),
+    RelayProbeGranted(RelayProbeGranted),
+    RelayProbeRejected(RelayProbeRejected),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

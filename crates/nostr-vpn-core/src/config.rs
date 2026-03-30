@@ -127,6 +127,8 @@ pub struct NetworkConfig {
     pub network_id: String,
     #[serde(default)]
     pub participants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admins: Vec<String>,
     #[serde(
         default = "default_listen_for_join_requests",
         skip_serializing_if = "is_true"
@@ -138,6 +140,10 @@ pub struct NetworkConfig {
     pub outbound_join_request: Option<PendingOutboundJoinRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbound_join_requests: Vec<PendingInboundJoinRequest>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shared_roster_updated_at: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shared_roster_signed_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -166,6 +172,17 @@ pub struct EnabledNetworkMesh {
     pub participants: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedNetworkRoster {
+    pub id: String,
+    pub network_id: String,
+    pub name: String,
+    pub participants: Vec<String>,
+    pub admins: Vec<String>,
+    pub updated_at: u64,
+    pub signed_by: String,
+}
+
 const LEGACY_NETWORK_ID_COMPAT_PREFIX: &str = "nostr-vpn:";
 
 impl Default for AppConfig {
@@ -177,10 +194,13 @@ impl Default for AppConfig {
                 enabled: default_network_enabled(),
                 network_id: default_network_id(),
                 participants: Vec::new(),
+                admins: Vec::new(),
                 listen_for_join_requests: default_listen_for_join_requests(),
                 invite_inviter: String::new(),
                 outbound_join_request: None,
                 inbound_join_requests: Vec::new(),
+                shared_roster_updated_at: 0,
+                shared_roster_signed_by: String::new(),
             }],
             node_name: default_node_name(),
             use_public_relay_fallback: default_use_public_relay_fallback(),
@@ -352,10 +372,13 @@ impl AppConfig {
                 enabled: true,
                 network_id: default_network_id(),
                 participants: Vec::new(),
+                admins: Vec::new(),
                 listen_for_join_requests: default_listen_for_join_requests(),
                 invite_inviter: String::new(),
                 outbound_join_request: None,
                 inbound_join_requests: Vec::new(),
+                shared_roster_updated_at: 0,
+                shared_roster_signed_by: String::new(),
             });
         }
 
@@ -391,6 +414,11 @@ impl AppConfig {
                 .collect();
             network.participants.sort();
             network.participants.dedup();
+            network.admins = normalize_network_admins(
+                std::mem::take(&mut network.admins),
+                own_pubkey_hex.as_deref(),
+                &network.invite_inviter,
+            );
             network.outbound_join_request = normalize_outbound_join_request(
                 network.outbound_join_request.take(),
                 &network.participants,
@@ -399,6 +427,11 @@ impl AppConfig {
                 std::mem::take(&mut network.inbound_join_requests),
                 &network.participants,
             );
+            network.shared_roster_signed_by =
+                normalize_nostr_pubkey(&network.shared_roster_signed_by).unwrap_or_default();
+            if network.shared_roster_signed_by.is_empty() {
+                network.shared_roster_updated_at = 0;
+            }
         }
 
         self.ensure_single_active_network();
@@ -418,6 +451,13 @@ impl AppConfig {
                 .collect();
             network.participants.sort();
             network.participants.dedup();
+            network.admins = network
+                .admins
+                .iter()
+                .filter_map(|admin| canonical_npub_key(admin))
+                .collect();
+            network.admins.sort();
+            network.admins.dedup();
             network.invite_inviter =
                 canonical_npub_key(&network.invite_inviter).unwrap_or_default();
             network.outbound_join_request =
@@ -425,6 +465,11 @@ impl AppConfig {
             network.inbound_join_requests = canonicalize_inbound_join_requests(std::mem::take(
                 &mut network.inbound_join_requests,
             ));
+            network.shared_roster_signed_by =
+                canonical_npub_key(&network.shared_roster_signed_by).unwrap_or_default();
+            if network.shared_roster_signed_by.is_empty() {
+                network.shared_roster_updated_at = 0;
+            }
         }
 
         self.normalize_peer_aliases();
@@ -523,23 +568,30 @@ impl AppConfig {
             enabled: false,
             network_id: default_network_id(),
             participants: Vec::new(),
+            admins: Vec::new(),
             listen_for_join_requests: default_listen_for_join_requests(),
             invite_inviter: String::new(),
             outbound_join_request: None,
             inbound_join_requests: Vec::new(),
+            shared_roster_updated_at: 0,
+            shared_roster_signed_by: String::new(),
         });
+        let _ = self.note_network_roster_local_change(&id);
         id
     }
 
     pub fn rename_network(&mut self, network_id: &str, name: &str) -> Result<()> {
-        let network = self
-            .network_by_id_mut(network_id)
-            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
         let normalized = name.trim();
         if normalized.is_empty() {
             return Err(anyhow::anyhow!("network name cannot be empty"));
         }
-        network.name = normalized.to_string();
+        {
+            let network = self
+                .network_by_id_mut(network_id)
+                .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+            network.name = normalized.to_string();
+        }
+        self.note_network_roster_local_change(network_id)?;
         Ok(())
     }
 
@@ -694,19 +746,22 @@ impl AppConfig {
         participant: &str,
     ) -> Result<String> {
         let normalized = normalize_nostr_pubkey(participant)?;
-        let network = self
-            .network_by_id_mut(network_id)
-            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
-        if !network
-            .participants
-            .iter()
-            .any(|configured| configured == &normalized)
         {
-            network.participants.push(normalized.clone());
-            network.participants.sort();
-            network.participants.dedup();
+            let network = self
+                .network_by_id_mut(network_id)
+                .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+            if !network
+                .participants
+                .iter()
+                .any(|configured| configured == &normalized)
+            {
+                network.participants.push(normalized.clone());
+                network.participants.sort();
+                network.participants.dedup();
+            }
         }
 
+        self.note_network_roster_local_change(network_id)?;
         self.normalize_peer_aliases();
         Ok(normalized)
     }
@@ -717,15 +772,226 @@ impl AppConfig {
         participant: &str,
     ) -> Result<()> {
         let normalized = normalize_nostr_pubkey(participant)?;
-        let network = self
-            .network_by_id_mut(network_id)
-            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
-        network
-            .participants
-            .retain(|configured| configured != &normalized);
+        {
+            let network = self
+                .network_by_id_mut(network_id)
+                .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+            if network.admins.len() == 1 && network.admins.iter().any(|admin| admin == &normalized)
+            {
+                return Err(anyhow::anyhow!("cannot remove the last admin"));
+            }
+            network
+                .participants
+                .retain(|configured| configured != &normalized);
+            network
+                .admins
+                .retain(|configured| configured != &normalized);
+            if network.invite_inviter == normalized {
+                network.invite_inviter = network.admins.first().cloned().unwrap_or_default();
+            }
+        }
 
+        self.note_network_roster_local_change(network_id)?;
         self.normalize_peer_aliases();
         Ok(())
+    }
+
+    pub fn add_admin_to_network(&mut self, network_id: &str, admin: &str) -> Result<String> {
+        let normalized = normalize_nostr_pubkey(admin)?;
+        {
+            let network = self
+                .network_by_id_mut(network_id)
+                .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+            if !network
+                .admins
+                .iter()
+                .any(|configured| configured == &normalized)
+            {
+                network.admins.push(normalized.clone());
+                network.admins.sort();
+                network.admins.dedup();
+            }
+            if network.invite_inviter.is_empty() {
+                network.invite_inviter = normalized.clone();
+            }
+        }
+        self.note_network_roster_local_change(network_id)?;
+        Ok(normalized)
+    }
+
+    pub fn remove_admin_from_network(&mut self, network_id: &str, admin: &str) -> Result<()> {
+        let normalized = normalize_nostr_pubkey(admin)?;
+        {
+            let network = self
+                .network_by_id_mut(network_id)
+                .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+            if !network
+                .admins
+                .iter()
+                .any(|configured| configured == &normalized)
+            {
+                return Ok(());
+            }
+            if network.admins.len() <= 1 {
+                return Err(anyhow::anyhow!("cannot remove the last admin"));
+            }
+            network
+                .admins
+                .retain(|configured| configured != &normalized);
+            if network.invite_inviter == normalized {
+                network.invite_inviter = network.admins.first().cloned().unwrap_or_default();
+            }
+        }
+        self.note_network_roster_local_change(network_id)?;
+        Ok(())
+    }
+
+    pub fn network_admin_pubkeys_hex(&self, network_id: &str) -> Result<Vec<String>> {
+        let network = self
+            .network_by_id(network_id)
+            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+        let mut admins = network.admins.clone();
+        admins.sort();
+        admins.dedup();
+        Ok(admins)
+    }
+
+    pub fn network_signal_pubkeys_hex(&self, network_id: &str) -> Result<Vec<String>> {
+        let network = self
+            .network_by_id(network_id)
+            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+        let mut members = network.participants.clone();
+        members.extend(network.admins.iter().cloned());
+        members.sort();
+        members.dedup();
+        Ok(members)
+    }
+
+    pub fn active_network_admin_pubkeys_hex(&self) -> Vec<String> {
+        let mut admins = self.active_network().admins.clone();
+        admins.sort();
+        admins.dedup();
+        admins
+    }
+
+    pub fn active_network_signal_pubkeys_hex(&self) -> Vec<String> {
+        let mut members = self.active_network().participants.clone();
+        members.extend(self.active_network().admins.iter().cloned());
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    pub fn is_network_admin(&self, network_id: &str, pubkey: &str) -> bool {
+        let Ok(normalized) = normalize_nostr_pubkey(pubkey) else {
+            return false;
+        };
+        self.network_by_id(network_id)
+            .map(|network| network.admins.iter().any(|admin| admin == &normalized))
+            .unwrap_or(false)
+    }
+
+    pub fn shared_network_roster(&self, network_id: &str) -> Result<SharedNetworkRoster> {
+        let network = self
+            .network_by_id(network_id)
+            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+        let mut participants = network.participants.clone();
+        if let Ok(own_pubkey) = self.own_nostr_pubkey_hex() {
+            participants.push(own_pubkey);
+        }
+        participants.sort();
+        participants.dedup();
+
+        let mut admins = network.admins.clone();
+        admins.sort();
+        admins.dedup();
+
+        Ok(SharedNetworkRoster {
+            id: network.id.clone(),
+            network_id: normalize_runtime_network_id(&network.network_id),
+            name: network.name.clone(),
+            participants,
+            admins,
+            updated_at: network.shared_roster_updated_at,
+            signed_by: network.shared_roster_signed_by.clone(),
+        })
+    }
+
+    pub fn apply_admin_signed_shared_roster(
+        &mut self,
+        network_id: &str,
+        network_name: &str,
+        participants: Vec<String>,
+        admins: Vec<String>,
+        signed_at: u64,
+        signed_by: &str,
+    ) -> Result<bool> {
+        let normalized_network_id = normalize_runtime_network_id(network_id);
+        if normalized_network_id.is_empty() {
+            return Ok(false);
+        }
+
+        let normalized_signed_by = normalize_nostr_pubkey(signed_by)?;
+        let own_pubkey = self.own_nostr_pubkey_hex().ok();
+        let now = current_unix_timestamp();
+        if signed_at > now.saturating_add(MAX_SHARED_ROSTER_FUTURE_SECS) {
+            return Err(anyhow::anyhow!(
+                "shared roster timestamp is too far in the future"
+            ));
+        }
+
+        let Some(network) = self.networks.iter_mut().find(|network| {
+            normalize_runtime_network_id(&network.network_id) == normalized_network_id
+        }) else {
+            return Ok(false);
+        };
+
+        if !network
+            .admins
+            .iter()
+            .any(|admin| admin == &normalized_signed_by)
+        {
+            return Ok(false);
+        }
+
+        if signed_at <= network.shared_roster_updated_at {
+            return Ok(false);
+        }
+
+        let participants =
+            normalize_shared_roster_participants(participants, own_pubkey.as_deref())?;
+        let admins =
+            normalize_network_admins(admins, own_pubkey.as_deref(), &network.invite_inviter);
+        if admins.is_empty() {
+            return Err(anyhow::anyhow!(
+                "shared roster must include at least one admin"
+            ));
+        }
+
+        network.participants = participants;
+        network.admins = admins;
+        if !network_name.trim().is_empty() {
+            network.name = network_name.trim().to_string();
+        }
+        if !network
+            .admins
+            .iter()
+            .any(|admin| admin == &network.invite_inviter)
+        {
+            network.invite_inviter = normalized_signed_by.clone();
+        }
+        network.shared_roster_updated_at = signed_at;
+        network.shared_roster_signed_by = normalized_signed_by;
+        network.outbound_join_request = normalize_outbound_join_request(
+            network.outbound_join_request.take(),
+            &network.participants,
+        );
+        network.inbound_join_requests = normalize_inbound_join_requests(
+            std::mem::take(&mut network.inbound_join_requests),
+            &network.participants,
+        );
+        self.normalize_peer_aliases();
+        Ok(true)
     }
 
     pub fn mesh_members_pubkeys(&self) -> Vec<String> {
@@ -958,6 +1224,22 @@ impl AppConfig {
         }
 
         None
+    }
+
+    fn note_network_roster_local_change(&mut self, network_id: &str) -> Result<()> {
+        let own_pubkey = self.own_nostr_pubkey_hex().ok();
+        let network = self
+            .network_by_id_mut(network_id)
+            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+        let Some(own_pubkey) = own_pubkey else {
+            return Ok(());
+        };
+        if !network.admins.iter().any(|admin| admin == &own_pubkey) {
+            return Ok(());
+        }
+        network.shared_roster_updated_at = current_unix_timestamp();
+        network.shared_roster_signed_by = own_pubkey;
+        Ok(())
     }
 }
 
@@ -1584,6 +1866,59 @@ fn npub_for_pubkey_hex(pubkey_hex: &str) -> String {
         .ok()
         .and_then(|public_key| public_key.to_bech32().ok())
         .unwrap_or_else(|| pubkey_hex.to_string())
+}
+
+const MAX_SHARED_ROSTER_FUTURE_SECS: u64 = 600;
+
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn normalize_network_admins(
+    admins: Vec<String>,
+    own_pubkey_hex: Option<&str>,
+    invite_inviter: &str,
+) -> Vec<String> {
+    let mut normalized = admins
+        .into_iter()
+        .filter_map(|admin| normalize_nostr_pubkey(&admin).ok())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    if !normalized.is_empty() {
+        return normalized;
+    }
+
+    if let Ok(inviter) = normalize_nostr_pubkey(invite_inviter) {
+        return vec![inviter];
+    }
+
+    own_pubkey_hex
+        .map(|pubkey| vec![pubkey.to_string()])
+        .unwrap_or_default()
+}
+
+fn normalize_shared_roster_participants(
+    participants: Vec<String>,
+    own_pubkey_hex: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut normalized = participants
+        .into_iter()
+        .map(|participant| normalize_nostr_pubkey(&participant))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(own_pubkey_hex) = own_pubkey_hex {
+        normalized.retain(|participant| participant != own_pubkey_hex);
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 fn canonical_npub_key(value: &str) -> Option<String> {

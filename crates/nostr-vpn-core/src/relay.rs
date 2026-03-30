@@ -19,6 +19,50 @@ pub struct RelayAllocationGranted {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayProbeRequest {
+    pub request_id: String,
+    pub requested_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayProbeGranted {
+    pub request_id: String,
+    pub relay_pubkey: String,
+    pub requester_ingress_endpoint: String,
+    pub target_ingress_endpoint: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayAllocationRejectReason {
+    OverCapacity,
+    TooManySessionsForRequester,
+    ByteLimitExceeded,
+    RateLimited,
+    InvalidRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayAllocationRejected {
+    pub request_id: String,
+    pub network_id: String,
+    pub relay_pubkey: String,
+    pub reason: RelayAllocationRejectReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayProbeRejected {
+    pub request_id: String,
+    pub relay_pubkey: String,
+    pub reason: RelayAllocationRejectReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelaySession {
     pub request_id: String,
     pub network_id: String,

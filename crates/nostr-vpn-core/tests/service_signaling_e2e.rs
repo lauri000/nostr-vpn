@@ -5,7 +5,10 @@ use std::time::Duration;
 use nostr_sdk::prelude::{
     ClientBuilder, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp, nip44,
 };
-use nostr_vpn_core::relay::{RelayAllocationGranted, RelayAllocationRequest};
+use nostr_vpn_core::relay::{
+    RelayAllocationGranted, RelayAllocationRejectReason, RelayAllocationRequest, RelayProbeGranted,
+    RelayProbeRejected, RelayProbeRequest,
+};
 use nostr_vpn_core::service_signaling::{RelayServiceClient, ServiceEnvelope, ServicePayload};
 use nostr_vpn_core::signaling::NOSTR_KIND_NOSTR_VPN;
 use tokio::time::timeout;
@@ -92,6 +95,115 @@ async fn relay_service_messages_flow_between_unknown_pubkeys() {
             requester_ingress_endpoint: "198.51.100.10:45001".to_string(),
             target_ingress_endpoint: "198.51.100.10:45002".to_string(),
             expires_at: 500,
+        })
+    );
+
+    requester.disconnect().await;
+    operator.disconnect().await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_probe_messages_flow_between_unknown_pubkeys() {
+    let mut relay = WsRelay::new();
+    relay.start().await.expect("relay should start");
+    let relay_url = relay.url().expect("relay url");
+
+    let requester_keys = Keys::generate();
+    let operator_keys = Keys::generate();
+    let requester =
+        RelayServiceClient::from_secret_key(&requester_keys.secret_key().to_secret_hex())
+            .expect("requester client");
+    let operator = RelayServiceClient::from_secret_key(&operator_keys.secret_key().to_secret_hex())
+        .expect("operator client");
+
+    requester
+        .connect(std::slice::from_ref(&relay_url))
+        .await
+        .expect("requester connect");
+    operator
+        .connect(std::slice::from_ref(&relay_url))
+        .await
+        .expect("operator connect");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    requester
+        .publish_to(
+            ServicePayload::RelayProbeRequest(RelayProbeRequest {
+                request_id: "probe-1".to_string(),
+                requested_at: 42,
+            }),
+            operator.own_pubkey(),
+        )
+        .await
+        .expect("probe request publish");
+
+    let received = timeout(Duration::from_secs(5), operator.recv())
+        .await
+        .expect("timed out waiting for probe request")
+        .expect("probe request expected");
+    assert_eq!(
+        received.payload,
+        ServicePayload::RelayProbeRequest(RelayProbeRequest {
+            request_id: "probe-1".to_string(),
+            requested_at: 42,
+        })
+    );
+
+    operator
+        .publish_to(
+            ServicePayload::RelayProbeGranted(RelayProbeGranted {
+                request_id: "probe-1".to_string(),
+                relay_pubkey: operator.own_pubkey().to_string(),
+                requester_ingress_endpoint: "198.51.100.10:45001".to_string(),
+                target_ingress_endpoint: "198.51.100.10:45002".to_string(),
+                expires_at: 500,
+            }),
+            requester.own_pubkey(),
+        )
+        .await
+        .expect("probe grant publish");
+
+    let response = timeout(Duration::from_secs(5), requester.recv())
+        .await
+        .expect("timed out waiting for probe response")
+        .expect("probe response expected");
+    assert_eq!(
+        response.payload,
+        ServicePayload::RelayProbeGranted(RelayProbeGranted {
+            request_id: "probe-1".to_string(),
+            relay_pubkey: operator.own_pubkey().to_string(),
+            requester_ingress_endpoint: "198.51.100.10:45001".to_string(),
+            target_ingress_endpoint: "198.51.100.10:45002".to_string(),
+            expires_at: 500,
+        })
+    );
+
+    operator
+        .publish_to(
+            ServicePayload::RelayProbeRejected(RelayProbeRejected {
+                request_id: "probe-2".to_string(),
+                relay_pubkey: operator.own_pubkey().to_string(),
+                reason: RelayAllocationRejectReason::OverCapacity,
+                retry_after_secs: Some(60),
+            }),
+            requester.own_pubkey(),
+        )
+        .await
+        .expect("probe reject publish");
+
+    let rejected = timeout(Duration::from_secs(5), requester.recv())
+        .await
+        .expect("timed out waiting for probe rejection")
+        .expect("probe rejection expected");
+    assert_eq!(
+        rejected.payload,
+        ServicePayload::RelayProbeRejected(RelayProbeRejected {
+            request_id: "probe-2".to_string(),
+            relay_pubkey: operator.own_pubkey().to_string(),
+            reason: RelayAllocationRejectReason::OverCapacity,
+            retry_after_secs: Some(60),
         })
     );
 

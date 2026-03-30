@@ -23,6 +23,7 @@ const SIGNAL_HELLO_IDENTIFIER: &str = "hello";
 pub enum SignalPayload {
     Hello,
     Announce(PeerAnnouncement),
+    Roster(NetworkRoster),
     Disconnect {
         node_id: String,
     },
@@ -30,6 +31,17 @@ pub enum SignalPayload {
         requested_at: u64,
         request: MeshJoinRequest,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkRoster {
+    #[serde(default)]
+    pub network_name: String,
+    #[serde(default)]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub admins: Vec<String>,
+    pub signed_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

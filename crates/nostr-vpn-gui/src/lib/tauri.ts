@@ -28,6 +28,8 @@ type MockNetworkInvite = {
   networkName: string
   networkId: string
   inviterNpub: string
+  admins: string[]
+  participants: string[]
   relays: string[]
 }
 
@@ -82,10 +84,12 @@ const defaultMockLanPeers = (): LanPeerView[] => [
     networkName: 'Home',
     networkId: 'mesh-home',
     invite: encodeInvitePayload({
-      v: 1,
+      v: 2,
       networkName: 'Home',
       networkId: 'mesh-home',
       inviterNpub: 'npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m',
+      admins: ['npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m'],
+      participants: ['npub1x8teht3pj2zhq6e4l6s5zh2fcn0vzrp3d8zjls74g7zq5qemk3dq3wlp5m'],
       relays: ['wss://temp.iris.to', 'wss://relay.damus.io'],
     }),
     lastSeenText: '2s ago',
@@ -166,6 +170,8 @@ const mockState: UiState = {
       name: 'Network 1',
       enabled: true,
       networkId: 'mockmesh1234',
+      localIsAdmin: true,
+      adminNpubs: ['npub1akgu9lxldpt32lnjf97k005a4kgasewmvsrmkpzqeff39ssev0ssd6t3u'],
       ...emptyMockJoinRequestState(),
       onlineCount: 0,
       expectedCount: 0,
@@ -196,12 +202,31 @@ const buildMockActiveNetworkInvite = () => {
   }
 
   return encodeInvitePayload({
-    v: 1,
+    v: 2,
     networkName: activeNetwork.name,
     networkId: activeNetwork.networkId,
-    inviterNpub: mockState.ownNpub,
+    inviterNpub:
+      activeNetwork.inviteInviterNpub || activeNetwork.adminNpubs[0] || mockState.ownNpub,
+    admins: activeNetwork.adminNpubs,
+    participants: activeNetwork.participants.map((participant) => participant.npub),
     relays: mockState.relays.map((relay) => relay.url),
   })
+}
+
+const syncMockNetworkAdminState = (network: NetworkView): NetworkView => {
+  const adminSet = new Set(network.adminNpubs)
+  return {
+    ...network,
+    localIsAdmin: adminSet.has(mockState.ownNpub),
+    inviteInviterNpub:
+      network.inviteInviterNpub && adminSet.has(network.inviteInviterNpub)
+        ? network.inviteInviterNpub
+        : network.adminNpubs[0] || '',
+    participants: network.participants.map((participant) => ({
+      ...participant,
+      isAdmin: adminSet.has(participant.npub),
+    })),
+  }
 }
 
 const buildMockSelfMagicDnsName = () => {
@@ -450,6 +475,8 @@ export const addNetwork = (name: string) =>
           name: normalized,
           enabled: false,
           networkId: id.replace(/-/g, ''),
+          localIsAdmin: true,
+          adminNpubs: [mockState.ownNpub],
           ...emptyMockJoinRequestState(),
           onlineCount: 0,
           expectedCount: 0,
@@ -562,6 +589,7 @@ const upsertMockParticipant = (networkId: string, npub: string, alias = '') => {
   target.participants.push({
     npub,
     pubkeyHex,
+    isAdmin: target.adminNpubs.includes(npub),
     tunnelIp: '10.44.0.2/32',
     magicDnsAlias,
     magicDnsName: composeMagicDnsName(magicDnsAlias, mockState.magicDnsSuffix),
@@ -583,6 +611,23 @@ export const addParticipant = (networkId: string, npub: string, alias = '') =>
     ? invoke<UiState>('add_participant', { networkId, npub, alias: alias.trim() || null })
     : (() => {
         upsertMockParticipant(networkId, npub, alias)
+        return asResult()
+      })()
+
+export const addAdmin = (networkId: string, npub: string) =>
+  isTauriRuntime()
+    ? invoke<UiState>('add_admin', { networkId, npub })
+    : (() => {
+        upsertMockParticipant(networkId, npub)
+        mockState.networks = mockState.networks.map((network) =>
+          network.id === networkId
+            ? syncMockNetworkAdminState({
+                ...network,
+                adminNpubs: [...new Set([...network.adminNpubs, npub])],
+              })
+            : network,
+        )
+        mockState.sessionStatus = 'Admin saved'
         return asResult()
       })()
 
@@ -613,6 +658,8 @@ export const importNetworkInvite = (invite: string) =>
             name: parsed.networkName.trim() || `Network ${mockState.networks.length + 1}`,
             enabled: false,
             networkId: parsed.networkId.trim() || id.replace(/-/g, ''),
+            localIsAdmin: false,
+            adminNpubs: [],
             ...emptyMockJoinRequestState(),
             onlineCount: 0,
             expectedCount: 0,
@@ -634,9 +681,18 @@ export const importNetworkInvite = (invite: string) =>
         if (parsed.networkId.trim()) {
           targetNetwork.networkId = parsed.networkId.trim()
         }
+        targetNetwork.adminNpubs = [
+          ...new Set([...(targetNetwork.adminNpubs || []), ...parsed.admins]),
+        ]
         targetNetwork.inviteInviterNpub = parsed.inviterNpub
         activateMockNetwork(targetNetwork.id)
-        upsertMockParticipant(targetNetwork.id, parsed.inviterNpub)
+        for (const participant of parsed.participants) {
+          upsertMockParticipant(targetNetwork.id, participant)
+        }
+        targetNetwork = syncMockNetworkAdminState(targetNetwork)
+        mockState.networks = mockState.networks.map((network) =>
+          network.id === targetNetwork?.id ? targetNetwork : network,
+        )
         for (const relay of parsed.relays) {
           const normalizedRelay = relay.trim()
           if (
@@ -681,14 +737,35 @@ export const removeParticipant = (networkId: string, npub: string) =>
           if (network.id !== networkId) {
             return network
           }
-          return {
+          if (network.adminNpubs.includes(npub) && network.adminNpubs.length <= 1) {
+            return network
+          }
+          return syncMockNetworkAdminState({
             ...network,
+            adminNpubs: network.adminNpubs.filter((admin) => admin !== npub),
             participants: network.participants.filter(
               (participant) => participant.npub !== npub,
             ),
-          }
+          })
         })
 
+        return asResult()
+      })()
+
+export const removeAdmin = (networkId: string, npub: string) =>
+  isTauriRuntime()
+    ? invoke<UiState>('remove_admin', { networkId, npub })
+    : (() => {
+        mockState.networks = mockState.networks.map((network) => {
+          if (network.id !== networkId || network.adminNpubs.length <= 1) {
+            return network
+          }
+          return syncMockNetworkAdminState({
+            ...network,
+            adminNpubs: network.adminNpubs.filter((admin) => admin !== npub),
+          })
+        })
+        mockState.sessionStatus = 'Admin removed'
         return asResult()
       })()
 

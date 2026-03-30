@@ -38,6 +38,21 @@ services:
       e2e:
         ipv4_address: 10.203.0.11
 
+  node-c:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    entrypoint: ["sleep", "infinity"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - relay
+    networks:
+      e2e:
+        ipv4_address: 10.203.0.12
+
 networks:
   e2e:
     driver: bridge
