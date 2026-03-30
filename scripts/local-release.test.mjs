@@ -8,6 +8,7 @@ import {
   autoDetectWindowsVmName,
   buildReleaseManifest,
   describeAsset,
+  extractChangelogSection,
   parseEnvFile,
   readWorkspaceVersionTag,
   renderReleaseNotes,
@@ -103,7 +104,32 @@ test('buildReleaseManifest records staged assets with sizes', () => {
   assert.equal(manifest.assets[0].path, 'assets/nostr-vpn-v0.2.27-windows-x64-setup.exe')
 })
 
-test('renderReleaseNotes includes built and skipped sections', () => {
+test('extractChangelogSection returns the matching version body', () => {
+  const section = extractChangelogSection(`
+# Changelog
+
+## Unreleased
+
+## 0.3.0 - 2026-03-31
+
+Changes since v0.2.28.
+
+### Added
+
+- Admin-managed rosters.
+
+## 0.2.28 - 2026-03-26
+
+- Previous release.
+`, 'v0.3.0')
+
+  assert.equal(
+    section,
+    'Changes since v0.2.28.\n\n### Added\n\n- Admin-managed rosters.',
+  )
+})
+
+test('renderReleaseNotes includes changelog, built, and skipped sections', () => {
   const notes = renderReleaseNotes({
     tag: 'v0.2.27',
     commit: 'abc123',
@@ -111,11 +137,47 @@ test('renderReleaseNotes includes built and skipped sections', () => {
       'nostr-vpn-v0.2.27-macos-arm64.zip',
       'nvpn-v0.2.27-x86_64-pc-windows-msvc.zip',
     ],
+    changelogText: `
+# Changelog
+
+## 0.2.27 - 2026-03-25
+
+Changes since v0.2.26.
+
+### Fixed
+
+- Release note formatting.
+`,
     builtLines: ['Built Windows x64 CLI inside a local Parallels VM.'],
     skippedLines: ['Linux musl CLI skipped because cross was unavailable.'],
   })
 
+  assert.match(notes, /## Changes/)
+  assert.match(notes, /Changes since v0\.2\.26\./)
+  assert.match(notes, /### Fixed/)
   assert.match(notes, /Windows x64 CLI/)
   assert.match(notes, /Built Windows x64 CLI inside a local Parallels VM\./)
   assert.match(notes, /Linux musl CLI skipped because cross was unavailable\./)
+})
+
+test('renderReleaseNotes omits CLI skip boilerplate and can link assets', () => {
+  const notes = renderReleaseNotes({
+    tag: 'v0.3.0',
+    commit: 'abc123',
+    assetNames: ['nostr-vpn-v0.3.0-macos-arm64.zip'],
+    assetBaseUrl: 'https://github.com/mmalmi/nostr-vpn/releases/download/v0.3.0',
+    skippedLines: [
+      'verify skipped by CLI options.',
+      'windows skipped by CLI options.',
+      'Linux release artifacts are not built by this host script unless run on Linux.',
+    ],
+  })
+
+  assert.match(
+    notes,
+    /\[nostr-vpn-v0\.3\.0-macos-arm64\.zip\]\(https:\/\/github\.com\/mmalmi\/nostr-vpn\/releases\/download\/v0\.3\.0\/nostr-vpn-v0\.3\.0-macos-arm64\.zip\)/,
+  )
+  assert.doesNotMatch(notes, /verify skipped by CLI options/)
+  assert.doesNotMatch(notes, /windows skipped by CLI options/)
+  assert.match(notes, /Linux release artifacts are not built by this host script unless run on Linux\./)
 })

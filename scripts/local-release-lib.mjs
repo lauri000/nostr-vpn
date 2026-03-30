@@ -64,6 +64,26 @@ export function normalizeTag(value) {
   return value.startsWith('v') ? value : `v${value}`
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+export function extractChangelogSection(changelogText, tag) {
+  const version = normalizeTag(tag).replace(/^v/, '')
+  const headingPattern = new RegExp(`^##\\s+${escapeRegExp(version)}(?:\\s+-\\s+.*)?\\s*$`, 'm')
+  const headingMatch = changelogText.match(headingPattern)
+  if (!headingMatch || headingMatch.index == null) {
+    return null
+  }
+
+  const sectionStart = headingMatch.index + headingMatch[0].length
+  const remainder = changelogText.slice(sectionStart).replace(/^\r?\n/, '')
+  const nextHeadingMatch = remainder.match(/^##\s+/m)
+  const section = nextHeadingMatch ? remainder.slice(0, nextHeadingMatch.index) : remainder
+  const trimmed = section.trim()
+  return trimmed || null
+}
+
 export function autoDetectWindowsVmName(prlctlListOutput) {
   const candidates = []
   for (const line of prlctlListOutput.split(/\r?\n/)) {
@@ -158,23 +178,42 @@ export function renderReleaseNotes({
   assetNames,
   builtLines = [],
   skippedLines = [],
+  changelogText = '',
+  assetBaseUrl = '',
 }) {
   const normalizedTag = normalizeTag(tag)
-  const lines = ['## Downloads', '']
+  const lines = []
+  const changelogSection = extractChangelogSection(changelogText, normalizedTag)
+  const visibleSkippedLines = skippedLines.filter((line) => !line.endsWith('skipped by CLI options.'))
 
-  for (const name of [...assetNames].sort((left, right) => left.localeCompare(right))) {
-    lines.push(`- ${describeAsset(name)}: \`${name}\``)
+  if (changelogSection) {
+    lines.push('## Changes', '', ...changelogSection.split('\n'), '')
   }
 
-  lines.push('', '## Built Here', '', `- Built from commit \`${commit}\` for release \`${normalizedTag}\`.`)
+  lines.push('## Downloads', '')
+
+  for (const name of [...assetNames].sort((left, right) => left.localeCompare(right))) {
+    if (assetBaseUrl) {
+      lines.push(`- ${describeAsset(name)}: [${name}](${assetBaseUrl}/${name})`)
+    } else {
+      lines.push(`- ${describeAsset(name)}: \`${name}\``)
+    }
+  }
+
+  if (commit || builtLines.length > 0) {
+    lines.push('', '## Release Build', '')
+    if (commit) {
+      lines.push(`- Built from commit \`${commit}\` for release \`${normalizedTag}\`.`)
+    }
+  }
 
   for (const line of builtLines) {
     lines.push(`- ${line}`)
   }
 
-  if (skippedLines.length > 0) {
+  if (visibleSkippedLines.length > 0) {
     lines.push('', '## Skipped or Not Built', '')
-    for (const line of skippedLines) {
+    for (const line of visibleSkippedLines) {
       lines.push(`- ${line}`)
     }
   }

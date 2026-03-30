@@ -30,6 +30,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..')
 const guiRoot = join(repoRoot, 'crates', 'nostr-vpn-gui')
 const rootCargoToml = join(repoRoot, 'Cargo.toml')
+const changelogPath = join(repoRoot, 'CHANGELOG.md')
 const distDir = join(repoRoot, 'dist')
 const defaultEnvFiles = [
   join(repoRoot, '.env.release.local'),
@@ -687,6 +688,7 @@ function stageRelease({ tag, commit, stageDir, builtLines, skippedLines, dryRun 
       assetNames: stagedAssetPaths.map((assetPath) => basename(assetPath)),
       builtLines,
       skippedLines,
+      changelogText: existsSync(changelogPath) ? readFileSync(changelogPath, 'utf8') : '',
     }),
   )
 
@@ -708,6 +710,23 @@ function publishRelease({ stageDir, releaseTree, tag, dryRun }) {
   const cid = match[1]
   run('htree', ['release', 'publish', releaseTree, tag, cid], { dryRun })
   return cid
+}
+
+function resolveReleaseCommit(tag, { dryRun = false } = {}) {
+  const normalizedTag = normalizeTag(tag)
+  if (dryRun) {
+    return normalizedTag
+  }
+
+  const taggedCommit = run('git', ['rev-parse', '-q', '--verify', `${normalizedTag}^{commit}`], {
+    capture: true,
+    dryRun,
+  })
+  if (taggedCommit) {
+    return taggedCommit
+  }
+
+  return run('git', ['rev-parse', 'HEAD'], { capture: true, dryRun }) || 'HEAD'
 }
 
 function main() {
@@ -768,7 +787,7 @@ function main() {
     skippedLines.push('Linux release artifacts are not built by this host script unless run on Linux or extended with a working local cross toolchain.')
   }
 
-  const commit = run('git', ['rev-parse', 'HEAD'], { capture: true, dryRun: options.dryRun }) || 'HEAD'
+  const commit = resolveReleaseCommit(tag, { dryRun: options.dryRun })
   stageRelease({
     tag,
     commit,
