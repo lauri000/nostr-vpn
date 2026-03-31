@@ -66,6 +66,8 @@ pub(crate) struct PeerRuntimeStatus {
     pub participant_pubkey: String,
     pub endpoint: SocketAddr,
     pub last_handshake_age: Option<Duration>,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
 }
 
 pub(crate) struct UserspaceWireGuardRuntime {
@@ -249,11 +251,13 @@ impl UserspaceWireGuardRuntime {
         self.peers
             .iter()
             .map(|peer| {
-                let (handshake_age, _, _, _, _) = peer.tunnel.stats();
+                let (handshake_age, tx_bytes, rx_bytes, _, _) = peer.tunnel.stats();
                 PeerRuntimeStatus {
                     participant_pubkey: peer.participant_pubkey.clone(),
                     endpoint: peer.endpoint,
                     last_handshake_age: handshake_age,
+                    tx_bytes: tx_bytes as u64,
+                    rx_bytes: rx_bytes as u64,
                 }
             })
             .collect()
@@ -473,6 +477,11 @@ mod tests {
             delivered.iter().any(|packet| packet == &tunneled_packet),
             "expected the tunneled IPv4 packet to be delivered after the WireGuard handshake"
         );
+
+        let alice_statuses = alice_runtime.peer_statuses();
+        let bob_statuses = bob_runtime.peer_statuses();
+        assert!(alice_statuses[0].tx_bytes > 0, "alice should record transmitted data bytes");
+        assert!(bob_statuses[0].rx_bytes > 0, "bob should record received data bytes");
     }
 
     #[test]

@@ -234,6 +234,8 @@ impl WindowsTunnelBackend {
                     endpoint: Some(status.endpoint.to_string()),
                     last_handshake_sec: None,
                     last_handshake_nsec: None,
+                    tx_bytes: status.tx_bytes,
+                    rx_bytes: status.rx_bytes,
                 };
                 if let Some(handshake_age) = status.last_handshake_age {
                     peer.last_handshake_sec = Some(handshake_age.as_secs());
