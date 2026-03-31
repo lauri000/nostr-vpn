@@ -18,14 +18,14 @@ import {
 test('parseEnvFile reads basic dotenv syntax', () => {
   const parsed = parseEnvFile(`
 # comment
-NVPN_RELEASE_TREE=nostr-vpn-releases
+NVPN_RELEASE_TREE=releases/nostr-vpn
 NVPN_WINDOWS_VM_NAME="Windows 11"
 NVPN_NOTE='line one'
 INVALID KEY=nope
 `)
 
   assert.deepEqual(parsed, {
-    NVPN_RELEASE_TREE: 'nostr-vpn-releases',
+    NVPN_RELEASE_TREE: 'releases/nostr-vpn',
     NVPN_WINDOWS_VM_NAME: 'Windows 11',
     NVPN_NOTE: 'line one',
   })
