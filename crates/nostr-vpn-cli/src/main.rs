@@ -4367,9 +4367,7 @@ fn direct_peer_announcements(
     }
 }
 
-fn relay_connection_action(
-    relay_connected: bool,
-) -> RelayConnectionAction {
+fn relay_connection_action(relay_connected: bool) -> RelayConnectionAction {
     if relay_connected {
         RelayConnectionAction::KeepConnected
     } else {
