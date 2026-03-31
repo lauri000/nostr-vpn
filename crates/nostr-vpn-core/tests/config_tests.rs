@@ -33,7 +33,7 @@ fn default_relays_match_hashtree_defaults() {
         [
             "wss://temp.iris.to",
             "wss://relay.damus.io",
-            "wss://nos.lol",
+            "wss://relay.snort.social",
             "wss://relay.primal.net",
         ]
     );

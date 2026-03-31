@@ -15,7 +15,7 @@ use crate::crypto::generate_keypair;
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://temp.iris.to",
     "wss://relay.damus.io",
-    "wss://nos.lol",
+    "wss://relay.snort.social",
     "wss://relay.primal.net",
 ];
 const LEGACY_DEFAULT_NODE_NAME: &str = "nostr-vpn-node";

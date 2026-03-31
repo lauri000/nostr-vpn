@@ -181,7 +181,7 @@ const mockState: UiState = {
   relays: [
     { url: 'wss://temp.iris.to', state: 'unknown', statusText: 'not checked' },
     { url: 'wss://relay.damus.io', state: 'unknown', statusText: 'not checked' },
-    { url: 'wss://nos.lol', state: 'unknown', statusText: 'not checked' },
+    { url: 'wss://relay.snort.social', state: 'unknown', statusText: 'not checked' },
   ],
   relaySummary: { up: 0, down: 0, checking: 0, unknown: 3 },
   relayOperator: null,
