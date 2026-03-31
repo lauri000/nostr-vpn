@@ -214,6 +214,7 @@ jobs:
     outputs:
       macos_signed: ${{ steps.macos_release_status.outputs.signed }}
       macos_notarized: ${{ steps.macos_release_status.outputs.notarized }}
+      macos_artifact_published: ${{ steps.macos_release_status.outputs.artifact_published }}
     env:
       MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
       MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -281,22 +282,33 @@ jobs:
             fi
           done
 
-          if [ "${#missing_signing[@]}" -eq 0 ]; then
-            echo "signing_ready=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "signing_ready=false" >> "${GITHUB_OUTPUT}"
-            echo "::warning::macOS signing secrets missing: ${missing_signing[*]}. The release will continue with an unsigned app bundle."
+          signing_ready=true
+          notarization_ready=true
+
+          if [ "${#missing_signing[@]}" -ne 0 ]; then
+            signing_ready=false
           fi
 
-          if [ "${#missing_notarization[@]}" -eq 0 ]; then
-            echo "notarization_ready=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "notarization_ready=false" >> "${GITHUB_OUTPUT}"
-            echo "::warning::macOS notarization secrets missing: ${missing_notarization[*]}. The release will continue without notarization."
+          if [ "${#missing_notarization[@]}" -ne 0 ]; then
+            notarization_ready=false
+          fi
+
+          publish_ready=false
+          if [ "${signing_ready}" = "true" ] && [ "${notarization_ready}" = "true" ]; then
+            publish_ready=true
+          fi
+
+          echo "signing_ready=${signing_ready}" >> "${GITHUB_OUTPUT}"
+          echo "notarization_ready=${notarization_ready}" >> "${GITHUB_OUTPUT}"
+          echo "publish_ready=${publish_ready}" >> "${GITHUB_OUTPUT}"
+
+          if [ "${publish_ready}" != "true" ]; then
+            missing=("${missing_signing[@]}" "${missing_notarization[@]}")
+            echo "::warning::macOS signing/notarization secrets missing: ${missing[*]}. The GitHub release will continue without a macOS desktop artifact."
           fi
 
       - name: Install macOS signing certificate
-        if: ${{ steps.macos_capabilities.outputs.signing_ready == 'true' }}
+        if: ${{ steps.macos_capabilities.outputs.publish_ready == 'true' }}
         shell: bash
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/nvpn-signing.keychain-db"
@@ -321,10 +333,15 @@ jobs:
           fi
 
       - name: Build macOS app bundle
+        id: build_macos_app_bundle
+        if: ${{ steps.macos_capabilities.outputs.publish_ready == 'true' }}
+        continue-on-error: true
         run: pnpm --dir crates/nostr-vpn-gui exec tauri build --target aarch64-apple-darwin --bundles app --no-sign --ci
 
       - name: Code sign macOS app
-        if: ${{ steps.macos_capabilities.outputs.signing_ready == 'true' }}
+        id: code_sign_macos_app
+        if: ${{ steps.macos_capabilities.outputs.publish_ready == 'true' && steps.build_macos_app_bundle.outcome == 'success' }}
+        continue-on-error: true
         shell: bash
         run: |
           APP_PATH="$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
@@ -348,7 +365,7 @@ jobs:
 
       - name: Notarize macOS app
         id: notarize_macos_app
-        if: ${{ steps.macos_capabilities.outputs.signing_ready == 'true' && steps.macos_capabilities.outputs.notarization_ready == 'true' }}
+        if: ${{ steps.macos_capabilities.outputs.publish_ready == 'true' && steps.code_sign_macos_app.outcome == 'success' }}
         continue-on-error: true
         shell: bash
         run: |
@@ -392,12 +409,20 @@ jobs:
         if: ${{ always() }}
         shell: bash
         env:
+          PUBLISH_READY: ${{ steps.macos_capabilities.outputs.publish_ready }}
           SIGNING_READY: ${{ steps.macos_capabilities.outputs.signing_ready }}
           NOTARIZATION_READY: ${{ steps.macos_capabilities.outputs.notarization_ready }}
+          BUILD_OUTCOME: ${{ steps.build_macos_app_bundle.outcome }}
+          SIGN_OUTCOME: ${{ steps.code_sign_macos_app.outcome }}
           NOTARIZE_OUTCOME: ${{ steps.notarize_macos_app.outcome }}
         run: |
-          signed="${SIGNING_READY}"
+          signed=false
           notarized=false
+          artifact_published=false
+
+          if [ "${SIGN_OUTCOME}" = "success" ]; then
+            signed=true
+          fi
 
           if [ "${NOTARIZE_OUTCOME}" = "success" ]; then
             notarized=true
@@ -405,12 +430,23 @@ jobs:
 
           echo "signed=${signed}" >> "${GITHUB_OUTPUT}"
           echo "notarized=${notarized}" >> "${GITHUB_OUTPUT}"
+          if [ "${PUBLISH_READY}" = "true" ] && [ "${BUILD_OUTCOME}" = "success" ] && [ "${signed}" = "true" ] && [ "${notarized}" = "true" ]; then
+            artifact_published=true
+          fi
+          echo "artifact_published=${artifact_published}" >> "${GITHUB_OUTPUT}"
 
-          if [ "${signed}" = "true" ] && [ "${NOTARIZATION_READY}" = "true" ] && [ "${notarized}" != "true" ]; then
-            echo "::warning::macOS app is signed but not notarized. The GitHub release will continue with the signed artifact."
+          if [ "${PUBLISH_READY}" != "true" ]; then
+            echo "::warning::Skipping macOS desktop artifact because signing/notarization secrets are not fully configured."
+          elif [ "${BUILD_OUTCOME}" != "success" ]; then
+            echo "::warning::Skipping macOS desktop artifact because the macOS app bundle failed to build."
+          elif [ "${signed}" != "true" ]; then
+            echo "::warning::Skipping macOS desktop artifact because code signing failed."
+          elif [ "${notarized}" != "true" ]; then
+            echo "::warning::Skipping macOS desktop artifact because notarization failed."
           fi
 
       - name: Package macOS artifacts
+        if: ${{ steps.macos_release_status.outputs.artifact_published == 'true' }}
         shell: bash
         run: |
           RELEASE_VERSION="${{ github.event.inputs.tag || github.ref_name }}"
@@ -425,6 +461,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "dist/${MACOS_ZIP}"
 
       - name: Verify packaged macOS artifact
+        if: ${{ steps.macos_release_status.outputs.artifact_published == 'true' }}
         shell: bash
         env:
           MACOS_SIGNED: ${{ steps.macos_release_status.outputs.signed }}
@@ -457,6 +494,7 @@ jobs:
           fi
 
       - name: Upload macOS artifacts
+        if: ${{ steps.macos_release_status.outputs.artifact_published == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
@@ -843,26 +881,24 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
           MACOS_SIGNED: ${{ needs.build-macos-app.outputs.macos_signed }}
           MACOS_NOTARIZED: ${{ needs.build-macos-app.outputs.macos_notarized }}
+          MACOS_ARTIFACT_PUBLISHED: ${{ needs.build-macos-app.outputs.macos_artifact_published }}
         run: |
           {
             echo "## Downloads"
             echo
             echo "### Most people"
             echo
-            echo "- [Nostr VPN for macOS (Apple Silicon)](https://github.com/${RELEASE_REPOSITORY}/releases/download/${RELEASE_TAG}/nostr-vpn-${RELEASE_TAG}-macos-arm64.zip)"
+            if [ "${MACOS_ARTIFACT_PUBLISHED}" = "true" ]; then
+              echo "- [Nostr VPN for macOS (Apple Silicon)](https://github.com/${RELEASE_REPOSITORY}/releases/download/${RELEASE_TAG}/nostr-vpn-${RELEASE_TAG}-macos-arm64.zip)"
+            fi
             echo "- [Nostr VPN for Linux (AppImage)](https://github.com/${RELEASE_REPOSITORY}/releases/download/${RELEASE_TAG}/nostr-vpn-${RELEASE_TAG}-linux-x64.AppImage)"
             echo "- [Nostr VPN for Debian/Ubuntu (.deb)](https://github.com/${RELEASE_REPOSITORY}/releases/download/${RELEASE_TAG}/nostr-vpn-${RELEASE_TAG}-linux-x64.deb)"
             echo "- [Nostr VPN for Windows](https://github.com/${RELEASE_REPOSITORY}/releases/download/${RELEASE_TAG}/nostr-vpn-${RELEASE_TAG}-windows-x64-setup.exe)"
             echo "- [Nostr VPN for Android](https://github.com/${RELEASE_REPOSITORY}/releases/download/${RELEASE_TAG}/nostr-vpn-${RELEASE_TAG}-android-arm64.apk)"
             echo
-            if [ "${MACOS_NOTARIZED}" != "true" ]; then
-              if [ "${MACOS_SIGNED}" = "true" ]; then
-                echo "> Note: The macOS app in this GitHub release is signed but not notarized."
-                echo "> If Gatekeeper blocks it, right-click the app and choose Open."
-              else
-                echo "> Note: The macOS app in this GitHub release is unsigned."
-                echo "> If you only need the CLI, use the CLI tarball below."
-              fi
+            if [ "${MACOS_ARTIFACT_PUBLISHED}" != "true" ]; then
+              echo "> Note: The macOS desktop app is not included in this GitHub release because Apple signing/notarization did not complete."
+              echo "> If you only need macOS today, use the CLI tarball below or build from source."
               echo
             fi
             echo "Prebuilt Intel macOS release artifacts have been sunset. Intel Mac users should build from source or use an older release."

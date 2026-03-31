@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process'
 import {
   copyFileSync,
   existsSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -36,6 +37,16 @@ const defaultEnvFiles = [
   join(repoRoot, '.env.release.local'),
   join(repoRoot, '.env.zapstore.local'),
 ]
+const macosSigningRequiredEnv = [
+  'MACOS_SIGNING_IDENTITY',
+  'MACOS_CERTIFICATE_P12',
+  'MACOS_CERTIFICATE_PASSWORD',
+]
+const macosNotarizationRequiredEnv = [
+  'MACOS_NOTARIZE_APPLE_ID',
+  'MACOS_NOTARIZE_APP_PASSWORD',
+  'MACOS_NOTARIZE_TEAM_ID',
+]
 const versionlessCliAssets = new Map([
   ['nvpn-aarch64-apple-darwin.tar.gz', 'nvpn-v{tag}-aarch64-apple-darwin.tar.gz'],
   ['nvpn-x86_64-unknown-linux-musl.tar.gz', 'nvpn-v{tag}-x86_64-unknown-linux-musl.tar.gz'],
@@ -59,6 +70,7 @@ Options:
   --env-file <path>        Extra dotenv file to load (repeatable)
   --only <csv>             Limit steps to verify,macos,android,windows
   --skip <csv>             Skip steps by name
+  --allow-unsigned-macos   Build the macOS app without signing when local signing inputs are unavailable
   --help                   Show this help
 
 The script auto-loads .env.release.local and .env.zapstore.local when present.
@@ -76,6 +88,7 @@ function parseArgs(argv) {
     envFiles: [],
     only: null,
     skip: new Set(),
+    allowUnsignedMacos: false,
   }
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -114,6 +127,9 @@ function parseArgs(argv) {
           options.skip.add(value)
         }
         break
+      case '--allow-unsigned-macos':
+        options.allowUnsignedMacos = true
+        break
       default:
         throw new Error(`Unknown argument: ${arg}`)
     }
@@ -150,6 +166,26 @@ function commandExists(command) {
 function quote(arg) {
   const value = String(arg)
   return /[^\w./:-]/.test(value) ? JSON.stringify(value) : value
+}
+
+function envFlagEnabled(value) {
+  return /^(1|true|yes|on)$/i.test(String(value ?? '').trim())
+}
+
+function missingEnvVars(names, env) {
+  return names.filter((name) => !String(env[name] ?? '').trim())
+}
+
+function detectLocalMacosReleaseCapabilities(env) {
+  const missingSigning = missingEnvVars(macosSigningRequiredEnv, env)
+  const missingNotarization = missingEnvVars(macosNotarizationRequiredEnv, env)
+
+  return {
+    signingReady: missingSigning.length === 0,
+    notarizationReady: missingNotarization.length === 0,
+    missingSigning,
+    missingNotarization,
+  }
 }
 
 function run(command, args, { cwd = repoRoot, env = process.env, capture = false, dryRun = false } = {}) {
@@ -303,6 +339,161 @@ function findFirstFile(root, matcher) {
   const entries = readdirSync(root)
   const match = entries.find((entry) => matcher(entry))
   return match ? join(root, match) : null
+}
+
+function prepareLocalMacosSigning(env, { dryRun }) {
+  const tempRoot = dryRun ? join(os.tmpdir(), 'nvpn-local-signing-dry-run') : mkdtempSync(join(os.tmpdir(), 'nvpn-local-signing-'))
+  const keychainPath = join(tempRoot, 'nvpn-signing.keychain-db')
+  const certPath = join(tempRoot, 'nvpn-signing-cert.p12')
+  const keychainPassword = env.MACOS_KEYCHAIN_PASSWORD || 'temp_signing_password'
+
+  if (!dryRun) {
+    writeFileSync(certPath, Buffer.from(env.MACOS_CERTIFICATE_P12, 'base64'))
+  }
+
+  run('security', ['create-keychain', '-p', keychainPassword, keychainPath], { dryRun })
+  run('security', ['set-keychain-settings', '-lut', '21600', keychainPath], { dryRun })
+  run('security', ['unlock-keychain', '-p', keychainPassword, keychainPath], { dryRun })
+  run(
+    'security',
+    [
+      'import',
+      certPath,
+      '-k',
+      keychainPath,
+      '-P',
+      env.MACOS_CERTIFICATE_PASSWORD,
+      '-T',
+      '/usr/bin/codesign',
+      '-T',
+      '/usr/bin/security',
+    ],
+    { dryRun },
+  )
+  run(
+    'security',
+    ['set-key-partition-list', '-S', 'apple-tool:,apple:', '-k', keychainPassword, keychainPath],
+    { dryRun },
+  )
+
+  const identities = run('security', ['find-identity', '-v', '-p', 'codesigning', keychainPath], {
+    capture: true,
+    dryRun,
+  })
+  if (!dryRun && !identities.includes(env.MACOS_SIGNING_IDENTITY)) {
+    throw new Error(`Expected signing identity not found: ${env.MACOS_SIGNING_IDENTITY}`)
+  }
+
+  return {
+    keychainPath,
+    cleanup() {
+      if (dryRun) {
+        return
+      }
+      rmSync(certPath, { force: true })
+      run('security', ['delete-keychain', keychainPath], { dryRun })
+      rmSync(tempRoot, { recursive: true, force: true })
+    },
+  }
+}
+
+function signLocalMacosApp({ appPath, env, keychainPath, dryRun }) {
+  const entitlementsPath = join(guiRoot, 'src-tauri', 'Release.entitlements')
+  const args = ['--force', '--deep', '--options', 'runtime', '--timestamp', '--keychain', keychainPath]
+  if (existsSync(entitlementsPath)) {
+    args.push('--entitlements', entitlementsPath)
+  }
+  args.push('--sign', env.MACOS_SIGNING_IDENTITY, appPath)
+
+  run('codesign', args, { dryRun })
+  run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath], { dryRun })
+}
+
+function notarizeLocalMacosApp({ appPath, env, dryRun }) {
+  const tempRoot = dryRun ? join(os.tmpdir(), 'nvpn-local-notary-dry-run') : mkdtempSync(join(os.tmpdir(), 'nvpn-local-notary-'))
+  const notaryZipPath = join(tempRoot, 'nvpn-notarize.zip')
+
+  try {
+    run('ditto', ['-c', '-k', '--sequesterRsrc', '--keepParent', appPath, notaryZipPath], { dryRun })
+    const submitOutput = run(
+      'xcrun',
+      [
+        'notarytool',
+        'submit',
+        notaryZipPath,
+        '--apple-id',
+        env.MACOS_NOTARIZE_APPLE_ID,
+        '--password',
+        env.MACOS_NOTARIZE_APP_PASSWORD,
+        '--team-id',
+        env.MACOS_NOTARIZE_TEAM_ID,
+        '--wait',
+        '--output-format',
+        'json',
+      ],
+      { capture: true, dryRun },
+    )
+
+    if (!dryRun) {
+      const submission = JSON.parse(submitOutput)
+      if (submission.status !== 'Accepted') {
+        if (submission.id) {
+          try {
+            run(
+              'xcrun',
+              [
+                'notarytool',
+                'log',
+                submission.id,
+                '--apple-id',
+                env.MACOS_NOTARIZE_APPLE_ID,
+                '--password',
+                env.MACOS_NOTARIZE_APP_PASSWORD,
+                '--team-id',
+                env.MACOS_NOTARIZE_TEAM_ID,
+              ],
+              { dryRun },
+            )
+          } catch {}
+        }
+        throw new Error(`Notarization status was '${submission.status}' (expected 'Accepted').`)
+      }
+    }
+
+    run('xcrun', ['stapler', 'staple', appPath], { dryRun })
+    run('xcrun', ['stapler', 'validate', appPath], { dryRun })
+  } finally {
+    if (!dryRun) {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  }
+}
+
+function verifyPackagedMacosArtifact({ zipPath, signed, notarized, dryRun }) {
+  const verifyDir = dryRun ? join(os.tmpdir(), 'nvpn-local-verify-dry-run') : mkdtempSync(join(os.tmpdir(), 'nvpn-local-verify-'))
+
+  try {
+    run('ditto', ['-x', '-k', zipPath, verifyDir], { dryRun })
+    const appPath = findFirstFile(verifyDir, (entry) => entry.endsWith('.app'))
+    if (!dryRun && !appPath) {
+      throw new Error('Packaged zip did not contain a macOS .app bundle.')
+    }
+
+    if (signed) {
+      run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath || '<macos-app-bundle>'], {
+        dryRun,
+      })
+    }
+    if (notarized) {
+      run('spctl', ['--assess', '--type', 'execute', '--verbose=4', appPath || '<macos-app-bundle>'], {
+        dryRun,
+      })
+    }
+  } finally {
+    if (!dryRun) {
+      rmSync(verifyDir, { recursive: true, force: true })
+    }
+  }
 }
 
 function defaultSharedWindowsRepoPath() {
@@ -557,7 +748,7 @@ storeFile=${keystorePath}
   }
 }
 
-function buildMacosArtifacts({ pnpmInvocation, tag, dryRun, builtLines }) {
+function buildMacosArtifacts({ env, pnpmInvocation, tag, dryRun, builtLines, allowUnsignedMacos }) {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw new SkipStepError('Skipping macOS artifacts because the host is not Apple Silicon macOS.')
   }
@@ -571,6 +762,20 @@ function buildMacosArtifacts({ pnpmInvocation, tag, dryRun, builtLines }) {
     tag,
     dryRun,
   })
+  builtLines.push('Built Apple Silicon CLI locally.')
+
+  const macosZipPath = join(distDir, `nostr-vpn-${tag}-macos-arm64.zip`)
+  if (!dryRun) {
+    rmSync(macosZipPath, { force: true })
+  }
+
+  const capabilities = detectLocalMacosReleaseCapabilities(env)
+  if (!capabilities.signingReady && !allowUnsignedMacos) {
+    const missing = capabilities.missingSigning.join(', ')
+    throw new SkipStepError(
+      `Skipping macOS desktop app because signing inputs are missing (${missing}). Pass --allow-unsigned-macos or set NVPN_ALLOW_UNSIGNED_MACOS=1 to force an unsigned zip.`,
+    )
+  }
 
   runPnpm(
     pnpmInvocation,
@@ -587,13 +792,45 @@ function buildMacosArtifacts({ pnpmInvocation, tag, dryRun, builtLines }) {
   }
   const appPathForZip = appPath || '<macos-app-bundle>'
 
+  let signed = false
+  let notarized = false
+  let signingContext = null
+  try {
+    if (capabilities.signingReady) {
+      signingContext = prepareLocalMacosSigning(env, { dryRun })
+      signLocalMacosApp({
+        appPath: appPathForZip,
+        env,
+        keychainPath: signingContext.keychainPath,
+        dryRun,
+      })
+      signed = true
+
+      if (capabilities.notarizationReady) {
+        notarizeLocalMacosApp({ appPath: appPathForZip, env, dryRun })
+        notarized = true
+      }
+    }
+  } finally {
+    signingContext?.cleanup()
+  }
+
   run(
     'ditto',
-    ['-c', '-k', '--sequesterRsrc', '--keepParent', appPathForZip, join(distDir, `nostr-vpn-${tag}-macos-arm64.zip`)],
+    ['-c', '-k', '--sequesterRsrc', '--keepParent', appPathForZip, macosZipPath],
     { dryRun },
   )
 
-  builtLines.push('Built Apple Silicon macOS app and CLI locally.')
+  verifyPackagedMacosArtifact({ zipPath: macosZipPath, signed, notarized, dryRun })
+
+  if (notarized) {
+    builtLines.push('Built signed and notarized Apple Silicon macOS app locally.')
+  } else if (signed) {
+    const missing = capabilities.notarizationReady ? '' : ` Missing notarization inputs: ${capabilities.missingNotarization.join(', ')}.`
+    builtLines.push(`Built signed Apple Silicon macOS app locally without notarization.${missing}`)
+  } else {
+    builtLines.push('Built unsigned Apple Silicon macOS app locally because unsigned output was explicitly allowed.')
+  }
 }
 
 function runVerify({ pnpmInvocation, dryRun, builtLines }) {
@@ -741,6 +978,7 @@ function main() {
 
   const builtLines = []
   const skippedLines = []
+  const allowUnsignedMacos = options.allowUnsignedMacos || envFlagEnabled(env.NVPN_ALLOW_UNSIGNED_MACOS)
 
   console.log(`Release tag: ${tag}`)
   console.log(`Release tree: ${releaseTree}`)
@@ -755,7 +993,14 @@ function main() {
 
   const steps = [
     ['verify', () => runVerify({ pnpmInvocation, dryRun: options.dryRun, builtLines })],
-    ['macos', () => buildMacosArtifacts({ pnpmInvocation, tag, dryRun: options.dryRun, builtLines })],
+    ['macos', () => buildMacosArtifacts({
+      env,
+      pnpmInvocation,
+      tag,
+      dryRun: options.dryRun,
+      builtLines,
+      allowUnsignedMacos,
+    })],
     ['android', () => buildAndroidArtifacts({ env, pnpmInvocation, tag, dryRun: options.dryRun, builtLines })],
     ['windows', () => buildWindowsArtifacts({ env, tag, dryRun: options.dryRun, builtLines })],
   ]

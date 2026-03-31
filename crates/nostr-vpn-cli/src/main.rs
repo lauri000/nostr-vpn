@@ -151,7 +151,7 @@ const LISTENING_FOR_JOIN_REQUESTS_STATUS: &str = "Listening for join requests";
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_DAEMON_STATE_FRESHNESS_SECS: u64 = 5;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
 const LINUX_SERVICE_UNIT_NAME: &str = "nvpn.service";
@@ -10693,7 +10693,7 @@ fn systemd_quote(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
