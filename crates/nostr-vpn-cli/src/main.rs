@@ -8469,7 +8469,7 @@ fn wait_for_daemon_control_result(
     }
 
     Err(anyhow!(
-        "daemon did not report result for {} within {}s; restart the daemon with a newer nvpn binary",
+        "daemon did not report result for {} within {}s; background service may be busy or stuck. try again, or restart/reinstall the app/service if it keeps happening",
         request.as_str(),
         timeout.as_secs()
     ))
@@ -8547,7 +8547,7 @@ fn wait_for_daemon_control_ack(config_path: &Path, timeout: Duration) -> Result<
     }
 
     Err(anyhow!(
-        "daemon did not acknowledge control request within {}s; restart the daemon with a newer nvpn binary",
+        "daemon did not acknowledge control request within {}s; background service may be busy or stuck. try again, or restart/reinstall the app/service if it keeps happening",
         timeout.as_secs()
     ))
 }
@@ -8576,7 +8576,8 @@ fn wait_for_daemon_session_active(
 
     let verb = if expected_active { "resume" } else { "pause" };
     Err(anyhow!(
-        "daemon acknowledged control request but did not {verb}; likely an older nvpn daemon binary is still running. restart or reinstall the app/service so the daemon matches the current CLI"
+        "daemon acknowledged control request but did not {verb} within {}s; background service may be busy or stuck. try again, or restart/reinstall the app/service if it keeps happening",
+        timeout.as_secs()
     ))
 }
 
@@ -12073,6 +12074,8 @@ fn run_checked(command: &mut ProcessCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clap::CommandFactory;
     use nostr_sdk::prelude::ToBech32;
     use nostr_vpn_core::config::NetworkConfig;
@@ -15227,6 +15230,56 @@ errno=0\n";
         assert!(
             take_daemon_control_request(&config).is_none(),
             "without control file there should be no stop request"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_control_timeout_errors_use_generic_service_wording() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-control-timeout-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config = dir.join("config.toml");
+        fs::write(&config, "node_name = \"test\"").expect("write config");
+
+        let ack_error = super::wait_for_daemon_control_ack(&config, Duration::from_millis(0))
+            .expect_err("ack wait should time out");
+        assert!(
+            ack_error
+                .to_string()
+                .contains("background service may be busy or stuck")
+        );
+        assert!(!ack_error.to_string().contains("newer nvpn binary"));
+
+        let result_error = super::wait_for_daemon_control_result(
+            &config,
+            super::DaemonControlRequest::Reload,
+            Duration::from_millis(0),
+        )
+        .expect_err("result wait should time out");
+        assert!(
+            result_error
+                .to_string()
+                .contains("background service may be busy or stuck")
+        );
+        assert!(!result_error.to_string().contains("newer nvpn binary"));
+
+        let session_error =
+            super::wait_for_daemon_session_active(&config, true, Duration::from_millis(0))
+                .expect_err("session wait should time out");
+        assert!(
+            session_error
+                .to_string()
+                .contains("background service may be busy or stuck")
+        );
+        assert!(
+            !session_error
+                .to_string()
+                .contains("older nvpn daemon binary is still running")
         );
 
         let _ = fs::remove_dir_all(&dir);
