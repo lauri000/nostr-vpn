@@ -1718,6 +1718,9 @@
           <div class="panel-kicker">Status</div>
           <div class="row hero-title-row">
             <h1 data-testid="active-network-title">{activeNetworkView.name}</h1>
+            {#if activeNetworkView.localIsAdmin}
+              <span class="badge ok" data-testid="active-network-admin-badge">Admin</span>
+            {/if}
             <span class={`badge ${heroStateBadgeClass(state)}`}>
               {heroBadgeText(state)}
             </span>
@@ -2498,6 +2501,9 @@
                     <div class="row network-directory-title-row">
                       <div class="item-title">{network.name}</div>
                       <span class="badge muted">Saved</span>
+                      {#if network.localIsAdmin}
+                        <span class="badge ok" data-testid="saved-network-admin-badge">Admin</span>
+                      {/if}
                       {#if network.inboundJoinRequests.length > 0}
                         <span class="badge warn">
                           {network.inboundJoinRequests.length} request{network.inboundJoinRequests.length === 1 ? '' : 's'}
