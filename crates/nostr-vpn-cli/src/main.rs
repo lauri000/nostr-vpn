@@ -8629,11 +8629,32 @@ fn read_daemon_state(path: &Path) -> Result<Option<DaemonRuntimeState>> {
         return Ok(None);
     }
 
-    let raw = fs::read_to_string(path)
+    let raw = fs::read(path)
         .with_context(|| format!("failed to read daemon state file {}", path.display()))?;
-    let parsed = serde_json::from_str::<DaemonRuntimeState>(&raw)
-        .with_context(|| format!("failed to parse daemon state file {}", path.display()))?;
-    Ok(Some(parsed))
+    match serde_json::from_slice::<DaemonRuntimeState>(&raw) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(parse_error) => {
+            let trimmed = trim_runtime_json_padding(&raw);
+            if trimmed.len() != raw.len()
+                && !trimmed.is_empty()
+                && let Ok(parsed) = serde_json::from_slice::<DaemonRuntimeState>(trimmed)
+            {
+                if let Err(error) = write_runtime_file_atomically(path, trimmed) {
+                    eprintln!(
+                        "daemon: parsed padded state file {} but failed to rewrite clean copy: {}",
+                        path.display(),
+                        error
+                    );
+                } else {
+                    let _ = set_daemon_runtime_file_permissions(path);
+                }
+                return Ok(Some(parsed));
+            }
+
+            quarantine_corrupt_runtime_file(path, "daemon state", &parse_error);
+            Ok(None)
+        }
+    }
 }
 
 fn write_daemon_state(path: &Path, state: &DaemonRuntimeState) -> Result<()> {
@@ -8694,6 +8715,54 @@ fn write_runtime_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+fn trim_runtime_json_padding(raw: &[u8]) -> &[u8] {
+    let start = raw
+        .iter()
+        .position(|byte| *byte != 0 && !byte.is_ascii_whitespace())
+        .unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|byte| *byte != 0 && !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &raw[start..end]
+}
+
+fn quarantine_corrupt_runtime_file(path: &Path, label: &str, parse_error: &serde_json::Error) {
+    let Some(parent) = path.parent() else {
+        eprintln!(
+            "daemon: ignoring corrupt {label} file {}: {}",
+            path.display(),
+            parse_error
+        );
+        return;
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("runtime");
+    let quarantined = parent.join(format!(
+        "{file_name}.corrupt-{}-{}",
+        std::process::id(),
+        unix_timestamp()
+    ));
+
+    match fs::rename(path, &quarantined) {
+        Ok(()) => eprintln!(
+            "daemon: ignoring corrupt {label} file {}: {}; moved aside to {}",
+            path.display(),
+            parse_error,
+            quarantined.display()
+        ),
+        Err(rename_error) => eprintln!(
+            "daemon: ignoring corrupt {label} file {}: {}; failed to move aside: {}",
+            path.display(),
+            parse_error,
+            rename_error
+        ),
+    }
 }
 
 fn spawn_daemon_process(args: &ConnectArgs, config_path: &Path) -> Result<u32> {
@@ -9150,6 +9219,7 @@ fn executable_fingerprint(path: &Path) -> Result<ExecutableFingerprint> {
     })
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn current_executable_fingerprint() -> Result<(PathBuf, ExecutableFingerprint)> {
     let executable = std::env::current_exe().context("failed to resolve current executable")?;
     let executable = fs::canonicalize(&executable)
@@ -14693,6 +14763,72 @@ errno=0\n";
 }"#;
 
         assert!(serde_json::from_str::<DaemonRuntimeState>(raw).is_err());
+    }
+
+    #[test]
+    fn read_daemon_state_trims_nul_padding() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-daemon-state-trim-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let state_path = dir.join("daemon.state.json");
+        let mut raw = br#"{
+  "updated_at": 1,
+  "binary_version": "test",
+  "session_active": true,
+  "relay_connected": false,
+  "session_status": "Ready",
+  "expected_peer_count": 0,
+  "connected_peer_count": 0,
+  "mesh_ready": false
+}"#
+        .to_vec();
+        raw.extend_from_slice(&[0, 0, b'\n']);
+        fs::write(&state_path, raw).expect("write padded daemon state");
+
+        let state = read_daemon_state(&state_path)
+            .expect("read daemon state")
+            .expect("daemon state should exist");
+        assert_eq!(state.session_status, "Ready");
+
+        let rewritten = fs::read(&state_path).expect("read rewritten daemon state");
+        assert!(!rewritten.contains(&0));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_status_ignores_and_quarantines_corrupt_daemon_state() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-daemon-status-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.toml");
+        fs::write(&config_path, "").expect("write config placeholder");
+        let state_path = dir.join("daemon.state.json");
+        fs::write(&state_path, vec![0; 64]).expect("write corrupt daemon state");
+
+        let status = super::daemon_status(&config_path).expect("daemon status should succeed");
+        assert!(status.state.is_none());
+        assert!(!state_path.exists());
+
+        let quarantined: Vec<_> = fs::read_dir(&dir)
+            .expect("list temp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.starts_with("daemon.state.json.corrupt-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
