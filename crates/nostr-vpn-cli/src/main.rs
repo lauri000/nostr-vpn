@@ -6541,6 +6541,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
 
                 if let Some(request) = take_daemon_control_request(&config_path) {
+                    eprintln!("daemon: handling control request {}", request.as_str());
                     let control_result = match request {
                         DaemonControlRequest::Stop => break,
                         DaemonControlRequest::Pause => {
@@ -6840,7 +6841,6 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             }
                         }
                     };
-                    let _ = write_daemon_control_result(&config_path, request, control_result);
                     if let Err(error) = sync_local_relay_operator(
                         &config_path,
                         &app,
@@ -6851,7 +6851,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     ) {
                         eprintln!("relay operator: sync failed after control request: {error}");
                     }
-                    let _ = persist_daemon_runtime_state(
+                    let persist_result = persist_daemon_runtime_state(
                         &state_file,
                         &app,
                         session_enabled,
@@ -6863,7 +6863,19 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         &network_snapshot.summary(network_changed_at, captive_portal),
                         &port_mapping_runtime.status(),
                         &relay_operator_runtime,
-                    );
+                    )
+                    .map_err(|error| anyhow!("failed to persist daemon state after control request: {error}"));
+                    let control_result = control_result.and(persist_result);
+                    match &control_result {
+                        Ok(()) => eprintln!("daemon: control request {} completed", request.as_str()),
+                        Err(error) => {
+                            eprintln!(
+                                "daemon: control request {} failed: {error}",
+                                request.as_str()
+                            );
+                        }
+                    }
+                    let _ = write_daemon_control_result(&config_path, request, control_result);
                 }
                 if let Some((executable, launched_fingerprint)) =
                     supervised_service_executable.as_ref()
@@ -7788,10 +7800,20 @@ fn control_daemon(args: ControlArgs, request: DaemonControlRequest) -> Result<()
     wait_for_daemon_control_ack(&config_path, Duration::from_secs(3))?;
     match request {
         DaemonControlRequest::Pause => {
-            wait_for_daemon_session_active(&config_path, false, Duration::from_secs(2))?;
+            wait_for_daemon_control_completion(
+                &config_path,
+                request,
+                Some(false),
+                Duration::from_secs(6),
+            )?;
         }
         DaemonControlRequest::Resume => {
-            wait_for_daemon_session_active(&config_path, true, Duration::from_secs(2))?;
+            wait_for_daemon_control_completion(
+                &config_path,
+                request,
+                Some(true),
+                Duration::from_secs(6),
+            )?;
         }
         DaemonControlRequest::Reload | DaemonControlRequest::Stop => {}
     }
@@ -8293,6 +8315,7 @@ fn write_daemon_control_request(config_path: &Path, request: DaemonControlReques
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    clear_daemon_control_result(config_path);
     fs::write(&control_file, format!("{}\n", request.as_str())).with_context(|| {
         format!(
             "failed to write daemon control request {}",
@@ -8383,6 +8406,67 @@ fn wait_for_daemon_control_result(
     ))
 }
 
+fn daemon_status_matches_expected_session(status: &DaemonStatus, expected_active: bool) -> bool {
+    let current_state = status.state.as_ref();
+    let current_active = current_state
+        .map(|state| state.session_active)
+        .unwrap_or(status.running);
+    let resumed_waiting_for_participants = expected_active
+        && current_state
+            .is_some_and(|state| state.session_status == WAITING_FOR_PARTICIPANTS_STATUS);
+    current_active == expected_active || resumed_waiting_for_participants
+}
+
+fn wait_for_daemon_control_completion(
+    config_path: &Path,
+    request: DaemonControlRequest,
+    expected_active: Option<bool>,
+    timeout: Duration,
+) -> Result<()> {
+    let result_file = daemon_control_result_file_path(config_path);
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(result) = read_daemon_control_result(config_path)?
+            && result.request == request.as_str()
+        {
+            let _ = fs::remove_file(&result_file);
+            return if result.ok {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "{}",
+                    result
+                        .error
+                        .unwrap_or_else(|| "daemon control request failed".to_string())
+                ))
+            };
+        }
+
+        if let Some(expected_active) = expected_active
+            && let Ok(status) = daemon_status(config_path)
+            && daemon_status_matches_expected_session(&status, expected_active)
+        {
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(expected_active) = expected_active {
+        let verb = if expected_active { "resume" } else { "pause" };
+        Err(anyhow!(
+            "daemon acknowledged control request but did not {verb} within {}s; background service may be busy or stuck. try again, or restart/reinstall the app/service if it keeps happening",
+            timeout.as_secs()
+        ))
+    } else {
+        Err(anyhow!(
+            "daemon did not report result for {} within {}s; background service may be busy or stuck. try again, or restart/reinstall the app/service if it keeps happening",
+            request.as_str(),
+            timeout.as_secs()
+        ))
+    }
+}
+
 fn stage_daemon_config_apply(config_path: &Path, source_path: &Path) -> Result<()> {
     let staged_path = daemon_staged_config_file_path(config_path);
     if let Some(parent) = staged_path.parent() {
@@ -8467,17 +8551,10 @@ fn wait_for_daemon_session_active(
 ) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if let Ok(status) = daemon_status(config_path) {
-            let current_state = status.state.as_ref();
-            let current_active = current_state
-                .map(|state| state.session_active)
-                .unwrap_or(status.running);
-            let resumed_waiting_for_participants = expected_active
-                && current_state
-                    .is_some_and(|state| state.session_status == WAITING_FOR_PARTICIPANTS_STATUS);
-            if current_active == expected_active || resumed_waiting_for_participants {
-                return Ok(());
-            }
+        if let Ok(status) = daemon_status(config_path)
+            && daemon_status_matches_expected_session(&status, expected_active)
+        {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -11982,8 +12059,10 @@ fn run_checked(command: &mut ProcessCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
+    use anyhow::anyhow;
     use clap::CommandFactory;
     use nostr_sdk::prelude::ToBech32;
     use nostr_vpn_core::config::NetworkConfig;
@@ -15356,6 +15435,105 @@ errno=0\n";
                 .contains("older nvpn daemon binary is still running")
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_control_request_clears_stale_result_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-control-stale-result-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config = dir.join("config.toml");
+        fs::write(&config, "node_name = \"test\"").expect("write config");
+
+        super::write_daemon_control_result(&config, super::DaemonControlRequest::Pause, Ok(()))
+            .expect("write stale result");
+        super::write_daemon_control_request(&config, super::DaemonControlRequest::Pause)
+            .expect("write control request");
+
+        assert!(
+            super::read_daemon_control_result(&config)
+                .expect("read control result")
+                .is_none(),
+            "writing a new control request should discard any stale result"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_control_completion_accepts_daemon_result_before_state_refresh() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("nvpn-control-completion-success-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config = dir.join("config.toml");
+        fs::write(&config, "node_name = \"test\"").expect("write config");
+
+        let config_for_writer = config.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            super::write_daemon_control_result(
+                &config_for_writer,
+                super::DaemonControlRequest::Pause,
+                Ok(()),
+            )
+            .expect("write control result");
+        });
+
+        super::wait_for_daemon_control_completion(
+            &config,
+            super::DaemonControlRequest::Pause,
+            Some(false),
+            Duration::from_secs(1),
+        )
+        .expect("pause should succeed once daemon reports completion");
+
+        writer.join().expect("join result writer");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_control_completion_returns_daemon_error() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-control-completion-error-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config = dir.join("config.toml");
+        fs::write(&config, "node_name = \"test\"").expect("write config");
+
+        let config_for_writer = config.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            super::write_daemon_control_result(
+                &config_for_writer,
+                super::DaemonControlRequest::Resume,
+                Err(anyhow!("resume cleanup stalled")),
+            )
+            .expect("write control result");
+        });
+
+        let error = super::wait_for_daemon_control_completion(
+            &config,
+            super::DaemonControlRequest::Resume,
+            Some(true),
+            Duration::from_secs(1),
+        )
+        .expect_err("resume should surface daemon-side failure");
+        assert!(
+            error.to_string().contains("resume cleanup stalled"),
+            "unexpected error: {error}"
+        );
+
+        writer.join().expect("join result writer");
         let _ = fs::remove_dir_all(&dir);
     }
 

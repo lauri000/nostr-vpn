@@ -637,6 +637,11 @@ body {
   background: var(--surface-4);
 }
 
+.session-switch:disabled {
+  opacity: 0.75;
+  cursor: wait;
+}
+
 .session-switch:focus-visible {
   outline: 1px solid var(--focus-border);
   outline-offset: 2px;

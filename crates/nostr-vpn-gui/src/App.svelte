@@ -30,6 +30,7 @@
     validateMeshIdInput,
   } from './lib/mesh-id.js'
   import { nodeNameDnsPreview } from './lib/node-name.js'
+  import { sessionToggleVisualState } from './lib/session-toggle.js'
   import {
     addAdmin,
     addNetwork,
@@ -121,6 +122,8 @@
   let lanPairingTickHandle: number | null = null
   let copiedHandle: number | null = null
   let deepLinkUnlisten: (() => void) | null = null
+  let sessionTogglePendingTarget: boolean | null = null
+  let sessionToggleState = sessionToggleVisualState(false)
   let refreshInFlight = false
   let actionInFlight = false
   let serviceInstallRecommended = false
@@ -162,6 +165,10 @@
   $: cliInstallSupported = !!state?.cliInstallSupported
   $: startupSettingsSupported = !!state?.startupSettingsSupported
   $: trayBehaviorSupported = !!state?.trayBehaviorSupported
+  $: sessionToggleState = sessionToggleVisualState(
+    state?.sessionActive ?? false,
+    sessionTogglePendingTarget,
+  )
   $: {
     const invite = state?.activeNetworkInvite ?? ''
     if (invite !== inviteQrSource) {
@@ -1311,17 +1318,23 @@
       return
     }
 
-    if (serviceSetupRequired && !state.sessionActive) {
-      await onInstallSystemService(true)
-      return
-    }
+    const targetActive = !state.sessionActive
+    sessionTogglePendingTarget = targetActive
+    try {
+      if (serviceSetupRequired && !state.sessionActive) {
+        await onInstallSystemService(true)
+        return
+      }
 
-    if (serviceEnableRecommended && !state.sessionActive) {
-      await onEnableSystemService(true)
-      return
-    }
+      if (serviceEnableRecommended && !state.sessionActive) {
+        await onEnableSystemService(true)
+        return
+      }
 
-    await runAction(state.sessionActive ? disconnectSession : connectSession)
+      await runAction(state.sessionActive ? disconnectSession : connectSession)
+    } finally {
+      sessionTogglePendingTarget = null
+    }
   }
 
   async function onInstallCli() {
@@ -1729,17 +1742,21 @@
         </div>
         {#if vpnControlSupported && !serviceSetupRequired}
           <button
-            class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
+            class={`session-switch ${sessionToggleState.className} ${
+              sessionTogglePendingTarget !== null ? 'pending' : ''
+            }`}
             role="switch"
-            aria-checked={state.sessionActive}
+            aria-checked={sessionToggleState.active}
             aria-label="Toggle VPN session"
+            aria-busy={sessionTogglePendingTarget !== null}
             data-testid="session-toggle"
+            disabled={actionInFlight}
             on:click={onToggleSession}
           >
             <span class="session-switch-track" aria-hidden="true">
               <span class="session-switch-thumb"></span>
             </span>
-            <span class="session-switch-label">VPN {state.sessionActive ? 'On' : 'Off'}</span>
+            <span class="session-switch-label">{sessionToggleState.label}</span>
           </button>
         {/if}
       </div>
@@ -1788,8 +1805,8 @@
           <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
             Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
           </span>
-          <span class={`badge ${state.sessionActive ? 'ok' : 'bad'}`}>
-            VPN {state.sessionActive ? 'On' : 'Off'}
+          <span class={`badge ${sessionToggleState.active ? 'ok' : 'bad'}`}>
+            {sessionToggleState.label}
           </span>
           <span class={`badge ${state.relayConnected ? 'ok' : 'muted'}`}>
             Relays {state.relayConnected ? 'Connected' : 'Disconnected'}
