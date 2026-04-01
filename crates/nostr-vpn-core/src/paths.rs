@@ -188,6 +188,32 @@ impl PeerPathBook {
             .retain(|participant, _| participants.contains(participant));
     }
 
+    pub fn remove_relay_paths_for_participant(&mut self, participant: &str) -> bool {
+        let Some(state) = self.peers.get_mut(participant) else {
+            return false;
+        };
+
+        let before = state.endpoints.len();
+        state
+            .endpoints
+            .retain(|_, tracked| tracked.source != PeerPathSource::Relay);
+        let mut changed = state.endpoints.len() != before;
+
+        if let Some(current_endpoint) = state.current_endpoint.as_deref()
+            && !state.endpoints.contains_key(current_endpoint)
+        {
+            state.current_endpoint = None;
+            changed = true;
+        }
+
+        if state.endpoints.is_empty() {
+            self.peers.remove(participant);
+            changed = true;
+        }
+
+        changed
+    }
+
     pub fn select_endpoint(
         &self,
         participant: &str,
@@ -282,12 +308,6 @@ impl PeerPathBook {
                 return Some(preferred);
             }
             return Some(current_endpoint.clone());
-        }
-
-        if preferred_state.source == PeerPathSource::Relay
-            && current.source != PeerPathSource::Relay
-        {
-            return Some(preferred);
         }
 
         let can_rotate = current

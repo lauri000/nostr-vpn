@@ -3127,6 +3127,14 @@ impl NvpnBackend {
                     return "awaiting WireGuard handshake".to_string();
                 };
 
+                if peer_link_uses_relay_path(link) {
+                    let runtime_endpoint = link.runtime_endpoint.as_deref().unwrap_or_default();
+                    return format!(
+                        "awaiting WireGuard handshake via relay {}",
+                        shorten_middle(runtime_endpoint, 18, 10)
+                    );
+                }
+
                 match link
                     .endpoint
                     .as_deref()
@@ -8230,6 +8238,30 @@ mod tests {
         assert_eq!(view.runtime_endpoint, "198.51.100.9:45000");
         assert_eq!(view.tx_bytes, 4_096);
         assert_eq!(view.rx_bytes, 8_192);
+    }
+
+    #[test]
+    fn pending_peer_status_line_reports_when_runtime_waits_on_relay_endpoint() {
+        let participant = "44".repeat(32);
+        let mut backend = test_backend(&participant);
+        let mut peer = daemon_peer(
+            &participant,
+            false,
+            Some(3),
+            Some("awaiting handshake"),
+            "203.0.113.10:51820",
+        );
+        peer.runtime_endpoint = Some("198.51.100.9:45000".to_string());
+        backend.daemon_state = Some(daemon_state_with_peer(Some(peer), true));
+        backend.session_active = true;
+        backend.refresh_peer_runtime_status();
+
+        let view = backend.participant_view(&participant, "mesh-test", None, false);
+        assert!(
+            view.status_text
+                .contains("awaiting WireGuard handshake via relay")
+        );
+        assert!(view.status_text.contains("198.51.100.9:45000"));
     }
 
     #[test]

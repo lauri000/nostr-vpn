@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.3.2 - 2026-04-01
+
+Changes since `v0.3.1` on 2026-03-31.
+
+### Changed
+
+- Desktop advanced settings now expose the relay-routing toggle in both `Routing & Sharing` and `Session & Relays`, using clearer “Enable routing over relay when direct path fails” wording.
+- Pending peer status in the desktop UI now reports when WireGuard is waiting on a relay endpoint instead of implying the direct endpoint is still in use.
+
+### Fixed
+
+- Relay routing no longer preempts a freshly selected direct path immediately; direct UDP now gets a retry window before relay routing takes over.
+- Public relay fallback requests now wait for active peer presence and a short direct-handshake grace period instead of firing immediately on just-seen or stale peers.
+- Disabling relay routing now drops cached relay endpoints from runtime path selection so the setting takes effect right away.
+- Daemon and relay-operator debug logs are now trimmed to a bounded rolling tail instead of growing without limit.
+
 ## 0.3.1 - 2026-03-31
 
 Changes since `v0.3.0` on 2026-03-31.

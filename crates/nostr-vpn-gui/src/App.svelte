@@ -881,7 +881,7 @@
 
   const publicRelayFallbackStatusText = (state: UiState) => {
     if (state.usePublicRelayFallback) {
-      return 'If a peer cannot be reached directly, nostr-vpn will try discoverable public relays before giving up.'
+      return 'If direct UDP does not establish a handshake, nostr-vpn may route peer traffic through discoverable relay endpoints.'
     }
 
     return 'Only direct peer paths will be used. Devices on restrictive networks may stay offline until a direct path works.'
@@ -2381,6 +2381,21 @@
           <label class="toggle-row">
             <input
               type="checkbox"
+              checked={state.usePublicRelayFallback}
+              on:change={(event) =>
+                onUpdateSettings({
+                  usePublicRelayFallback: (event.currentTarget as HTMLInputElement).checked,
+                })}
+            />
+            <div>Enable routing over relay when direct path fails</div>
+          </label>
+          <div class="config-path settings-note">{publicRelayFallbackStatusText(state)}</div>
+        </div>
+
+        <div class="field-panel">
+          <label class="toggle-row">
+            <input
+              type="checkbox"
               checked={state.advertiseExitNode}
               on:change={(event) =>
                 onUpdateSettings({
@@ -3082,7 +3097,7 @@
                   usePublicRelayFallback: (event.target as HTMLInputElement).checked,
                 })}
             />
-            <span>Use public relay fallback when direct connection fails</span>
+            <span>Enable routing over relay when direct path fails</span>
           </label>
           <div class="config-path settings-note">{publicRelayFallbackStatusText(state)}</div>
 

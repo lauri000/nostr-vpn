@@ -9,8 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::net::ToSocketAddrs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -140,6 +139,8 @@ const RELAY_PROVIDER_PROBE_TIMEOUT_SECS: u64 = 4;
 const RELAY_PROVIDER_PROBE_RETRY_AFTER_SECS: u64 = 60;
 const MAX_PARALLEL_RELAY_PROVIDER_PROBES: usize = 2;
 const MAX_PARALLEL_RELAY_REQUESTS_PER_PARTICIPANT: usize = 3;
+const DEBUG_LOG_MAX_BYTES: u64 = 512 * 1024;
+const DEBUG_LOG_KEEP_BYTES: usize = 384 * 1024;
 const MIN_PERSISTED_PEER_CACHE_TIMEOUT_SECS: u64 = 600;
 const PERSISTED_PEER_CACHE_TIMEOUT_MULTIPLIER: u64 = 30;
 const MIN_PERSISTED_PATH_CACHE_TIMEOUT_SECS: u64 = 1_800;
@@ -2264,20 +2265,30 @@ fn participant_has_pending_relay_request(
     })
 }
 
+fn peer_is_past_direct_handshake_grace(
+    presence: &PeerPresenceBook,
+    participant: &str,
+    now: u64,
+) -> bool {
+    presence
+        .last_seen_at(participant)
+        .is_some_and(|last_seen_at| now.saturating_sub(last_seen_at) >= PEER_PATH_RETRY_AFTER_SECS)
+}
+
 fn participants_needing_relay(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     presence: &PeerPresenceBook,
-    tunnel_runtime: &CliTunnelRuntime,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
     relay_sessions: &HashMap<String, ActiveRelaySession>,
     pending_requests: &HashMap<String, PendingRelayRequest>,
     now: u64,
 ) -> Vec<String> {
-    let runtime_peers = tunnel_runtime.peer_status().ok();
     app.participant_pubkeys_hex()
         .into_iter()
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
-        .filter(|participant| presence.announcement_for(participant).is_some())
+        .filter(|participant| presence.active().contains_key(participant))
+        .filter(|participant| peer_is_past_direct_handshake_grace(presence, participant, now))
         .filter(|participant| {
             relay_sessions
                 .get(participant)
@@ -2290,10 +2301,35 @@ fn participants_needing_relay(
             let Some(announcement) = presence.announcement_for(participant) else {
                 return false;
             };
-            let runtime_peer = peer_runtime_lookup(announcement, runtime_peers.as_ref());
+            let runtime_peer = peer_runtime_lookup(announcement, runtime_peers);
             !runtime_peer.is_some_and(peer_has_recent_handshake)
         })
         .collect()
+}
+
+fn relay_fallback_request_reason(
+    announcement: &PeerAnnouncement,
+    runtime_peer: Option<&WireGuardPeerStatus>,
+    last_signal_seen_at: Option<u64>,
+    now: u64,
+) -> String {
+    let signal_text = last_signal_seen_at
+        .map(|last_seen_at| format!("nostr seen {}s ago", now.saturating_sub(last_seen_at)))
+        .unwrap_or_else(|| "nostr seen recently".to_string());
+    let runtime_endpoint = runtime_peer
+        .and_then(|peer| peer.endpoint.as_deref())
+        .unwrap_or(announcement.endpoint.as_str());
+
+    if let Some(handshake_age) = runtime_peer.and_then(WireGuardPeerStatus::last_handshake_age) {
+        format!(
+            "{signal_text}; last handshake {}s ago via {runtime_endpoint}",
+            handshake_age.as_secs()
+        )
+    } else if runtime_peer.is_some() {
+        format!("{signal_text}; no completed handshake via {runtime_endpoint}")
+    } else {
+        format!("{signal_text}; peer not yet in tunnel runtime")
+    }
 }
 
 async fn probe_relay_provider_datapath(
@@ -2545,11 +2581,12 @@ async fn maybe_request_public_relay_fallback(
     pending_requests: &mut HashMap<String, PendingRelayRequest>,
     now: u64,
 ) -> Result<usize> {
+    let runtime_peers = tunnel_runtime.peer_status().ok();
     let participants = participants_needing_relay(
         app,
         own_pubkey,
         presence,
-        tunnel_runtime,
+        runtime_peers.as_ref(),
         relay_sessions,
         pending_requests,
         now,
@@ -2583,6 +2620,9 @@ async fn maybe_request_public_relay_fallback(
 
     let mut requested = 0usize;
     for participant in participants {
+        let Some(announcement) = presence.announcement_for(&participant) else {
+            continue;
+        };
         let relay_candidates = relay_candidates_for_participant(
             &relay_pubkeys,
             &participant,
@@ -2594,6 +2634,15 @@ async fn maybe_request_public_relay_fallback(
         if relay_candidates.is_empty() {
             continue;
         }
+
+        let runtime_peer = peer_runtime_lookup(announcement, runtime_peers.as_ref());
+        let reason = relay_fallback_request_reason(
+            announcement,
+            runtime_peer,
+            presence.last_seen_at(&participant),
+            now,
+        );
+        eprintln!("relay: requesting fallback for {participant}: {reason}");
 
         for relay_pubkey in relay_candidates {
             let request_id = format!(
@@ -4826,7 +4875,16 @@ fn planned_tunnel_peers_for_local_endpoints(
         let Some(announcement) = peer_announcements.get(participant) else {
             continue;
         };
-        let effective_announcement = announcement.without_expired_relay(now);
+        if !app.use_public_relay_fallback {
+            path_book.remove_relay_paths_for_participant(participant);
+        }
+        let effective_announcement = if app.use_public_relay_fallback {
+            announcement.without_expired_relay(now)
+        } else {
+            announcement
+                .without_expired_relay(now)
+                .with_relay(None, None, None)
+        };
         path_book.refresh_from_announcement(participant.clone(), &effective_announcement, now);
         let selected_endpoint = path_book
             .select_endpoint_for_local_endpoints(
@@ -5894,6 +5952,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut expected_peers = expected_peer_count(&app);
     let state_file = daemon_state_file_path(&config_path);
     let peer_cache_file = daemon_peer_cache_file_path(&config_path);
+    trim_debug_logs(&config_path);
     let _ = fs::remove_file(daemon_control_file_path(&config_path));
     let mut presence = PeerPresenceBook::default();
     let mut path_book = PeerPathBook::default();
@@ -5912,6 +5971,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut port_mapping_runtime = PortMappingRuntime::default();
     let mut public_signal_endpoint = None;
     let mut last_written_peer_cache = None;
+    let mut last_log_trim_at = Instant::now();
     let mut relay_operator_runtime = LocalRelayOperatorRuntime {
         status: if app.relay_for_others {
             "Waiting for relay operator startup".to_string()
@@ -6899,6 +6959,10 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &port_mapping_runtime.status(),
                     &relay_operator_runtime,
                 );
+                if last_log_trim_at.elapsed() >= Duration::from_secs(30) {
+                    trim_debug_logs(&config_path);
+                    last_log_trim_at = Instant::now();
+                }
             }
             message = async {
                 if relay_session_active(
@@ -7853,6 +7917,65 @@ fn relay_operator_state_file_path(config_path: &Path) -> PathBuf {
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
     parent.join("relay.operator.json")
+}
+
+fn trim_debug_log_file(path: &Path) -> Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.len() <= DEBUG_LOG_MAX_BYTES {
+        return Ok(false);
+    }
+
+    let mut reader = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("failed to open {} for trimming", path.display()))?;
+    let read_len = usize::try_from(metadata.len().min(DEBUG_LOG_KEEP_BYTES as u64))
+        .unwrap_or(DEBUG_LOG_KEEP_BYTES);
+    reader
+        .seek(SeekFrom::End(
+            -(i64::try_from(read_len).unwrap_or(i64::MAX)),
+        ))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    let mut tail = vec![0_u8; read_len];
+    reader
+        .read_exact(&mut tail)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+
+    if let Some(newline) = tail.iter().position(|byte| *byte == b'\n')
+        && newline + 1 < tail.len()
+    {
+        tail.drain(..=newline);
+    }
+
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("failed to rewrite {}", path.display()))?;
+    writer
+        .write_all(&tail)
+        .with_context(|| format!("failed to trim {}", path.display()))?;
+    Ok(true)
+}
+
+fn trim_debug_logs(config_path: &Path) {
+    for path in [
+        daemon_log_file_path(config_path),
+        relay_operator_log_file_path(config_path),
+    ] {
+        if let Err(error) = trim_debug_log_file(&path) {
+            eprintln!(
+                "daemon: failed to trim debug log {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 const LOCAL_NAT_ASSIST_PORT: u16 = 3478;
@@ -11888,9 +12011,9 @@ mod tests {
         local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
         nat_punch_targets, nat_punch_targets_for_local_endpoint,
         nat_punch_targets_for_local_endpoints, parse_exit_node_arg, parse_nonzero_pid,
-        peer_has_recent_handshake, peer_path_cache_timeout_secs, peer_runtime_lookup,
-        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
-        persisted_peer_cache_timeout_secs, planned_tunnel_peers,
+        participants_needing_relay, peer_has_recent_handshake, peer_path_cache_timeout_secs,
+        peer_runtime_lookup, peer_signal_timeout_secs, pending_tunnel_heartbeat_ips,
+        persisted_path_cache_timeout_secs, persisted_peer_cache_timeout_secs, planned_tunnel_peers,
         planned_tunnel_peers_for_local_endpoints, public_endpoint_for_listen_port,
         public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
         read_daemon_peer_cache, read_daemon_state, record_successful_runtime_paths,
@@ -14019,7 +14142,7 @@ errno=0\n";
     }
 
     #[test]
-    fn relay_endpoint_preempts_recent_failed_direct_selection() {
+    fn relay_endpoint_waits_for_direct_retry_window_before_preempting() {
         let mut config = AppConfig::generated();
         let participant = "11".repeat(32);
         config.networks[0].participants = vec![participant.clone()];
@@ -14069,9 +14192,128 @@ errno=0\n";
                 101,
                 super::PEER_PATH_RETRY_AFTER_SECS,
             )
-            .expect("relay endpoint");
+            .expect("direct endpoint before retry window");
 
-        assert_eq!(selected_with_relay, "10.203.1.2:40001");
+        assert_eq!(selected_with_relay, "10.203.1.11:51820");
+
+        let selected_after_retry = path_book
+            .select_endpoint_for_local_endpoints(
+                &participant,
+                &direct_and_relay,
+                &own_local_endpoints,
+                106,
+                super::PEER_PATH_RETRY_AFTER_SECS,
+            )
+            .expect("relay endpoint after retry window");
+
+        assert_eq!(selected_after_retry, "10.203.1.2:40001");
+    }
+
+    #[test]
+    fn planned_tunnel_peers_ignore_relay_endpoint_when_relay_routing_disabled() {
+        let mut config = AppConfig::generated();
+        config.use_public_relay_fallback = false;
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: generate_keypair().public_key,
+            endpoint: "203.0.113.20:51820".to_string(),
+            local_endpoint: Some("192.168.1.20:51820".to_string()),
+            public_endpoint: Some("203.0.113.20:51820".to_string()),
+            relay_endpoint: Some("198.51.100.30:40001".to_string()),
+            relay_pubkey: Some("relay-pubkey".to_string()),
+            relay_expires_at: Some(500),
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 10,
+        };
+
+        let mut path_book = PeerPathBook::default();
+        path_book.refresh_from_announcement(participant.clone(), &announcement, 10);
+
+        let selected = planned_tunnel_peers(
+            &config,
+            None,
+            &HashMap::from([(participant.clone(), announcement)]),
+            &mut path_book,
+            Some("10.0.0.33:51820"),
+            100,
+        )
+        .expect("planned tunnel peers");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
+    }
+
+    #[test]
+    fn participants_needing_relay_wait_for_direct_handshake_grace() {
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let announcement = sample_peer_announcement(generate_keypair().public_key);
+        let mut presence = PeerPresenceBook::default();
+        presence.apply_signal(
+            participant.clone(),
+            SignalPayload::Announce(announcement),
+            100,
+        );
+
+        let fresh = participants_needing_relay(
+            &config,
+            None,
+            &presence,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            103,
+        );
+        assert!(
+            fresh.is_empty(),
+            "fresh direct attempts should keep trying first"
+        );
+
+        let after_grace = participants_needing_relay(
+            &config,
+            None,
+            &presence,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            106,
+        );
+        assert_eq!(after_grace, vec![participant]);
+    }
+
+    #[test]
+    fn participants_needing_relay_ignore_stale_known_peer_without_active_presence() {
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let mut presence = PeerPresenceBook::default();
+        presence.restore_known(
+            participant.clone(),
+            sample_peer_announcement(generate_keypair().public_key),
+            Some(100),
+        );
+
+        let selected = participants_needing_relay(
+            &config,
+            None,
+            &presence,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            200,
+        );
+
+        assert!(
+            selected.is_empty(),
+            "known-only peers should not trigger relay routing"
+        );
     }
 
     #[test]
