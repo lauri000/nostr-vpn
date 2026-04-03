@@ -14,6 +14,7 @@ mod ios_vpn;
 #[cfg(any(target_os = "android", target_os = "ios", test))]
 mod mobile_wg;
 mod path_resolution;
+mod peer_state;
 mod tray_runtime;
 
 #[cfg(target_os = "ios")]
@@ -60,6 +61,15 @@ pub(crate) use path_resolution::{
 pub(crate) use path_resolution::{
     normalize_windows_elevated_args, windows_temp_config_import_path,
 };
+#[allow(unused_imports)]
+pub(crate) use peer_state::{
+    ConfiguredPeerStatus, LanAnnouncement, LanPairingSignal, LanPeerRecord, NetworkInvite,
+    PeerLinkStatus, PeerPresenceStatus, active_network_invite_code,
+    apply_network_invite_to_active_network, connected_configured_peer_count,
+    decode_lan_pairing_announcement, parse_network_invite, peer_link_uses_relay_path,
+    peer_presence_state_label, peer_state_label, preferred_join_request_recipient, to_npub,
+    unix_timestamp,
+};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 pub(crate) use tray_runtime::{
     build_tray_menu, current_tray_runtime_state, refresh_tray_menu, run_tray_backend_action,
@@ -82,10 +92,9 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nostr_sdk::prelude::{PublicKey, ToBech32};
 use nostr_vpn_core::config::{
     AppConfig, PendingInboundJoinRequest, PendingOutboundJoinRequest, derive_mesh_tunnel_ip,
@@ -170,21 +179,6 @@ struct RelaySummary {
     unknown: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-struct PeerLinkStatus {
-    reachable: Option<bool>,
-    last_handshake_at: Option<SystemTime>,
-    endpoint: Option<String>,
-    runtime_endpoint: Option<String>,
-    tx_bytes: u64,
-    rx_bytes: u64,
-    error: Option<String>,
-    checked_at: Option<SystemTime>,
-    last_signal_seen_at: Option<SystemTime>,
-    advertised_routes: Vec<String>,
-    offers_exit_node: bool,
-}
-
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PersistConfigOutcome {
@@ -196,55 +190,6 @@ impl PersistConfigOutcome {
     fn needs_explicit_daemon_reload(self) -> bool {
         matches!(self, Self::SavedLocally)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfiguredPeerStatus {
-    Local,
-    Online,
-    Present,
-    Offline,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerPresenceStatus {
-    Local,
-    Present,
-    Absent,
-    Unknown,
-}
-
-#[derive(Debug, Clone)]
-struct LanPeerRecord {
-    npub: String,
-    node_name: String,
-    endpoint: String,
-    network_name: String,
-    network_id: String,
-    invite: String,
-    last_seen: SystemTime,
-}
-
-#[derive(Debug, Clone)]
-struct LanPairingSignal {
-    npub: String,
-    node_name: String,
-    endpoint: String,
-    network_name: String,
-    network_id: String,
-    invite: String,
-    seen_at: SystemTime,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LanAnnouncement {
-    v: u8,
-    npub: String,
-    node_name: String,
-    endpoint: String,
-    invite: String,
-    timestamp: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -526,22 +471,6 @@ struct SettingsPatch {
     autoconnect: Option<bool>,
     launch_on_startup: Option<bool>,
     close_to_tray_on_close: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct NetworkInvite {
-    v: u8,
-    network_name: String,
-    network_id: String,
-    inviter_npub: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    inviter_node_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    admins: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    participants: Vec<String>,
-    relays: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3822,363 +3751,12 @@ fn peer_offers_exit_node(routes: &[String]) -> bool {
         .any(|route| route == "0.0.0.0/0" || route == "::/0")
 }
 
-fn active_network_invite_code(config: &AppConfig) -> Result<String> {
-    let active_network = config.active_network();
-    let roster = config.shared_network_roster(&active_network.id)?;
-    let own_pubkey = config.own_nostr_pubkey_hex().ok();
-    let inviter_pubkey = own_pubkey
-        .as_deref()
-        .filter(|pubkey| config.is_network_admin(&active_network.id, pubkey))
-        .map(|pubkey| pubkey.to_string())
-        .or_else(|| preferred_join_request_recipient(active_network))
-        .or_else(|| active_network.admins.first().cloned())
-        .ok_or_else(|| anyhow!("active network has no admin configured"))?;
-    let invite = NetworkInvite {
-        v: NETWORK_INVITE_VERSION,
-        network_name: active_network.name.trim().to_string(),
-        network_id: roster.network_id,
-        inviter_npub: to_npub(&inviter_pubkey),
-        inviter_node_name: if own_pubkey.as_deref() == Some(inviter_pubkey.as_str()) {
-            config.node_name.trim().to_string()
-        } else {
-            config.peer_alias(&inviter_pubkey).unwrap_or_default()
-        },
-        admins: roster.admins.iter().map(|admin| to_npub(admin)).collect(),
-        participants: roster
-            .participants
-            .iter()
-            .map(|participant| to_npub(participant))
-            .collect(),
-        relays: normalized_invite_relays(&config.nostr.relays)?,
-    };
-    let encoded = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&invite).context("failed to encode network invite JSON")?);
-    Ok(format!("{NETWORK_INVITE_PREFIX}{encoded}"))
-}
-
-fn parse_network_invite(value: &str) -> Result<NetworkInvite> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("invite code is empty"));
-    }
-
-    let mut invite = if trimmed.starts_with('{') {
-        serde_json::from_str::<NetworkInvite>(trimmed)
-            .context("failed to parse network invite JSON")?
-    } else {
-        let payload = trimmed
-            .strip_prefix(NETWORK_INVITE_PREFIX)
-            .unwrap_or(trimmed);
-        let decoded = URL_SAFE_NO_PAD
-            .decode(payload)
-            .context("failed to decode network invite payload")?;
-        serde_json::from_slice::<NetworkInvite>(&decoded)
-            .context("failed to parse network invite payload")?
-    };
-
-    if invite.v != 1 && invite.v != NETWORK_INVITE_VERSION {
-        return Err(anyhow!(
-            "unsupported invite version {}; expected 1 or {}",
-            invite.v,
-            NETWORK_INVITE_VERSION
-        ));
-    }
-
-    invite.network_name = invite.network_name.trim().to_string();
-    if invite.network_name.is_empty() {
-        return Err(anyhow!("invite network name is empty"));
-    }
-
-    invite.network_id = invite.network_id.trim().to_string();
-    if invite.network_id.is_empty() {
-        return Err(anyhow!("invite network id is empty"));
-    }
-
-    invite.inviter_npub = to_npub(&normalize_nostr_pubkey(&invite.inviter_npub)?);
-    invite.inviter_node_name = invite.inviter_node_name.trim().to_string();
-    invite.admins = normalized_invite_pubkeys(&invite.admins)?;
-    if !invite
-        .admins
-        .iter()
-        .any(|admin| admin == &invite.inviter_npub)
-    {
-        invite.admins.push(invite.inviter_npub.clone());
-        invite.admins.sort();
-        invite.admins.dedup();
-    }
-    invite.participants = normalized_invite_pubkeys(&invite.participants)?;
-    if invite.participants.is_empty() {
-        invite.participants.push(invite.inviter_npub.clone());
-    }
-    invite.relays = normalized_invite_relays(&invite.relays)?;
-
-    Ok(invite)
-}
-
-fn apply_network_invite_to_active_network(
-    config: &mut AppConfig,
-    invite: &NetworkInvite,
-) -> Result<()> {
-    let normalized_invite_network_id = normalize_runtime_network_id(&invite.network_id);
-    let normalized_inviter_pubkey = normalize_nostr_pubkey(&invite.inviter_npub)?;
-    let own_pubkey = config.own_nostr_pubkey_hex().ok();
-    let invite_admins = invite
-        .admins
-        .iter()
-        .map(|admin| normalize_nostr_pubkey(admin))
-        .collect::<Result<Vec<_>>>()?;
-    let invite_participants = invite
-        .participants
-        .iter()
-        .map(|participant| normalize_nostr_pubkey(participant))
-        .collect::<Result<Vec<_>>>()?;
-    let (target_network_entry_id, reset_membership_from_invite) = if let Some(existing) =
-        config.networks.iter().find(|network| {
-            normalize_runtime_network_id(&network.network_id) == normalized_invite_network_id
-        }) {
-        (existing.id.clone(), false)
-    } else if network_should_adopt_invite(config.active_network()) {
-        (config.active_network().id.clone(), true)
-    } else {
-        let network_id = config.add_network(&invite.network_name);
-        config.set_network_enabled(&network_id, true)?;
-        (network_id, true)
-    };
-    let should_adopt_name = config
-        .network_by_id(&target_network_entry_id)
-        .map(network_should_adopt_invite)
-        .unwrap_or(false);
-    let inviter_already_configured = config
-        .network_by_id(&target_network_entry_id)
-        .map(|network| {
-            network
-                .participants
-                .iter()
-                .any(|participant| participant == &normalized_inviter_pubkey)
-                || network
-                    .admins
-                    .iter()
-                    .any(|admin| admin == &normalized_inviter_pubkey)
-        })
-        .unwrap_or(false);
-
-    config.set_network_enabled(&target_network_entry_id, true)?;
-    config.set_network_mesh_id(&target_network_entry_id, &invite.network_id)?;
-    if let Some(network) = config.network_by_id_mut(&target_network_entry_id) {
-        if reset_membership_from_invite {
-            network.participants.clear();
-            network.admins.clear();
-            network.shared_roster_updated_at = 0;
-            network.shared_roster_signed_by.clear();
-        }
-
-        for participant in &invite_participants {
-            if own_pubkey.as_deref() == Some(participant.as_str()) {
-                continue;
-            }
-            network.participants.push(participant.clone());
-        }
-        network.participants.sort();
-        network.participants.dedup();
-
-        for admin in &invite_admins {
-            network.admins.push(admin.clone());
-        }
-        if !network
-            .admins
-            .iter()
-            .any(|admin| admin == &normalized_inviter_pubkey)
-        {
-            network.admins.push(normalized_inviter_pubkey.clone());
-        }
-        network.admins.sort();
-        network.admins.dedup();
-
-        network.invite_inviter = if network
-            .admins
-            .iter()
-            .any(|admin| admin == &normalized_inviter_pubkey)
-        {
-            normalized_inviter_pubkey.clone()
-        } else {
-            network.admins.first().cloned().unwrap_or_default()
-        };
-        if network
-            .outbound_join_request
-            .as_ref()
-            .map(|request| {
-                !network
-                    .admins
-                    .iter()
-                    .any(|admin| admin == &request.recipient)
-            })
-            .unwrap_or(false)
-        {
-            network.outbound_join_request = None;
-        }
-    }
-
-    if !inviter_already_configured && !invite.inviter_node_name.trim().is_empty() {
-        let _ = config.set_peer_alias(&normalized_inviter_pubkey, &invite.inviter_node_name);
-    }
-
-    if should_adopt_name {
-        if let Some(network) = config.network_by_id_mut(&target_network_entry_id) {
-            network.name = invite.network_name.trim().to_string();
-        }
-    }
-
-    for relay in &invite.relays {
-        if !config.nostr.relays.iter().any(|existing| existing == relay) {
-            config.nostr.relays.push(relay.clone());
-        }
-    }
-
-    Ok(())
-}
-
-fn network_should_adopt_invite(network: &nostr_vpn_core::config::NetworkConfig) -> bool {
-    let trimmed = network.name.trim();
-    network.participants.is_empty() && (trimmed.is_empty() || trimmed.starts_with("Network "))
-}
-
-fn preferred_join_request_recipient(
-    network: &nostr_vpn_core::config::NetworkConfig,
-) -> Option<String> {
-    if !network.invite_inviter.is_empty()
-        && network
-            .admins
-            .iter()
-            .any(|admin| admin == &network.invite_inviter)
-    {
-        return Some(network.invite_inviter.clone());
-    }
-
-    network.admins.first().cloned()
-}
-
-fn normalized_invite_pubkeys(pubkeys: &[String]) -> Result<Vec<String>> {
-    let mut normalized = pubkeys
-        .iter()
-        .map(|pubkey| normalize_nostr_pubkey(pubkey).map(|value| to_npub(&value)))
-        .collect::<Result<Vec<_>>>()?;
-    normalized.sort();
-    normalized.dedup();
-    Ok(normalized)
-}
-
-fn normalized_invite_relays(relays: &[String]) -> Result<Vec<String>> {
-    let mut normalized = Vec::new();
-    for relay in relays {
-        let relay = relay.trim();
-        if relay.is_empty() {
-            continue;
-        }
-        if !is_valid_relay_url(relay) {
-            return Err(anyhow!("invalid invite relay '{relay}'"));
-        }
-        if !normalized.iter().any(|existing| existing == relay) {
-            normalized.push(relay.to_string());
-        }
-    }
-    Ok(normalized)
-}
-
 impl Drop for NvpnBackend {
     fn drop(&mut self) {
         #[cfg(target_os = "android")]
         let _ = self.android_session.stop();
         self.stop_lan_pairing();
     }
-}
-
-fn peer_link_uses_relay_path(link: &PeerLinkStatus) -> bool {
-    let Some(runtime_endpoint) = link
-        .runtime_endpoint
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return false;
-    };
-
-    link.endpoint
-        .as_deref()
-        .map(|endpoint| endpoint != runtime_endpoint)
-        .unwrap_or(true)
-}
-
-fn connected_configured_peer_count(
-    config: &AppConfig,
-    peer_status: &HashMap<String, PeerLinkStatus>,
-) -> usize {
-    let own_pubkey = config.own_nostr_pubkey_hex().ok();
-    let participants = config.participant_pubkeys_hex();
-
-    participants
-        .iter()
-        .filter(|participant| Some(participant.as_str()) != own_pubkey.as_deref())
-        .filter(|participant| {
-            peer_status
-                .get(*participant)
-                .and_then(|status| status.reachable)
-                .unwrap_or(false)
-        })
-        .count()
-}
-
-fn peer_state_label(state: ConfiguredPeerStatus) -> &'static str {
-    match state {
-        ConfiguredPeerStatus::Local => "local",
-        ConfiguredPeerStatus::Online => "online",
-        ConfiguredPeerStatus::Present => "pending",
-        ConfiguredPeerStatus::Offline => "offline",
-        ConfiguredPeerStatus::Unknown => "unknown",
-    }
-}
-
-fn peer_presence_state_label(state: PeerPresenceStatus) -> &'static str {
-    match state {
-        PeerPresenceStatus::Local => "local",
-        PeerPresenceStatus::Present => "present",
-        PeerPresenceStatus::Absent => "absent",
-        PeerPresenceStatus::Unknown => "unknown",
-    }
-}
-
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn to_npub(pubkey_hex: &str) -> String {
-    PublicKey::from_hex(pubkey_hex)
-        .ok()
-        .and_then(|pubkey| pubkey.to_bech32().ok())
-        .unwrap_or_else(|| pubkey_hex.to_string())
-}
-
-fn decode_lan_pairing_announcement(payload: &[u8], own_npub: &str) -> Option<LanPairingSignal> {
-    let parsed = serde_json::from_slice::<LanAnnouncement>(payload).ok()?;
-    if parsed.v != LAN_PAIRING_ANNOUNCEMENT_VERSION || parsed.npub == own_npub {
-        return None;
-    }
-
-    let invite = parse_network_invite(&parsed.invite).ok()?;
-    if invite.inviter_npub != parsed.npub {
-        return None;
-    }
-
-    Some(LanPairingSignal {
-        npub: parsed.npub,
-        node_name: parsed.node_name,
-        endpoint: parsed.endpoint,
-        network_name: invite.network_name,
-        network_id: invite.network_id,
-        invite: parsed.invite,
-        seen_at: SystemTime::now(),
-    })
 }
 
 async fn run_lan_pairing_loop(
