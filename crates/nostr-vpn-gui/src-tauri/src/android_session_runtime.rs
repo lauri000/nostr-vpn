@@ -4,22 +4,15 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use nostr_vpn_core::config::{
-    AppConfig, DEFAULT_RELAYS, maybe_autoconfigure_node, normalize_advertised_route,
-};
+use nostr_vpn_core::config::{AppConfig, DEFAULT_RELAYS, normalize_advertised_route};
 use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint};
 use nostr_vpn_core::paths::PeerPathBook;
 use nostr_vpn_core::presence::PeerPresenceBook;
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload, SignalingNetwork};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use super::{
-    DaemonPeerState, DaemonRuntimeState, PEER_ONLINE_GRACE_SECS, android_vpn::AndroidVpnExt,
-    android_vpn::StartVpnArgs, mobile_wg::MobileWireGuardRuntime, mobile_wg::PeerRuntimeStatus,
-    mobile_wg::WireGuardPeerConfig,
-};
+use super::{DaemonRuntimeState, PEER_ONLINE_GRACE_SECS, mobile_wg::PeerRuntimeStatus};
 
 const ANDROID_TUN_MTU: u16 = 1_280;
 const ANDROID_SESSION_STATUS_WAITING: &str = "Waiting for participants";
@@ -534,13 +527,14 @@ pub(crate) fn unix_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{planned_tunnel_peers, runtime_local_signal_endpoint};
+    use super::{
+        PlannedTunnelPeer, TunnelPeer, planned_tunnel_peers, runtime_local_signal_endpoint,
+    };
     use nostr_sdk::prelude::Keys;
     use nostr_vpn_core::config::AppConfig;
     use nostr_vpn_core::control::PeerAnnouncement;
     use nostr_vpn_core::paths::PeerPathBook;
     use std::collections::HashMap;
-    use std::time::Duration;
 
     fn participant() -> String {
         Keys::generate().public_key().to_hex()

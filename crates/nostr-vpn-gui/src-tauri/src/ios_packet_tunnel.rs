@@ -1,16 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::raw::c_uchar;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use nostr_vpn_core::config::{AppConfig, maybe_autoconfigure_node};
-use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint};
 use nostr_vpn_core::paths::PeerPathBook;
 use nostr_vpn_core::presence::PeerPresenceBook;
-use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload, SignalingNetwork};
+use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -19,8 +18,7 @@ use self::ios_tunnel_planning::{
     configured_recipients, expected_peer_count, local_interface_address_for_tunnel,
     local_signal_endpoint, note_successful_runtime_paths, planned_tunnel_peers,
     publish_hello_best_effort, publish_private_announce_best_effort, resolve_relays,
-    route_targets_for_tunnel_peers, signaling_networks_for_app, strip_cidr, tunnel_fingerprint,
-    unix_timestamp,
+    route_targets_for_tunnel_peers, signaling_networks_for_app, tunnel_fingerprint, unix_timestamp,
 };
 use crate::mobile_wg::{MobileWireGuardRuntime, WireGuardPeerConfig};
 use crate::{DaemonPeerState, DaemonRuntimeState, PEER_ONLINE_GRACE_SECS};

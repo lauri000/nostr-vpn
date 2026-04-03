@@ -6,13 +6,12 @@ use anyhow::{Context, Result};
 use nostr_vpn_core::config::{AppConfig, DEFAULT_RELAYS, normalize_advertised_route};
 use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint};
 use nostr_vpn_core::paths::PeerPathBook;
-use nostr_vpn_core::presence::PeerPresenceBook;
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload, SignalingNetwork};
 
+use crate::PEER_ONLINE_GRACE_SECS;
 use crate::mobile_wg::MobileWireGuardRuntime;
-use crate::{DaemonRuntimeState, PEER_ONLINE_GRACE_SECS};
 
-use super::{IOS_ANNOUNCE_INTERVAL_SECS, IOS_PUBLISH_TIMEOUT_SECS, IOS_SIGNAL_STALE_AFTER_SECS};
+use super::{IOS_PUBLISH_TIMEOUT_SECS, IOS_SIGNAL_STALE_AFTER_SECS};
 
 pub(super) fn expected_peer_count(config: &AppConfig) -> usize {
     let participants = config.participant_pubkeys_hex();

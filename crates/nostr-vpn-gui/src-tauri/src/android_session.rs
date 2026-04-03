@@ -1,30 +1,26 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::android_session_runtime::{
-    build_peer_announcement, configured_recipients, detect_runtime_primary_ipv4,
-    expected_peer_count, local_interface_address_for_tunnel, local_signal_endpoint,
-    note_successful_runtime_paths, open_mobile_tun_io, planned_tunnel_peers,
-    publish_hello_best_effort, publish_private_announce_best_effort,
-    route_targets_for_tunnel_peers, runtime_local_signal_endpoint, should_retry_tun_io,
-    signal_payload_kind, signaling_networks_for_app, strip_cidr, tunnel_fingerprint,
-    unix_timestamp,
+    open_mobile_tun_io, should_retry_tun_io, signal_payload_kind, strip_cidr, unix_timestamp,
 };
 use crate::android_vpn::{AndroidVpnExt, StartVpnArgs};
 use crate::mobile_wg::{MobileWireGuardRuntime, PeerRuntimeStatus, WireGuardPeerConfig};
 use crate::{DaemonPeerState, DaemonRuntimeState, PEER_ONLINE_GRACE_SECS};
-use nostr_vpn_core::config::{AppConfig, maybe_autoconfigure_node};
+use nostr_vpn_core::config::{
+    AppConfig, DEFAULT_RELAYS, maybe_autoconfigure_node, normalize_advertised_route,
+};
 use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint};
 use nostr_vpn_core::paths::PeerPathBook;
 use nostr_vpn_core::presence::PeerPresenceBook;
-use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload};
+use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload, SignalingNetwork};
 
 const ANDROID_TUN_MTU: u16 = 1_280;
 const ANDROID_SESSION_STATUS_WAITING: &str = "Waiting for participants";
