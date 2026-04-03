@@ -191,7 +191,7 @@ fn handshake_age_converts_to_observed_epoch() {
     let now = 1_700_000_000;
     let runtime_peer = WireGuardPeerStatus {
         endpoint: Some("203.0.113.20:51820".to_string()),
-        last_handshake_sec: Some(now - 5),
+        last_handshake_sec: Some(5),
         last_handshake_nsec: Some(0),
         ..WireGuardPeerStatus::default()
     };
@@ -217,4 +217,25 @@ errno=0\n";
     assert_eq!(peer.last_handshake_at(1_700_000_010), Some(1_700_000_005));
     assert_eq!(peer.tx_bytes, 1234);
     assert_eq!(peer.rx_bytes, 5678);
+}
+
+#[test]
+fn parse_wg_peer_status_interprets_small_handshake_seconds_as_age() {
+    let response = "\
+public_key=peer-a\n\
+endpoint=203.0.113.20:51820\n\
+last_handshake_time_sec=11\n\
+last_handshake_time_nsec=0\n\
+tx_bytes=628\n\
+rx_bytes=396\n\
+errno=0\n";
+
+    let peers = crate::parse_wg_peer_status(response);
+    let peer = peers.get("peer-a").expect("peer should parse");
+    let now = 1_775_232_141;
+
+    assert_eq!(peer.last_handshake_at(now), Some(now - 11));
+    assert!(peer_has_recent_handshake(peer));
+    assert_eq!(peer.tx_bytes, 628);
+    assert_eq!(peer.rx_bytes, 396);
 }

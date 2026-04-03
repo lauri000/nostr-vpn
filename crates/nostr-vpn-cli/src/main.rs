@@ -2429,12 +2429,19 @@ impl WireGuardPeerStatus {
         self.last_handshake_sec.unwrap_or(0) > 0 || self.last_handshake_nsec.unwrap_or(0) > 0
     }
 
-    fn last_handshake_at(&self, _now: u64) -> Option<u64> {
+    fn last_handshake_at(&self, now: u64) -> Option<u64> {
         if !self.has_handshake() {
             return None;
         }
 
-        self.last_handshake_sec.filter(|value| *value > 0)
+        const ABSOLUTE_HANDSHAKE_TIMESTAMP_FLOOR: u64 = 946_684_800;
+
+        let raw = self.last_handshake_sec.filter(|value| *value > 0)?;
+        if raw < ABSOLUTE_HANDSHAKE_TIMESTAMP_FLOOR {
+            Some(now.saturating_sub(raw))
+        } else {
+            Some(raw)
+        }
     }
 
     fn last_handshake_age(&self, now: u64) -> Option<Duration> {
