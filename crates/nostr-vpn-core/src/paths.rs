@@ -235,6 +235,36 @@ impl PeerPathBook {
         changed
     }
 
+    pub fn endpoint_has_recent_success_for_local_endpoints(
+        &self,
+        participant: &str,
+        endpoint: &str,
+        own_local_endpoints: &[String],
+        now: u64,
+        stale_after_secs: u64,
+    ) -> bool {
+        if stale_after_secs == 0 {
+            return false;
+        }
+
+        let Some(tracked) = self
+            .peers
+            .get(participant)
+            .and_then(|state| state.endpoints.get(endpoint))
+        else {
+            return false;
+        };
+
+        let same_subnet_local = endpoint_shares_private_ipv4_subnet(endpoint, own_local_endpoints);
+        if !path_success_still_applies(endpoint, tracked, same_subnet_local) {
+            return false;
+        }
+
+        tracked
+            .last_success_at
+            .is_some_and(|success_at| now.saturating_sub(success_at) <= stale_after_secs)
+    }
+
     pub fn select_endpoint(
         &self,
         participant: &str,

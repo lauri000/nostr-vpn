@@ -2848,7 +2848,9 @@ impl CliTunnelRuntime {
                 own_pubkey,
                 peer_announcements,
                 &planned_peers,
+                path_book,
                 runtime_peers.as_ref(),
+                now,
             );
             let runtime_fingerprint = tunnel_runtime_fingerprint(&fingerprint, &route_targets);
             if self.last_fingerprint.as_deref() == Some(runtime_fingerprint.as_str())
@@ -5357,7 +5359,9 @@ fn route_targets_for_planned_tunnel_peers(
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     planned_peers: &[PlannedTunnelPeer],
+    path_book: &PeerPathBook,
     runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    now: u64,
 ) -> Vec<String> {
     let mut route_targets = route_targets_for_tunnel_peers(
         &planned_peers
@@ -5372,7 +5376,9 @@ fn route_targets_for_planned_tunnel_peers(
         own_pubkey,
         peer_announcements,
         planned_peers,
+        path_book,
         runtime_peers,
+        now,
     );
     #[cfg(any(target_os = "macos", test))]
     if !exit_node_ready {
@@ -5393,7 +5399,9 @@ fn selected_exit_node_ready_for_default_route(
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     planned_peers: &[PlannedTunnelPeer],
+    path_book: &PeerPathBook,
     runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    now: u64,
 ) -> bool {
     let Some(participant) = selected_exit_node_participant(app, own_pubkey, peer_announcements)
     else {
@@ -5413,10 +5421,27 @@ fn selected_exit_node_ready_for_default_route(
 
     let Some(runtime_peer) = runtime_peers.and_then(|peers| peers.get(&planned.peer.pubkey_hex))
     else {
-        return false;
+        let own_local_endpoints = runtime_local_signal_endpoints(app, app.node.listen_port);
+        return path_book.endpoint_has_recent_success_for_local_endpoints(
+            &participant,
+            &planned.endpoint,
+            &own_local_endpoints,
+            now,
+            PEER_ONLINE_GRACE_SECS,
+        );
     };
 
     let own_local_endpoints = runtime_local_signal_endpoints(app, app.node.listen_port);
+    if path_book.endpoint_has_recent_success_for_local_endpoints(
+        &participant,
+        &planned.endpoint,
+        &own_local_endpoints,
+        now,
+        PEER_ONLINE_GRACE_SECS,
+    ) {
+        return true;
+    }
+
     peer_has_recent_handshake(runtime_peer)
         && runtime_peer
             .endpoint
