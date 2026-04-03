@@ -30,6 +30,48 @@
     validateMeshIdInput,
   } from './lib/mesh-id.js'
   import { nodeNameDnsPreview } from './lib/node-name.js'
+  import {
+    activeNetwork,
+    exitNodeAvailabilityClass,
+    exitNodeAvailabilityText,
+    exitNodeCandidates,
+    filteredExitNodeCandidates,
+    formatCountdown,
+    formatTrafficBytes,
+    formatTrafficRate,
+    healthBadgeClass,
+    healthSummaryText,
+    heroBadgeText,
+    heroDetailText,
+    heroStateBadgeClass,
+    heroSubtext,
+    inactiveNetworks,
+    inviteInviterParticipant,
+    joinRequestButtonLabel,
+    joinRequestStatusText,
+    lanPairingHelpText,
+    networkAdminSummary,
+    networkHasParticipant,
+    networkPeerSummary,
+    offerExitNodeStatusText,
+    onlineDeviceSummary,
+    participantBadgeClass,
+    participantPresenceBadgeText,
+    participantTrafficText,
+    participantTransportBadgeText,
+    platformLabel,
+    publicRelayFallbackStatusText,
+    relayFallbackSummaryText,
+    relayOperatorSummaryText,
+    relaySessionTrafficText,
+    routingModeStatusText,
+    routingSectionMetaText,
+    selectedExitNodeStatusText,
+    serviceLifecycleBadgeClass,
+    serviceLifecycleBadgeText,
+    serviceMetaText,
+    short,
+  } from './lib/app-view'
   import SavedNetworksPanel from './SavedNetworksPanel.svelte'
   import {
     addAdmin,
@@ -212,160 +254,6 @@
         inviteQrError = 'Invite QR unavailable'
       }
     }
-  }
-
-  const serviceMetaText = (state: UiState) => {
-    if (!state.serviceInstalled) {
-      return 'Not installed'
-    }
-    if (state.serviceDisabled) {
-      return 'Installed but disabled'
-    }
-    if (state.serviceRunning) {
-      return 'Installed and running'
-    }
-    return 'Installed'
-  }
-
-  const serviceLifecycleBadgeText = (state: UiState) => {
-    if (state.serviceDisabled) {
-      return 'Disabled'
-    }
-    return state.serviceRunning ? 'Running' : 'Not running'
-  }
-
-  const serviceLifecycleBadgeClass = (state: UiState) => {
-    if (state.serviceDisabled) {
-      return 'warn'
-    }
-    return state.serviceRunning ? 'ok' : 'muted'
-  }
-
-  const participantBadgeClass = (state: PeerState | PresenceState) => {
-    if (state === 'online' || state === 'present') {
-      return 'ok'
-    }
-    if (state === 'pending') {
-      return 'warn'
-    }
-    if (state === 'offline' || state === 'absent') {
-      return 'bad'
-    }
-    return 'muted'
-  }
-
-  const peerStatePriority = (state: PeerState) => {
-    switch (state) {
-      case 'online':
-        return 0
-      case 'pending':
-        return 1
-      case 'offline':
-        return 2
-      case 'checking':
-        return 3
-      case 'unknown':
-        return 4
-      case 'local':
-      default:
-        return 5
-    }
-  }
-
-  const healthBadgeClass = (severity: HealthIssue['severity']) => {
-    switch (severity) {
-      case 'critical':
-        return 'bad'
-      case 'warning':
-        return 'warn'
-      case 'info':
-      default:
-        return 'muted'
-    }
-  }
-
-  const healthSummaryText = (state: UiState) => {
-    if (state.health.length === 0) {
-      return 'No active warnings'
-    }
-    const critical = state.health.filter((issue) => issue.severity === 'critical').length
-    const warning = state.health.filter((issue) => issue.severity === 'warning').length
-    if (critical > 0) {
-      return `${critical} critical`
-    }
-    if (warning > 0) {
-      return `${warning} warning${warning === 1 ? '' : 's'}`
-    }
-    return `${state.health.length} info`
-  }
-
-  const participantTransportBadgeText = (participant: ParticipantView) => {
-    switch (participant.state) {
-      case 'local':
-        return 'WireGuard self'
-      case 'online':
-        return 'WireGuard online'
-      case 'pending':
-        return 'WireGuard waiting'
-      case 'offline':
-        return 'WireGuard offline'
-      default:
-        return 'WireGuard unknown'
-    }
-  }
-
-  const participantPresenceBadgeText = (participant: ParticipantView) => {
-    switch (participant.presenceState) {
-      case 'local':
-        return 'Nostr self'
-      case 'present':
-        return 'Nostr present'
-      case 'absent':
-        return 'Nostr absent'
-      default:
-        return 'Nostr unknown'
-    }
-  }
-
-  const short = (value: string, head = 12, tail = 10) => {
-    if (value.length <= head + tail + 3) {
-      return value
-    }
-
-    return `${value.slice(0, head)}...${value.slice(-tail)}`
-  }
-
-  const activeNetwork = (state: UiState) =>
-    state.networks.find((network) => network.enabled) ?? state.networks[0]
-
-  const inactiveNetworks = (state: UiState) => state.networks.filter((network) => !network.enabled)
-
-  const inviteInviterParticipant = (network: NetworkView) =>
-    network.inviteInviterNpub
-      ? network.participants.find((participant) => participant.npub === network.inviteInviterNpub)
-      : undefined
-
-  const joinRequestButtonLabel = (network: NetworkView) => {
-    if (inviteInviterParticipant(network)?.state === 'online') {
-      return 'Connected'
-    }
-    if (network.outboundJoinRequest) {
-      return 'Requested'
-    }
-    return 'Request Join'
-  }
-
-  const joinRequestStatusText = (network: NetworkView) => {
-    if (inviteInviterParticipant(network)?.state === 'online') {
-      return 'Mesh connection received'
-    }
-    if (network.outboundJoinRequest) {
-      return `Requested ${network.outboundJoinRequest.requestedAtText}`
-    }
-    if (!network.inviteInviterNpub) {
-      return ''
-    }
-    return `Imported from ${network.inviteInviterNpub}. Send a Nostr join request if they have not added this device yet.`
   }
 
   const describeInviteScanError = (err: unknown) => {
@@ -716,311 +604,6 @@
       inviteScanError = String(err)
     }
   }
-
-  const heroStateBadgeClass = (state: UiState) => {
-    if (!state.vpnSessionControlSupported) {
-      return 'muted'
-    }
-    if (state.meshReady) {
-      return 'ok'
-    }
-    if (state.sessionActive || serviceInstallRecommended || serviceEnableRecommended) {
-      return 'warn'
-    }
-    return 'muted'
-  }
-
-  const heroSubtext = (state: UiState) => {
-    if (!state.vpnSessionControlSupported) {
-      return state.runtimeStatusDetail
-    }
-    const network = activeNetwork(state)
-    if ((serviceInstallRecommended || serviceEnableRecommended) && !state.sessionActive) {
-      return 'Install the background service for reliable startup, reconnects, and admin-free VPN switching.'
-    }
-    if (!state.sessionActive) {
-      return `Ready to connect ${network.name}.`
-    }
-    if (state.expectedPeerCount === 0) {
-      return `${network.name} is active, but no remote devices are configured yet.`
-    }
-    if (state.meshReady) {
-      return `${network.name} is fully connected across ${state.connectedPeerCount}/${state.expectedPeerCount} peers.`
-    }
-
-    const remaining = Math.max(state.expectedPeerCount - state.connectedPeerCount, 0)
-    return `${network.name} is waiting on ${remaining} more peer${remaining === 1 ? '' : 's'}.`
-  }
-
-  const heroBadgeText = (state: UiState) =>
-    state.vpnSessionControlSupported
-      ? heroStateText(state, { serviceInstallRecommended, serviceEnableRecommended })
-      : 'Preview'
-
-  const heroDetailText = (state: UiState) =>
-    state.vpnSessionControlSupported ? heroStatusDetailText(state) : ''
-
-  const platformLabel = (platform: string) =>
-    platform.length > 0 ? `${platform[0].toUpperCase()}${platform.slice(1)}` : 'Unknown'
-
-  const networkPeerSummary = (network: NetworkView) => {
-    const saved = `${network.participants.length} device${network.participants.length === 1 ? '' : 's'} saved`
-    if (network.enabled) {
-      return `${saved} • ${onlineDeviceSummary(network.onlineCount, network.expectedCount)}`
-    }
-    return saved
-  }
-
-  const networkAdminSummary = (network: NetworkView) => {
-    const count = network.adminNpubs.length
-    if (count === 0) {
-      return 'No admins configured'
-    }
-    if (network.localIsAdmin) {
-      return `You can manage members • ${count} admin${count === 1 ? '' : 's'} configured`
-    }
-    return `Managed by ${short(network.inviteInviterNpub || network.adminNpubs[0] || '')} • ${count} admin${count === 1 ? '' : 's'} configured`
-  }
-
-  const onlineDeviceSummary = (onlineCount: number, expectedCount: number) =>
-    `${onlineCount}/${expectedCount} device${expectedCount === 1 ? '' : 's'} online`
-
-  const networkHasParticipant = (network: NetworkView, npub: string) =>
-    network.participants.some((participant) => participant.npub === npub)
-
-  const exitNodeCandidates = (state: UiState) => {
-    const seen = new Set<string>()
-    const participants: ParticipantView[] = []
-
-    for (const network of state.networks) {
-      for (const participant of network.participants) {
-        if (participant.state === 'local' || seen.has(participant.npub)) {
-          continue
-        }
-        seen.add(participant.npub)
-        participants.push(participant)
-      }
-    }
-
-    return participants.sort((left, right) => {
-      const exitScore = Number(right.offersExitNode) - Number(left.offersExitNode)
-      if (exitScore !== 0) {
-        return exitScore
-      }
-      const stateScore = peerStatePriority(left.state) - peerStatePriority(right.state)
-      if (stateScore !== 0) {
-        return stateScore
-      }
-      return exitNodeOptionLabel(left).localeCompare(exitNodeOptionLabel(right))
-    })
-  }
-
-  const exitNodeOptionLabel = (participant: ParticipantView) => {
-    const base = participant.magicDnsName || participant.npub
-    return participant.offersExitNode
-      ? `${base} (offers private exit node)`
-      : `${base} (not offering private exit node)`
-  }
-
-  const filteredExitNodeCandidates = (state: UiState, query: string) => {
-    const normalized = query.trim().toLowerCase()
-    return exitNodeCandidates(state).filter((participant) => {
-      if (!normalized) {
-        return true
-      }
-      return (
-        participant.magicDnsName.toLowerCase().includes(normalized) ||
-        participant.magicDnsAlias.toLowerCase().includes(normalized) ||
-        participant.npub.toLowerCase().includes(normalized) ||
-        participant.tunnelIp.toLowerCase().includes(normalized)
-      )
-    })
-  }
-
-  const exitNodeAvailabilityClass = (participant: ParticipantView) => {
-    if (!participant.offersExitNode) {
-      return 'muted'
-    }
-    switch (participant.state) {
-      case 'online':
-        return 'ok'
-      case 'pending':
-        return 'warn'
-      case 'offline':
-        return 'bad'
-      default:
-        return 'muted'
-    }
-  }
-
-  const exitNodeAvailabilityText = (participant: ParticipantView) => {
-    if (!participant.offersExitNode) {
-      return 'Not offered'
-    }
-    switch (participant.state) {
-      case 'online':
-        return 'Ready'
-      case 'pending':
-        return 'Waiting'
-      case 'offline':
-        return 'Offline'
-      default:
-        return 'Unknown'
-    }
-  }
-
-  const offerExitNodeStatusText = (state: UiState) => {
-    const defaultRoutes = state.effectiveAdvertisedRoutes.filter(
-      (route) => route === '0.0.0.0/0' || route === '::/0',
-    )
-    const advertised = defaultRoutes.length > 0 ? defaultRoutes.join(', ') : '0.0.0.0/0, ::/0'
-
-    if (state.advertiseExitNode) {
-      return `Will advertise default routes: ${advertised}`
-    }
-
-    return 'Turn this on to offer this device as a private exit node.'
-  }
-
-  const additionalRoutesStatusText = (state: UiState) => {
-    if (state.advertisedRoutes.length === 0) {
-      return 'Optional extra LAN or subnet routes. Not needed for exit-node traffic.'
-    }
-
-    return `Currently advertising extra routes: ${state.advertisedRoutes.join(', ')}`
-  }
-
-  const routingSectionMetaText = (state: UiState) => {
-    if (state.exitNode && state.advertiseExitNode) {
-      return 'Using remote exit + sharing local exit'
-    }
-    if (state.exitNode) {
-      return 'Using remote exit'
-    }
-    if (state.advertiseExitNode) {
-      return 'Sharing local private exit'
-    }
-
-    return 'Direct mesh'
-  }
-
-  const routingModeStatusText = (state: UiState) => {
-    if (state.exitNode && state.advertiseExitNode) {
-      return 'Your internet-bound traffic uses the selected peer while this device also advertises private default routes to peers.'
-    }
-    if (state.exitNode) {
-      return selectedExitNodeStatusText(state)
-    }
-    if (state.advertiseExitNode) {
-      return 'This device is offering private default-route traffic to peers while your own internet-bound traffic stays local.'
-    }
-
-    return 'Internet-bound traffic stays local; only mesh routes are used.'
-  }
-
-  const selectedExitNodeStatusText = (state: UiState) => {
-    if (!state.exitNode) {
-      return 'Internet-bound traffic stays local; only mesh routes are used.'
-    }
-
-    const selected = exitNodeCandidates(state).find((participant) => participant.npub === state.exitNode)
-    if (!selected) {
-      return 'Selected exit node is not present in the current network view.'
-    }
-
-    const label = selected.magicDnsName || selected.npub
-    if (!selected.offersExitNode) {
-      return `${label} is selected, but it is not offering exit-node traffic right now.`
-    }
-
-    switch (selected.state) {
-      case 'online':
-        return `${label} is selected and ready to carry internet-bound traffic.`
-      case 'pending':
-        return `${label} is selected, but WireGuard is still waiting for a handshake.`
-      case 'offline':
-        return `${label} is selected, but it is currently offline.`
-      default:
-        return `${label} is selected; availability is still being checked.`
-    }
-  }
-
-  const publicRelayFallbackStatusText = (state: UiState) => {
-    if (state.usePublicRelayFallback) {
-      return 'If a peer cannot be reached directly, nostr-vpn will try discoverable public relays before giving up.'
-    }
-
-    return 'Only direct peer paths will be used. Devices on restrictive networks may stay offline until a direct path works.'
-  }
-
-  const formatTrafficBytes = (bytes: number) => {
-    if (!Number.isFinite(bytes) || bytes <= 0) {
-      return '0 B'
-    }
-
-    const units = ['B', 'KB', 'MB', 'GB', 'TB']
-    let value = bytes
-    let unitIndex = 0
-    while (value >= 1024 && unitIndex < units.length - 1) {
-      value /= 1024
-      unitIndex += 1
-    }
-    const digits = unitIndex === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2
-    return `${value.toFixed(digits)} ${units[unitIndex]}`
-  }
-
-  const participantTrafficText = (participant: ParticipantView) =>
-    `rx ${formatTrafficBytes(participant.rxBytes)} · tx ${formatTrafficBytes(participant.txBytes)}`
-
-  const formatTrafficRate = (bytesPerSecond: number) =>
-    `${formatTrafficBytes(bytesPerSecond)}/s`
-
-  const relayFallbackParticipants = (network: NetworkView) =>
-    network.participants.filter((participant) => participant.relayPathActive)
-
-  const relayFallbackSummaryText = (network: NetworkView) => {
-    const participants = relayFallbackParticipants(network)
-    if (participants.length === 0) {
-      return 'No peers are currently using relay fallback.'
-    }
-
-    const totals = participants.reduce(
-      (acc, participant) => ({
-        rx: acc.rx + participant.rxBytes,
-        tx: acc.tx + participant.txBytes,
-      }),
-      { rx: 0, tx: 0 },
-    )
-    const verb = participants.length === 1 ? 'is' : 'are'
-    return `${participants.length} peer${participants.length === 1 ? '' : 's'} ${verb} currently using relay fallback · rx ${formatTrafficBytes(totals.rx)} · tx ${formatTrafficBytes(totals.tx)}`
-  }
-
-  const relayOperatorSummaryText = (state: UiState) => {
-    const relay = state.relayOperator
-    if (!relay) {
-      return 'No local relay operator snapshot yet.'
-    }
-
-    if (relay.activeSessionCount === 0) {
-      return `No active relayed sessions right now · total ${formatTrafficBytes(relay.totalForwardedBytes)} across ${relay.totalSessionsServed} sessions`
-    }
-
-    return `${relay.activeSessionCount} active relayed session${relay.activeSessionCount === 1 ? '' : 's'} · ${formatTrafficRate(relay.currentForwardBps)} · total ${formatTrafficBytes(relay.totalForwardedBytes)}`
-  }
-
-  const relaySessionTrafficText = (bytesFromRequester: number, bytesFromTarget: number) =>
-    `A→B ${formatTrafficBytes(bytesFromRequester)} · B→A ${formatTrafficBytes(bytesFromTarget)}`
-
-  const formatCountdown = (totalSecs: number) => {
-    const minutes = Math.floor(totalSecs / 60)
-    const seconds = totalSecs % 60
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`
-  }
-
-  const lanPairingHelpText = (state: UiState) =>
-    state.lanPairingActive
-      ? 'Nearby devices can join this mesh directly while pairing is active.'
-      : 'Broadcast this invite on the local network for 15 minutes so nearby devices can join.'
 
   function syncLanPairingCountdown() {
     const now = Date.now()
