@@ -3929,7 +3929,25 @@ fn refresh_public_signal_endpoint(
             listen_port,
             endpoint,
         })
-        .or_else(|| previous.filter(|endpoint| endpoint.listen_port == listen_port));
+        .or_else(|| fallback_public_signal_endpoint(previous.as_ref(), listen_port));
+}
+
+fn fallback_public_signal_endpoint(
+    previous: Option<&DiscoveredPublicSignalEndpoint>,
+    listen_port: u16,
+) -> Option<DiscoveredPublicSignalEndpoint> {
+    let previous = previous?.clone();
+    if previous.listen_port != listen_port {
+        return None;
+    }
+
+    // If fresh discovery fails after a restart, prefer the same public host on the
+    // current listen port instead of indefinitely re-announcing a stale external port.
+    let endpoint = endpoint_with_listen_port(&previous.endpoint, listen_port);
+    Some(DiscoveredPublicSignalEndpoint {
+        listen_port,
+        endpoint,
+    })
 }
 
 fn sync_public_signal_endpoint_from_mapping_or_stun(

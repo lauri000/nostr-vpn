@@ -207,7 +207,10 @@ pub(crate) async fn connect_session(args: ConnectArgs) -> Result<()> {
                         "connect: failed to ensure macOS underlay default route: {error}"
                     ),
                 }
-                let latest_snapshot = capture_network_snapshot();
+                let latest_snapshot = crate::diagnostics::prefer_nonempty_network_snapshot(
+                    &network_snapshot,
+                    capture_network_snapshot(),
+                );
                 let runtime_listen_port =
                     tunnel_runtime.active_listen_port.unwrap_or(app.node.listen_port);
                 let network_changed = latest_snapshot.changed_since(&network_snapshot);
@@ -990,7 +993,10 @@ pub(crate) async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         "daemon: failed to ensure macOS underlay default route: {error}"
                     ),
                 }
-                let latest_snapshot = capture_network_snapshot();
+                let latest_snapshot = crate::diagnostics::prefer_nonempty_network_snapshot(
+                    &network_snapshot,
+                    capture_network_snapshot(),
+                );
                 let runtime_listen_port =
                     tunnel_runtime.active_listen_port.unwrap_or(app.node.listen_port);
                 let session_active = daemon_session_active(session_enabled, expected_peers);

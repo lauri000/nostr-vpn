@@ -80,6 +80,29 @@ impl NetworkSnapshot {
     }
 }
 
+#[must_use]
+pub(crate) fn prefer_nonempty_network_snapshot(
+    previous: &NetworkSnapshot,
+    latest: NetworkSnapshot,
+) -> NetworkSnapshot {
+    let latest_is_empty = latest.default_interface.is_none()
+        && latest.primary_ipv4.is_none()
+        && latest.primary_ipv6.is_none()
+        && latest.gateway_ipv4.is_none()
+        && latest.gateway_ipv6.is_none();
+    let previous_has_underlay = previous.default_interface.is_some()
+        || previous.primary_ipv4.is_some()
+        || previous.primary_ipv6.is_some()
+        || previous.gateway_ipv4.is_some()
+        || previous.gateway_ipv6.is_some();
+
+    if latest_is_empty && previous_has_underlay {
+        previous.clone()
+    } else {
+        latest
+    }
+}
+
 pub(crate) fn capture_network_snapshot() -> NetworkSnapshot {
     #[cfg(target_os = "macos")]
     {
@@ -448,7 +471,7 @@ mod tests {
     use super::probes::{probe_nat_pmp_server, probe_pcp_server, probe_upnp_ssdp_server};
     use super::{
         CaptivePortalEndpoint, NetworkSnapshot, build_health_issues, check_captive_portal_endpoint,
-        mapping_varies_by_dest_ip, parse_http_response,
+        mapping_varies_by_dest_ip, parse_http_response, prefer_nonempty_network_snapshot,
     };
     use nostr_vpn_core::config::AppConfig;
     use nostr_vpn_core::diagnostics::ProbeState;
@@ -474,6 +497,20 @@ mod tests {
         };
 
         assert!(right.changed_since(&left));
+    }
+
+    #[test]
+    fn empty_network_snapshot_does_not_replace_known_underlay() {
+        let previous = NetworkSnapshot {
+            default_interface: Some("en0".to_string()),
+            primary_ipv4: Some(Ipv4Addr::new(192, 168, 64, 2)),
+            gateway_ipv4: Some(Ipv4Addr::new(192, 168, 64, 1)),
+            ..NetworkSnapshot::default()
+        };
+
+        let preferred = prefer_nonempty_network_snapshot(&previous, NetworkSnapshot::default());
+
+        assert_eq!(preferred, previous);
     }
 
     #[test]

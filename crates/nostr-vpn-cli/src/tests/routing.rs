@@ -659,6 +659,32 @@ fn mapped_public_signal_endpoint_accepts_public_address() {
 }
 
 #[test]
+fn fallback_public_signal_endpoint_normalizes_stale_port_to_listen_port() {
+    let previous = DiscoveredPublicSignalEndpoint {
+        listen_port: 51820,
+        endpoint: "198.51.100.20:40787".to_string(),
+    };
+
+    assert_eq!(
+        fallback_public_signal_endpoint(Some(&previous), 51820),
+        Some(DiscoveredPublicSignalEndpoint {
+            listen_port: 51820,
+            endpoint: "198.51.100.20:51820".to_string(),
+        })
+    );
+}
+
+#[test]
+fn fallback_public_signal_endpoint_rejects_mismatched_listen_port() {
+    let previous = DiscoveredPublicSignalEndpoint {
+        listen_port: 51820,
+        endpoint: "198.51.100.20:40787".to_string(),
+    };
+
+    assert_eq!(fallback_public_signal_endpoint(Some(&previous), 52000), None);
+}
+
+#[test]
 fn peer_announcement_includes_effective_advertised_routes() {
     let mut config = AppConfig::generated();
     config.node.advertise_exit_node = true;
