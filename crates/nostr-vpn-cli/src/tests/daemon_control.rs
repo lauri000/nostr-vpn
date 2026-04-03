@@ -254,6 +254,34 @@ fn macos_tunnel_default_route_targets_use_split_defaults() {
 }
 
 #[test]
+fn macos_direct_route_args_use_bsd_iface_form() {
+    assert_eq!(
+        crate::macos_network::macos_direct_route_args("add", "0.0.0.0/0", "utun100"),
+        vec![
+            "-q".to_string(),
+            "-n".to_string(),
+            "add".to_string(),
+            "-inet".to_string(),
+            "0.0.0.0/0".to_string(),
+            "-iface".to_string(),
+            "utun100".to_string(),
+        ]
+    );
+    assert_eq!(
+        crate::macos_network::macos_direct_route_args("delete", "203.0.113.8/32", "utun100"),
+        vec![
+            "-q".to_string(),
+            "-n".to_string(),
+            "delete".to_string(),
+            "-inet".to_string(),
+            "203.0.113.8/32".to_string(),
+            "-iface".to_string(),
+            "utun100".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn macos_ifconfig_has_ipv4_matches_exact_interface_address() {
     let output = "utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380\n\
 \tinet 10.44.10.23 --> 10.44.10.23 netmask 0xffffffff\n\

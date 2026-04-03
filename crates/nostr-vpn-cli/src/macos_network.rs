@@ -169,6 +169,28 @@ pub(crate) fn macos_tunnel_default_route_targets() -> &'static [&'static str] {
     &["0.0.0.0/1", "128.0.0.0/1"]
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_direct_route_family(target: &str) -> &'static str {
+    if strip_cidr(target).contains(':') {
+        "-inet6"
+    } else {
+        "-inet"
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn macos_direct_route_args(action: &str, target: &str, iface: &str) -> Vec<String> {
+    vec![
+        "-q".to_string(),
+        "-n".to_string(),
+        action.to_string(),
+        macos_direct_route_family(target).to_string(),
+        target.to_string(),
+        "-iface".to_string(),
+        iface.to_string(),
+    ]
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn apply_macos_default_route(
     gateway: Option<&str>,
@@ -180,12 +202,8 @@ pub(super) fn apply_macos_default_route(
 
     if gateway.is_none() {
         let iface = ifscope.ok_or_else(|| anyhow!("missing interface for direct default route"))?;
-        for target in macos_tunnel_default_route_targets() {
-            apply_macos_route_spec(target, None, Some(iface)).with_context(|| {
-                format!("failed to install macOS split default route {target} on {iface}")
-            })?;
-        }
-        return Ok(());
+        return apply_macos_route_spec("0.0.0.0/0", None, Some(iface))
+            .with_context(|| format!("failed to install macOS default route on {iface}"));
     }
 
     let mut change = ProcessCommand::new("route");
@@ -245,6 +263,20 @@ pub(super) fn apply_macos_route_spec(
     gateway: Option<&str>,
     ifscope: Option<&str>,
 ) -> Result<()> {
+    if gateway.is_none() {
+        let iface = ifscope.ok_or_else(|| anyhow!("missing interface for direct route"))?;
+        let mut add = ProcessCommand::new("route");
+        add.args(macos_direct_route_args("add", target, iface));
+        return match run_checked(&mut add) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let mut change = ProcessCommand::new("route");
+                change.args(macos_direct_route_args("change", target, iface));
+                run_checked(&mut change)
+            }
+        };
+    }
+
     let target_ip = strip_cidr(target);
     let is_host = target.ends_with("/32") || !target.contains('/');
 
@@ -295,14 +327,17 @@ pub(super) fn apply_macos_route_spec(
 
 #[cfg(target_os = "macos")]
 fn delete_macos_route_spec(target: &str, ifscope: Option<&str>) -> Result<()> {
+    if let Some(iface) = ifscope {
+        let mut delete = ProcessCommand::new("route");
+        delete.args(macos_direct_route_args("delete", target, iface));
+        return run_checked(&mut delete);
+    }
+
     let target_ip = strip_cidr(target);
     let is_host = target.ends_with("/32") || !target.contains('/');
 
     let mut delete = ProcessCommand::new("route");
     delete.arg("-n").arg("delete");
-    if let Some(ifscope) = ifscope {
-        delete.arg("-ifscope").arg(ifscope);
-    }
     if is_host {
         delete.arg("-host").arg(target_ip);
     } else if target == "0.0.0.0/0" {
