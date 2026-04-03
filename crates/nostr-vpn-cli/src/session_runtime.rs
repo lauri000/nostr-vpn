@@ -37,7 +37,13 @@ pub(crate) async fn connect_session(args: ConnectArgs) -> Result<()> {
     let mut network_snapshot = capture_network_snapshot();
     let timeout = network_probe_timeout(&app);
     let mut port_mapping_runtime = PortMappingRuntime::default();
-    let mut public_signal_endpoint = None;
+    let mut public_signal_endpoint = restored_public_signal_endpoint_from_state(
+        read_daemon_state(&daemon_state_file_path(&config_path))
+            .ok()
+            .flatten()
+            .as_ref(),
+        app.node.listen_port,
+    );
 
     let mut client = NostrSignalingClient::from_secret_key_with_networks(
         &app.nostr.secret_key,
@@ -592,7 +598,10 @@ pub(crate) async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let timeout = network_probe_timeout(&app);
     let mut captive_portal = detect_captive_portal(timeout).await;
     let mut port_mapping_runtime = PortMappingRuntime::default();
-    let mut public_signal_endpoint = None;
+    let mut public_signal_endpoint = restored_public_signal_endpoint_from_state(
+        read_daemon_state(&state_file).ok().flatten().as_ref(),
+        app.node.listen_port,
+    );
     let mut last_written_peer_cache = None;
     let mut relay_operator_runtime = LocalRelayOperatorRuntime {
         status: if app.relay_for_others {
