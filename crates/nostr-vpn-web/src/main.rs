@@ -12,6 +12,7 @@ use clap::Parser;
 use tower_http::services::{ServeDir, ServeFile};
 
 mod invite;
+mod network_views;
 mod nvpn_cli;
 mod ui_models;
 mod ui_types;
