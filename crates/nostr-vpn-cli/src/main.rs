@@ -1,4 +1,8 @@
 mod diagnostics;
+#[cfg(any(target_os = "macos", test))]
+mod macos_network;
+#[cfg(any(target_os = "macos", test))]
+mod macos_service;
 #[cfg(any(target_os = "windows", test))]
 mod userspace_wg;
 #[cfg(any(target_os = "windows", test))]
@@ -9,8 +13,11 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", test))]
+use std::hash::{Hash, Hasher};
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::net::ToSocketAddrs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 #[cfg(unix)]
@@ -26,12 +33,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 #[cfg(unix)]
 use boringtun::device::{DeviceConfig, DeviceHandle};
 use clap::{Args, Parser, Subcommand};
 use hex::encode as encode_hex;
 use netdev::get_interfaces;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use netdev::interface::interface::Interface as NetworkInterface;
+use nostr_sdk::prelude::ToBech32;
 use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, maybe_autoconfigure_node, normalize_advertised_route,
     normalize_nostr_pubkey, normalize_runtime_network_id,
@@ -139,8 +149,6 @@ const RELAY_PROVIDER_PROBE_TIMEOUT_SECS: u64 = 4;
 const RELAY_PROVIDER_PROBE_RETRY_AFTER_SECS: u64 = 60;
 const MAX_PARALLEL_RELAY_PROVIDER_PROBES: usize = 2;
 const MAX_PARALLEL_RELAY_REQUESTS_PER_PARTICIPANT: usize = 3;
-const DEBUG_LOG_MAX_BYTES: u64 = 512 * 1024;
-const DEBUG_LOG_KEEP_BYTES: usize = 384 * 1024;
 const MIN_PERSISTED_PEER_CACHE_TIMEOUT_SECS: u64 = 600;
 const PERSISTED_PEER_CACHE_TIMEOUT_MULTIPLIER: u64 = 30;
 const MIN_PERSISTED_PATH_CACHE_TIMEOUT_SECS: u64 = 1_800;
@@ -226,6 +234,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show the running CLI version.
+    Version(VersionArgs),
     /// Install `nvpn` into a platform-appropriate default PATH location.
     InstallCli(InstallCliArgs),
     /// Remove an `nvpn` binary previously installed into PATH.
@@ -238,6 +248,8 @@ enum Command {
     Start(StartArgs),
     /// Stop a background daemon started by `nvpn start --daemon`.
     Stop(StopArgs),
+    /// Repair local network state left behind by a stopped or crashed VPN session.
+    RepairNetwork(RepairNetworkArgs),
     /// Ask the running daemon to reload config and peer set.
     Reload(ReloadArgs),
     /// Pause VPN networking while keeping daemon running.
@@ -252,6 +264,20 @@ enum Command {
     Status(StatusArgs),
     /// Update persisted node/network settings.
     Set(SetArgs),
+    /// Emit an `nvpn://invite/...` code for the active network.
+    CreateInvite(CreateInviteArgs),
+    /// Import an `nvpn://invite/...` code into the active network config.
+    ImportInvite(ImportInviteArgs),
+    /// Add one or more participants to the active network roster.
+    AddParticipant(UpdateRosterArgs),
+    /// Remove one or more participants from the active network roster.
+    RemoveParticipant(UpdateRosterArgs),
+    /// Add one or more admins to the active network roster.
+    AddAdmin(UpdateRosterArgs),
+    /// Remove one or more admins from the active network roster.
+    RemoveAdmin(UpdateRosterArgs),
+    /// Publish the active admin-signed roster over Nostr immediately.
+    PublishRoster(PublishRosterArgs),
     /// Ping a peer by node ID or tunnel IP.
     Ping(PingArgs),
     /// Check relay reachability and latency.
@@ -328,6 +354,12 @@ struct InstallCliArgs {
     /// Overwrite destination if it already exists.
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args)]
+struct VersionArgs {
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -506,6 +538,12 @@ struct StopArgs {
 }
 
 #[derive(Debug, Args)]
+struct RepairNetworkArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct ReloadArgs {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -583,6 +621,49 @@ struct SetArgs {
     provide_nat_assist: Option<bool>,
     #[arg(long)]
     autoconnect: Option<bool>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CreateInviteArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ImportInviteArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    invite: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PublishRosterArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    relay: Vec<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct UpdateRosterArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    network_id: Option<String>,
+    #[arg(long = "participant", required = true)]
+    participants: Vec<String>,
+    #[arg(long)]
+    publish: bool,
+    #[arg(long = "relay")]
+    relays: Vec<String>,
     #[arg(long)]
     json: bool,
 }
@@ -754,6 +835,9 @@ async fn run_command(command: Command) -> Result<()> {
                 println!("public_key={}", pair.public_key);
             }
         }
+        Command::Version(args) => {
+            print_version(args)?;
+        }
         Command::InstallCli(args) => {
             install_cli(args)?;
         }
@@ -815,6 +899,9 @@ async fn run_command(command: Command) -> Result<()> {
         }
         Command::Stop(args) => {
             stop_daemon(args)?;
+        }
+        Command::RepairNetwork(args) => {
+            repair_network(args)?;
         }
         Command::Reload(args) => {
             reload_daemon(args)?;
@@ -915,6 +1002,8 @@ async fn run_command(command: Command) -> Result<()> {
             };
 
             if args.json {
+                let endpoint = status_endpoint(&app, &daemon);
+                let listen_port = status_listen_port(&app, &daemon);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
@@ -924,7 +1013,10 @@ async fn run_command(command: Command) -> Result<()> {
                         "autoconnect": app.autoconnect,
                         "node_id": app.node.id,
                         "tunnel_ip": app.node.tunnel_ip,
-                        "endpoint": app.node.endpoint,
+                        "endpoint": endpoint,
+                        "configured_endpoint": app.node.endpoint,
+                        "listen_port": listen_port,
+                        "configured_listen_port": app.node.listen_port,
                         "exit_node": if app.exit_node.is_empty() {
                             None::<String>
                         } else {
@@ -932,7 +1024,7 @@ async fn run_command(command: Command) -> Result<()> {
                         },
                         "advertise_exit_node": app.node.advertise_exit_node,
                         "advertised_routes": app.node.advertised_routes,
-                        "effective_advertised_routes": app.effective_advertised_routes(),
+                        "effective_advertised_routes": runtime_effective_advertised_routes(&app),
                         "relays": relays,
                         "relay_for_others": app.relay_for_others,
                         "provide_nat_assist": app.provide_nat_assist,
@@ -944,19 +1036,28 @@ async fn run_command(command: Command) -> Result<()> {
                     }))?
                 );
             } else {
+                let endpoint = status_endpoint(&app, &daemon);
+                let listen_port = status_listen_port(&app, &daemon);
                 println!("network: {network_id}");
                 println!("magic_dns_suffix: {}", app.magic_dns_suffix);
                 println!("autoconnect: {}", app.autoconnect);
                 println!("node: {}", app.node.id);
                 println!("tunnel_ip: {}", app.node.tunnel_ip);
-                println!("endpoint: {}", app.node.endpoint);
+                println!("endpoint: {endpoint}");
+                println!("listen_port: {listen_port}");
+                if endpoint != app.node.endpoint {
+                    println!("configured_endpoint: {}", app.node.endpoint);
+                }
+                if listen_port != app.node.listen_port {
+                    println!("configured_listen_port: {}", app.node.listen_port);
+                }
                 if app.exit_node.is_empty() {
                     println!("exit_node: none");
                 } else {
                     println!("exit_node: {}", app.exit_node);
                 }
                 println!("advertise_exit_node: {}", app.node.advertise_exit_node);
-                let effective_routes = app.effective_advertised_routes();
+                let effective_routes = runtime_effective_advertised_routes(&app);
                 if effective_routes.is_empty() {
                     println!("advertised_routes: none");
                 } else {
@@ -1044,6 +1145,7 @@ async fn run_command(command: Command) -> Result<()> {
             app.ensure_defaults();
             maybe_autoconfigure_node(&mut app);
             app.save(&config_path)?;
+            maybe_reload_running_daemon(&config_path);
 
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&app)?);
@@ -1051,6 +1153,85 @@ async fn run_command(command: Command) -> Result<()> {
                 println!("saved {}", config_path.display());
                 println!("network_id={}", app.effective_network_id());
                 println!("node_id={}", app.node.id);
+            }
+        }
+        Command::CreateInvite(args) => {
+            let config_path = args.config.unwrap_or_else(default_config_path);
+            let app = load_or_default_config(&config_path)?;
+            let invite = active_network_invite_code(&app)?;
+
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "network_id": app.effective_network_id(),
+                        "invite": invite,
+                    }))?
+                );
+            } else {
+                println!("{invite}");
+            }
+        }
+        Command::ImportInvite(args) => {
+            let config_path = args.config.unwrap_or_else(default_config_path);
+            let mut app = load_or_default_config(&config_path)?;
+            let invite = parse_network_invite(&args.invite)?;
+            apply_network_invite_to_active_network(&mut app, &invite)?;
+            app.ensure_defaults();
+            maybe_autoconfigure_node(&mut app);
+            app.save(&config_path)?;
+            maybe_reload_running_daemon(&config_path);
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&app)?);
+            } else {
+                println!("saved {}", config_path.display());
+                println!("network_id={}", app.effective_network_id());
+                println!("invite_imported={}", invite.network_name);
+            }
+        }
+        Command::AddParticipant(args) => {
+            update_active_network_roster(args, RosterEditAction::AddParticipant).await?;
+        }
+        Command::RemoveParticipant(args) => {
+            update_active_network_roster(args, RosterEditAction::RemoveParticipant).await?;
+        }
+        Command::AddAdmin(args) => {
+            update_active_network_roster(args, RosterEditAction::AddAdmin).await?;
+        }
+        Command::RemoveAdmin(args) => {
+            update_active_network_roster(args, RosterEditAction::RemoveAdmin).await?;
+        }
+        Command::PublishRoster(args) => {
+            let config_path = args.config.unwrap_or_else(default_config_path);
+            let app = load_or_default_config(&config_path)?;
+            let relays = resolve_relays(&args.relay, &app);
+            let client = NostrSignalingClient::from_secret_key_with_networks(
+                &app.nostr.secret_key,
+                signaling_networks_for_app(&app),
+            )?;
+            client
+                .connect(&relays)
+                .await
+                .context("failed to connect signaling client")?;
+            let published = publish_active_network_roster(&client, &app, None).await?;
+            client.disconnect().await;
+
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "published_recipients": published,
+                        "network_id": app.effective_network_id(),
+                        "relays": relays,
+                    }))?
+                );
+            } else {
+                println!(
+                    "published roster for {} to {} recipient(s)",
+                    app.effective_network_id(),
+                    published
+                );
             }
         }
         Command::Ping(args) => {
@@ -1354,6 +1535,354 @@ fn parse_peer_arg(value: &str) -> Result<PeerConfig> {
     })
 }
 
+fn runtime_effective_advertised_routes(app: &AppConfig) -> Vec<String> {
+    let mut routes = app.effective_advertised_routes();
+    #[cfg(target_os = "macos")]
+    {
+        routes.retain(|route| route != "::/0");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        routes.retain(|route| !is_default_exit_node_route(route));
+    }
+    routes
+}
+
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
+fn is_default_exit_node_route(route: &str) -> bool {
+    matches!(route, "0.0.0.0/0" | "::/0")
+}
+
+const NETWORK_INVITE_PREFIX: &str = "nvpn://invite/";
+const NETWORK_INVITE_VERSION: u8 = 2;
+
+fn parse_network_invite(value: &str) -> Result<NetworkInvite> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("invite code is empty"));
+    }
+
+    let mut invite = if trimmed.starts_with('{') {
+        serde_json::from_str::<NetworkInvite>(trimmed)
+            .context("failed to parse network invite JSON")?
+    } else {
+        let payload = trimmed
+            .strip_prefix(NETWORK_INVITE_PREFIX)
+            .unwrap_or(trimmed);
+        let decoded = URL_SAFE_NO_PAD
+            .decode(payload)
+            .context("failed to decode network invite payload")?;
+        serde_json::from_slice::<NetworkInvite>(&decoded)
+            .context("failed to parse network invite payload")?
+    };
+
+    if invite.v != 1 && invite.v != NETWORK_INVITE_VERSION {
+        return Err(anyhow!(
+            "unsupported invite version {}; expected 1 or {}",
+            invite.v,
+            NETWORK_INVITE_VERSION
+        ));
+    }
+
+    invite.network_name = invite.network_name.trim().to_string();
+    if invite.network_name.is_empty() {
+        return Err(anyhow!("invite network name is empty"));
+    }
+
+    invite.network_id = invite.network_id.trim().to_string();
+    if invite.network_id.is_empty() {
+        return Err(anyhow!("invite network id is empty"));
+    }
+
+    invite.inviter_npub = normalize_nostr_pubkey(&invite.inviter_npub)?;
+    invite.inviter_node_name = invite.inviter_node_name.trim().to_string();
+    invite.admins = normalized_invite_pubkeys(&invite.admins)?;
+    if !invite
+        .admins
+        .iter()
+        .any(|admin| admin == &invite.inviter_npub)
+    {
+        invite.admins.push(invite.inviter_npub.clone());
+        invite.admins.sort();
+        invite.admins.dedup();
+    }
+    invite.participants = normalized_invite_pubkeys(&invite.participants)?;
+    if invite.participants.is_empty() {
+        invite.participants.push(invite.inviter_npub.clone());
+    }
+    invite.relays = normalized_invite_relays(&invite.relays)?;
+
+    Ok(invite)
+}
+
+fn apply_network_invite_to_active_network(
+    config: &mut AppConfig,
+    invite: &NetworkInvite,
+) -> Result<()> {
+    let normalized_invite_network_id = normalize_runtime_network_id(&invite.network_id);
+    let normalized_inviter_pubkey = normalize_nostr_pubkey(&invite.inviter_npub)?;
+    let own_pubkey = config.own_nostr_pubkey_hex().ok();
+    let invite_admins = invite
+        .admins
+        .iter()
+        .map(|admin| normalize_nostr_pubkey(admin))
+        .collect::<Result<Vec<_>>>()?;
+    let invite_participants = invite
+        .participants
+        .iter()
+        .map(|participant| normalize_nostr_pubkey(participant))
+        .collect::<Result<Vec<_>>>()?;
+
+    if let Some(existing_id) = config
+        .networks
+        .iter()
+        .find(|network| {
+            normalize_runtime_network_id(&network.network_id) == normalized_invite_network_id
+        })
+        .map(|network| network.id.clone())
+    {
+        config.set_network_enabled(&existing_id, true)?;
+    } else {
+        let network_id = config.active_network().id.clone();
+        config.set_network_enabled(&network_id, true)?;
+        config.set_network_mesh_id(&network_id, &invite.network_id)?;
+    }
+
+    let network = config.active_network_mut();
+    if network.participants.is_empty() {
+        network.name = invite.network_name.trim().to_string();
+    }
+    network.network_id = invite.network_id.clone();
+    network.participants.clear();
+    for participant in &invite_participants {
+        if own_pubkey.as_deref() == Some(participant.as_str()) {
+            continue;
+        }
+        network.participants.push(participant.clone());
+    }
+    network.participants.sort();
+    network.participants.dedup();
+
+    network.admins = invite_admins;
+    if !network
+        .admins
+        .iter()
+        .any(|admin| admin == &normalized_inviter_pubkey)
+    {
+        network.admins.push(normalized_inviter_pubkey.clone());
+    }
+    network.admins.sort();
+    network.admins.dedup();
+    network.invite_inviter = normalized_inviter_pubkey;
+
+    for relay in &invite.relays {
+        if !config.nostr.relays.iter().any(|existing| existing == relay) {
+            config.nostr.relays.push(relay.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn normalized_invite_pubkeys(pubkeys: &[String]) -> Result<Vec<String>> {
+    let mut normalized = pubkeys
+        .iter()
+        .map(|pubkey| normalize_nostr_pubkey(pubkey))
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalized_invite_relays(relays: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for relay in relays {
+        let relay = relay.trim();
+        if relay.is_empty() {
+            continue;
+        }
+        if !is_valid_relay_url(relay) {
+            return Err(anyhow!("invalid invite relay '{relay}'"));
+        }
+        if !normalized.iter().any(|existing| existing == relay) {
+            normalized.push(relay.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
+fn is_valid_relay_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("wss://") || trimmed.starts_with("ws://")
+}
+
+fn maybe_reload_running_daemon(config_path: &Path) {
+    let status = match daemon_status(config_path) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("config: failed to inspect daemon status after save: {error}");
+            return;
+        }
+    };
+    if !status.running {
+        return;
+    }
+    clear_daemon_control_result(config_path);
+    if let Err(error) = request_daemon_reload(config_path) {
+        eprintln!("config: failed to request daemon reload after save: {error}");
+        return;
+    }
+    if let Err(error) = wait_for_daemon_control_ack(config_path, Duration::from_secs(2)) {
+        eprintln!("config: daemon did not acknowledge reload after save: {error}");
+        return;
+    }
+    if let Err(error) = wait_for_daemon_control_result(
+        config_path,
+        DaemonControlRequest::Reload,
+        Duration::from_secs(2),
+    ) {
+        eprintln!("config: daemon reload after save failed: {error}");
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RosterEditAction {
+    AddParticipant,
+    RemoveParticipant,
+    AddAdmin,
+    RemoveAdmin,
+}
+
+fn to_npub(pubkey_hex: &str) -> String {
+    nostr_sdk::PublicKey::from_hex(pubkey_hex)
+        .ok()
+        .and_then(|pubkey| pubkey.to_bech32().ok())
+        .unwrap_or_else(|| pubkey_hex.to_string())
+}
+
+fn active_network_invite_code(config: &AppConfig) -> Result<String> {
+    let active_network = config.active_network();
+    let roster = config.shared_network_roster(&active_network.id)?;
+    let own_pubkey = config.own_nostr_pubkey_hex().ok();
+    let inviter_pubkey = own_pubkey
+        .as_deref()
+        .filter(|pubkey| config.is_network_admin(&active_network.id, pubkey))
+        .map(str::to_string)
+        .or_else(|| {
+            if !active_network.invite_inviter.is_empty()
+                && active_network
+                    .admins
+                    .iter()
+                    .any(|admin| admin == &active_network.invite_inviter)
+            {
+                Some(active_network.invite_inviter.clone())
+            } else {
+                active_network.admins.first().cloned()
+            }
+        })
+        .ok_or_else(|| anyhow!("active network has no admin configured"))?;
+    let invite = NetworkInvite {
+        v: NETWORK_INVITE_VERSION,
+        network_name: active_network.name.trim().to_string(),
+        network_id: roster.network_id,
+        inviter_npub: to_npub(&inviter_pubkey),
+        inviter_node_name: if own_pubkey.as_deref() == Some(inviter_pubkey.as_str()) {
+            config.node_name.trim().to_string()
+        } else {
+            config.peer_alias(&inviter_pubkey).unwrap_or_default()
+        },
+        admins: roster.admins.iter().map(|admin| to_npub(admin)).collect(),
+        participants: roster
+            .participants
+            .iter()
+            .map(|participant| to_npub(participant))
+            .collect(),
+        relays: normalized_invite_relays(&config.nostr.relays)?,
+    };
+    let encoded = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&invite).context("failed to encode network invite JSON")?);
+    Ok(format!("{NETWORK_INVITE_PREFIX}{encoded}"))
+}
+
+async fn update_active_network_roster(
+    args: UpdateRosterArgs,
+    action: RosterEditAction,
+) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let mut app = load_or_default_config(&config_path)?;
+    if let Some(network_id) = args.network_id {
+        app.set_active_network_id(&network_id)?;
+    }
+    let active_network_id = app.active_network().id.clone();
+
+    let mut changed = Vec::new();
+    for participant in &args.participants {
+        let normalized = match action {
+            RosterEditAction::AddParticipant => {
+                app.add_participant_to_network(&active_network_id, participant)?
+            }
+            RosterEditAction::RemoveParticipant => {
+                let normalized = normalize_nostr_pubkey(participant)?;
+                app.remove_participant_from_network(&active_network_id, participant)?;
+                normalized
+            }
+            RosterEditAction::AddAdmin => {
+                app.add_admin_to_network(&active_network_id, participant)?
+            }
+            RosterEditAction::RemoveAdmin => {
+                let normalized = normalize_nostr_pubkey(participant)?;
+                app.remove_admin_from_network(&active_network_id, participant)?;
+                normalized
+            }
+        };
+        changed.push(normalized);
+    }
+
+    app.ensure_defaults();
+    maybe_autoconfigure_node(&mut app);
+    app.save(&config_path)?;
+    maybe_reload_running_daemon(&config_path);
+
+    let mut published = 0usize;
+    let relays = resolve_relays(&args.relays, &app);
+    if args.publish {
+        let client = NostrSignalingClient::from_secret_key_with_networks(
+            &app.nostr.secret_key,
+            signaling_networks_for_app(&app),
+        )?;
+        client
+            .connect(&relays)
+            .await
+            .context("failed to connect signaling client")?;
+        published = publish_active_network_roster(&client, &app, None).await?;
+        client.disconnect().await;
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "network_id": app.effective_network_id(),
+                "participants": app.active_network().participants,
+                "admins": app.active_network().admins,
+                "changed": changed,
+                "published_recipients": published,
+                "published": args.publish,
+                "relays": if args.publish { relays } else { Vec::<String>::new() },
+            }))?
+        );
+    } else {
+        println!("saved {}", config_path.display());
+        println!("network_id={}", app.effective_network_id());
+        println!("changed={}", changed.join(","));
+        if args.publish {
+            println!("published_recipients={published}");
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct AnnounceRequest {
     config: Option<PathBuf>,
@@ -1372,6 +1901,22 @@ struct PublishedAnnouncement {
     network_id: String,
     relays: Vec<String>,
     announcement: PeerAnnouncement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NetworkInvite {
+    v: u8,
+    network_name: String,
+    network_id: String,
+    inviter_npub: String,
+    #[serde(default)]
+    inviter_node_name: String,
+    #[serde(default)]
+    admins: Vec<String>,
+    #[serde(default)]
+    participants: Vec<String>,
+    #[serde(default)]
+    relays: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1401,6 +1946,15 @@ struct ServiceStatusView {
     pid: Option<u32>,
     label: String,
     plist_path: String,
+    #[serde(default)]
+    binary_path: String,
+    #[serde(default)]
+    binary_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionInfoView {
+    version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1408,6 +1962,12 @@ struct DaemonRuntimeState {
     updated_at: u64,
     #[serde(default)]
     binary_version: String,
+    #[serde(default)]
+    local_endpoint: String,
+    #[serde(default)]
+    advertised_endpoint: String,
+    #[serde(default)]
+    listen_port: u16,
     session_active: bool,
     relay_connected: bool,
     session_status: String,
@@ -1432,6 +1992,21 @@ struct DaemonRuntimeState {
     nat_assist_running: bool,
     #[serde(default)]
     nat_assist_status: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct MacosNetworkCleanupState {
+    #[serde(default)]
+    iface: String,
+    #[serde(default)]
+    endpoint_bypass_routes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_default_route: Option<MacosRouteSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ipv4_forward_was_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pf_was_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1669,7 +2244,7 @@ async fn publish_announcement(request: AnnounceRequest) -> Result<PublishedAnnou
         endpoint,
         local_endpoint,
         tunnel_ip,
-        app.effective_advertised_routes(),
+        runtime_effective_advertised_routes(&app),
     );
 
     client
@@ -2265,32 +2840,20 @@ fn participant_has_pending_relay_request(
     })
 }
 
-fn peer_is_past_direct_handshake_grace(
-    presence: &PeerPresenceBook,
-    participant: &str,
-    now: u64,
-) -> bool {
-    presence
-        .active_since_at(participant)
-        .is_some_and(|active_since_at| {
-            now.saturating_sub(active_since_at) >= PEER_PATH_RETRY_AFTER_SECS
-        })
-}
-
 fn participants_needing_relay(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     presence: &PeerPresenceBook,
-    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    tunnel_runtime: &CliTunnelRuntime,
     relay_sessions: &HashMap<String, ActiveRelaySession>,
     pending_requests: &HashMap<String, PendingRelayRequest>,
     now: u64,
 ) -> Vec<String> {
+    let runtime_peers = tunnel_runtime.peer_status().ok();
     app.participant_pubkeys_hex()
         .into_iter()
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
-        .filter(|participant| presence.active().contains_key(participant))
-        .filter(|participant| peer_is_past_direct_handshake_grace(presence, participant, now))
+        .filter(|participant| presence.announcement_for(participant).is_some())
         .filter(|participant| {
             relay_sessions
                 .get(participant)
@@ -2303,35 +2866,10 @@ fn participants_needing_relay(
             let Some(announcement) = presence.announcement_for(participant) else {
                 return false;
             };
-            let runtime_peer = peer_runtime_lookup(announcement, runtime_peers);
+            let runtime_peer = peer_runtime_lookup(announcement, runtime_peers.as_ref());
             !runtime_peer.is_some_and(peer_has_recent_handshake)
         })
         .collect()
-}
-
-fn relay_fallback_request_reason(
-    announcement: &PeerAnnouncement,
-    runtime_peer: Option<&WireGuardPeerStatus>,
-    last_signal_seen_at: Option<u64>,
-    now: u64,
-) -> String {
-    let signal_text = last_signal_seen_at
-        .map(|last_seen_at| format!("nostr seen {}s ago", now.saturating_sub(last_seen_at)))
-        .unwrap_or_else(|| "nostr seen recently".to_string());
-    let runtime_endpoint = runtime_peer
-        .and_then(|peer| peer.endpoint.as_deref())
-        .unwrap_or(announcement.endpoint.as_str());
-
-    if let Some(handshake_age) = runtime_peer.and_then(WireGuardPeerStatus::last_handshake_age) {
-        format!(
-            "{signal_text}; last handshake {}s ago via {runtime_endpoint}",
-            handshake_age.as_secs()
-        )
-    } else if runtime_peer.is_some() {
-        format!("{signal_text}; no completed handshake via {runtime_endpoint}")
-    } else {
-        format!("{signal_text}; peer not yet in tunnel runtime")
-    }
 }
 
 async fn probe_relay_provider_datapath(
@@ -2583,12 +3121,11 @@ async fn maybe_request_public_relay_fallback(
     pending_requests: &mut HashMap<String, PendingRelayRequest>,
     now: u64,
 ) -> Result<usize> {
-    let runtime_peers = tunnel_runtime.peer_status().ok();
     let participants = participants_needing_relay(
         app,
         own_pubkey,
         presence,
-        runtime_peers.as_ref(),
+        tunnel_runtime,
         relay_sessions,
         pending_requests,
         now,
@@ -2622,9 +3159,6 @@ async fn maybe_request_public_relay_fallback(
 
     let mut requested = 0usize;
     for participant in participants {
-        let Some(announcement) = presence.announcement_for(&participant) else {
-            continue;
-        };
         let relay_candidates = relay_candidates_for_participant(
             &relay_pubkeys,
             &participant,
@@ -2636,15 +3170,6 @@ async fn maybe_request_public_relay_fallback(
         if relay_candidates.is_empty() {
             continue;
         }
-
-        let runtime_peer = peer_runtime_lookup(announcement, runtime_peers.as_ref());
-        let reason = relay_fallback_request_reason(
-            announcement,
-            runtime_peer,
-            presence.last_seen_at(&participant),
-            now,
-        );
-        eprintln!("relay: requesting fallback for {participant}: {reason}");
 
         for relay_pubkey in relay_candidates {
             let request_id = format!(
@@ -2930,6 +3455,12 @@ struct CliTunnelRuntime {
     exit_node_runtime: LinuxExitNodeRuntime,
     #[cfg(target_os = "linux")]
     original_default_route: Option<String>,
+    #[cfg(target_os = "macos")]
+    endpoint_bypass_routes: Vec<String>,
+    #[cfg(target_os = "macos")]
+    exit_node_runtime: MacosExitNodeRuntime,
+    #[cfg(target_os = "macos")]
+    original_default_route: Option<MacosRouteSpec>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2940,6 +3471,21 @@ struct LinuxExitNodeRuntime {
     ipv4_tunnel_source_cidr: Option<String>,
     ipv4_forward_was_enabled: Option<bool>,
     ipv6_forward_was_enabled: Option<bool>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct MacosRouteSpec {
+    gateway: Option<String>,
+    interface: String,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Default)]
+struct MacosExitNodeRuntime {
+    outbound_iface: Option<String>,
+    ipv4_forward_was_enabled: Option<bool>,
+    pf_was_enabled: Option<bool>,
 }
 
 impl CliTunnelRuntime {
@@ -2957,6 +3503,12 @@ impl CliTunnelRuntime {
             #[cfg(target_os = "linux")]
             exit_node_runtime: LinuxExitNodeRuntime::default(),
             #[cfg(target_os = "linux")]
+            original_default_route: None,
+            #[cfg(target_os = "macos")]
+            endpoint_bypass_routes: Vec::new(),
+            #[cfg(target_os = "macos")]
+            exit_node_runtime: MacosExitNodeRuntime::default(),
+            #[cfg(target_os = "macos")]
             original_default_route: None,
         }
     }
@@ -3059,6 +3611,22 @@ impl CliTunnelRuntime {
             &own_local_endpoints,
             now,
         )?;
+        #[cfg(target_os = "macos")]
+        if !planned_peers.is_empty() {
+            let summary = planned_peers
+                .iter()
+                .map(|planned| {
+                    format!(
+                        "{} endpoint={} allowed_ips=[{}]",
+                        planned.participant,
+                        planned.endpoint,
+                        planned.peer.allowed_ips.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            eprintln!("tunnel: planned macOS peers {summary}");
+        }
         let peers = planned_peers
             .iter()
             .map(|planned| planned.peer.clone())
@@ -3108,12 +3676,28 @@ impl CliTunnelRuntime {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let route_targets = route_targets_for_tunnel_peers(&peers);
+            let route_targets = route_targets_for_planned_tunnel_peers(
+                app,
+                own_pubkey,
+                peer_announcements,
+                &planned_peers,
+            );
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "tunnel: planned macOS route targets [{}]",
+                route_targets.join(", ")
+            );
             #[cfg(target_os = "linux")]
             if route_targets.iter().any(|route| route == "0.0.0.0/0") {
                 self.capture_linux_original_default_route();
             } else {
                 self.restore_linux_original_default_route();
+            }
+            #[cfg(target_os = "macos")]
+            if route_targets.iter().any(|route| route == "0.0.0.0/0") {
+                self.capture_macos_original_default_route();
+            } else {
+                self.restore_macos_original_default_route();
             }
             #[cfg(target_os = "linux")]
             let endpoint_bypass_specs = if route_targets_require_endpoint_bypass(&route_targets) {
@@ -3122,6 +3706,17 @@ impl CliTunnelRuntime {
                     &peers,
                     &self.iface,
                     self.original_default_route.as_deref(),
+                )?
+            } else {
+                Vec::new()
+            };
+            #[cfg(target_os = "macos")]
+            let endpoint_bypass_specs = if route_targets_require_endpoint_bypass(&route_targets) {
+                macos_bypass_route_specs(
+                    app,
+                    &peers,
+                    &self.iface,
+                    self.original_default_route.as_ref(),
                 )?
             } else {
                 Vec::new()
@@ -3222,15 +3817,23 @@ impl CliTunnelRuntime {
                 wg_set(socket, &body)?;
             }
 
+            #[cfg(target_os = "linux")]
             apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
             #[cfg(target_os = "linux")]
             self.reconcile_linux_endpoint_bypass_routes(&endpoint_bypass_specs);
+            #[cfg(target_os = "macos")]
+            {
+                self.reconcile_macos_endpoint_bypass_routes(&endpoint_bypass_specs);
+                apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
+            }
             #[cfg(target_os = "linux")]
             if let Err(error) = flush_linux_route_cache() {
                 eprintln!("tunnel: failed to flush linux route cache: {error}");
             }
             #[cfg(target_os = "linux")]
             self.reconcile_linux_exit_node_forwarding(app);
+            #[cfg(target_os = "macos")]
+            self.reconcile_macos_exit_node_forwarding(app);
 
             let applied_fingerprint = tunnel_fingerprint(
                 &self.iface,
@@ -3277,6 +3880,12 @@ impl CliTunnelRuntime {
                 eprintln!("tunnel: failed to flush linux route cache: {error}");
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.reconcile_macos_endpoint_bypass_routes(&[]);
+            self.reconcile_macos_exit_node_forwarding_cleanup();
+            self.restore_macos_original_default_route();
+        }
         self.handle = None;
         self.uapi_socket_path = None;
         #[cfg(target_os = "windows")]
@@ -3288,6 +3897,26 @@ impl CliTunnelRuntime {
         }
         self.last_fingerprint = None;
         self.active_listen_port = None;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_network_cleanup_state(&self) -> Option<MacosNetworkCleanupState> {
+        let has_exit_node_state = self.exit_node_runtime.ipv4_forward_was_enabled.is_some()
+            || self.exit_node_runtime.pf_was_enabled.is_some();
+        if self.original_default_route.is_none()
+            && self.endpoint_bypass_routes.is_empty()
+            && !has_exit_node_state
+        {
+            return None;
+        }
+
+        Some(MacosNetworkCleanupState {
+            iface: self.iface.clone(),
+            endpoint_bypass_routes: self.endpoint_bypass_routes.clone(),
+            original_default_route: self.original_default_route.clone(),
+            ipv4_forward_was_enabled: self.exit_node_runtime.ipv4_forward_was_enabled,
+            pf_was_enabled: self.exit_node_runtime.pf_was_enabled,
+        })
     }
 
     fn listen_port(&self, configured: u16) -> u16 {
@@ -3409,6 +4038,23 @@ impl CliTunnelRuntime {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn capture_macos_original_default_route(&mut self) {
+        if self.original_default_route.is_some() {
+            return;
+        }
+
+        match macos_default_route() {
+            Ok(route) if route.interface != self.iface => {
+                self.original_default_route = Some(route);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("exit-node: failed to snapshot macOS default route: {error}");
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn restore_linux_original_default_route(&mut self) {
         let Some(route) = self.original_default_route.as_deref() else {
@@ -3416,6 +4062,21 @@ impl CliTunnelRuntime {
         };
         if let Err(error) = restore_linux_default_route(route) {
             eprintln!("exit-node: failed to restore default route '{route}': {error}");
+            return;
+        }
+        self.original_default_route = None;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn restore_macos_original_default_route(&mut self) {
+        let Some(route) = self.original_default_route.as_ref() else {
+            return;
+        };
+        if route.interface != self.iface {
+            let _ = delete_macos_default_route_for_interface(&self.iface);
+        }
+        if let Err(error) = restore_macos_default_route(route) {
+            eprintln!("exit-node: failed to restore macOS default route: {error}");
             return;
         }
         self.original_default_route = None;
@@ -3444,6 +4105,38 @@ impl CliTunnelRuntime {
             if let Err(error) = apply_linux_endpoint_bypass_route(route) {
                 eprintln!(
                     "tunnel: failed to install endpoint bypass route {}: {}",
+                    route.target, error
+                );
+            }
+        }
+
+        self.endpoint_bypass_routes = desired.into_iter().collect();
+        self.endpoint_bypass_routes.sort();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconcile_macos_endpoint_bypass_routes(&mut self, routes: &[MacosEndpointBypassRoute]) {
+        let desired = routes
+            .iter()
+            .map(|route| route.target.clone())
+            .collect::<HashSet<_>>();
+
+        let stale = self
+            .endpoint_bypass_routes
+            .iter()
+            .filter(|route| !desired.contains(*route))
+            .cloned()
+            .collect::<Vec<_>>();
+        for route in stale {
+            if let Err(error) = delete_macos_endpoint_bypass_route(&route) {
+                eprintln!("tunnel: failed to remove macOS endpoint bypass route {route}: {error}");
+            }
+        }
+
+        for route in routes {
+            if let Err(error) = apply_macos_endpoint_bypass_route(route) {
+                eprintln!(
+                    "tunnel: failed to install macOS endpoint bypass route {}: {}",
                     route.target, error
                 );
             }
@@ -3672,6 +4365,68 @@ impl CliTunnelRuntime {
         }
 
         self.exit_node_runtime = LinuxExitNodeRuntime::default();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconcile_macos_exit_node_forwarding(&mut self, app: &AppConfig) {
+        let route_families =
+            linux_exit_node_default_route_families(&runtime_effective_advertised_routes(app));
+        if !route_families.ipv4 {
+            self.reconcile_macos_exit_node_forwarding_cleanup();
+            return;
+        }
+
+        let outbound_iface = match macos_default_route() {
+            Ok(route) if route.interface != self.iface => route.interface,
+            Ok(_) => {
+                eprintln!("exit-node: invalid macOS outbound route on {}", self.iface);
+                self.reconcile_macos_exit_node_forwarding_cleanup();
+                return;
+            }
+            Err(error) => {
+                eprintln!("exit-node: failed to resolve macOS default route device: {error}");
+                self.reconcile_macos_exit_node_forwarding_cleanup();
+                return;
+            }
+        };
+
+        if self.exit_node_runtime.outbound_iface.as_deref() == Some(outbound_iface.as_str()) {
+            return;
+        }
+
+        self.reconcile_macos_exit_node_forwarding_cleanup();
+        if let Err(error) = ensure_macos_ip_forwarding(true, &mut self.exit_node_runtime) {
+            eprintln!("exit-node: failed to enable macOS IPv4 forwarding: {error}");
+            self.reconcile_macos_exit_node_forwarding_cleanup();
+            return;
+        }
+
+        if let Err(error) = ensure_macos_pf_nat(&outbound_iface, &mut self.exit_node_runtime) {
+            eprintln!("exit-node: failed to configure macOS PF NAT: {error}");
+            self.reconcile_macos_exit_node_forwarding_cleanup();
+            return;
+        }
+
+        self.exit_node_runtime.outbound_iface = Some(outbound_iface);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconcile_macos_exit_node_forwarding_cleanup(&mut self) {
+        if let Err(error) = cleanup_macos_pf_nat() {
+            eprintln!("exit-node: failed to remove macOS PF NAT rules: {error}");
+        }
+        if self.exit_node_runtime.pf_was_enabled == Some(false)
+            && let Err(error) = run_checked(ProcessCommand::new("pfctl").arg("-d"))
+        {
+            eprintln!("exit-node: failed to restore macOS PF state: {error}");
+        }
+        if let Some(previous) = self.exit_node_runtime.ipv4_forward_was_enabled.take()
+            && let Err(error) = write_macos_ip_forward(previous)
+        {
+            eprintln!("exit-node: failed to restore macOS IPv4 forwarding: {error}");
+        }
+        self.exit_node_runtime.outbound_iface = None;
+        self.exit_node_runtime.pf_was_enabled = None;
     }
 }
 
@@ -3994,7 +4749,7 @@ fn build_peer_announcement(
         relay_pubkey: None,
         relay_expires_at: None,
         tunnel_ip: app.node.tunnel_ip.clone(),
-        advertised_routes: app.effective_advertised_routes(),
+        advertised_routes: runtime_effective_advertised_routes(app),
         timestamp: unix_timestamp(),
     }
 }
@@ -4084,7 +4839,22 @@ fn is_exit_node_route(route: &str) -> bool {
     route == "0.0.0.0/0" || route == "::/0"
 }
 
-#[cfg(any(target_os = "linux", test))]
+fn platform_supports_exit_node_client() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn route_is_host_route(route: &str) -> bool {
     let Some((host, bits)) = route.split_once('/') else {
         return true;
@@ -4100,7 +4870,7 @@ fn route_is_host_route(route: &str) -> bool {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn route_targets_require_endpoint_bypass(route_targets: &[String]) -> bool {
     route_targets
         .iter()
@@ -4131,6 +4901,10 @@ fn selected_exit_node_participant(
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
 ) -> Option<String> {
+    if !platform_supports_exit_node_client() {
+        return None;
+    }
+
     if app.exit_node.is_empty() || Some(app.exit_node.as_str()) == own_pubkey {
         return None;
     }
@@ -4259,7 +5033,47 @@ fn runtime_endpoint_requires_refresh(
     own_local_endpoints: &[String],
 ) -> bool {
     runtime_endpoint != planned_endpoint
+        && !runtime_endpoint_is_same_subnet_translation_for_peer(
+            runtime_endpoint,
+            announcement,
+            own_local_endpoints,
+        )
         && !runtime_endpoint_is_viable_for_peer(runtime_endpoint, announcement, own_local_endpoints)
+}
+
+fn runtime_endpoint_is_same_subnet_translation_for_peer(
+    runtime_endpoint: &str,
+    announcement: &PeerAnnouncement,
+    own_local_endpoints: &[String],
+) -> bool {
+    if !endpoint_is_local_only(runtime_endpoint) {
+        return false;
+    }
+
+    if !own_local_endpoints
+        .iter()
+        .any(|own| endpoints_share_local_only_ipv4_subnet(runtime_endpoint, own))
+    {
+        return false;
+    }
+
+    let Some(runtime_addr) = parse_endpoint_socket_addr(runtime_endpoint) else {
+        return false;
+    };
+    let Some(public_addr) = announcement
+        .public_endpoint
+        .as_deref()
+        .and_then(parse_endpoint_socket_addr)
+        .or_else(|| {
+            (!endpoint_is_local_only(&announcement.endpoint))
+                .then(|| parse_endpoint_socket_addr(&announcement.endpoint))
+                .flatten()
+        })
+    else {
+        return false;
+    };
+
+    runtime_addr.port() == public_addr.port()
 }
 
 fn runtime_endpoint_is_viable_for_peer(
@@ -4696,7 +5510,7 @@ async fn publish_private_announce_to_participants(
             endpoint,
             local_endpoint,
             app.node.tunnel_ip.clone(),
-            app.effective_advertised_routes(),
+            runtime_effective_advertised_routes(app),
             relay_fields,
         );
         let fingerprint = announcement_fingerprint(&announcement);
@@ -4877,16 +5691,7 @@ fn planned_tunnel_peers_for_local_endpoints(
         let Some(announcement) = peer_announcements.get(participant) else {
             continue;
         };
-        if !app.use_public_relay_fallback {
-            path_book.remove_relay_paths_for_participant(participant);
-        }
-        let effective_announcement = if app.use_public_relay_fallback {
-            announcement.without_expired_relay(now)
-        } else {
-            announcement
-                .without_expired_relay(now)
-                .with_relay(None, None, None)
-        };
+        let effective_announcement = announcement.without_expired_relay(now);
         path_book.refresh_from_announcement(participant.clone(), &effective_announcement, now);
         let selected_endpoint = path_book
             .select_endpoint_for_local_endpoints(
@@ -4929,13 +5734,6 @@ fn planned_tunnel_peers_for_local_endpoints(
     Ok(peers)
 }
 
-fn runtime_has_handshake(tunnel_runtime: &CliTunnelRuntime) -> bool {
-    tunnel_runtime
-        .peer_status()
-        .ok()
-        .is_some_and(|peers| peers.values().any(WireGuardPeerStatus::has_handshake))
-}
-
 fn ipv4_is_local_only(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     ip.is_private()
@@ -4953,6 +5751,10 @@ fn endpoint_host_ip(endpoint: &str) -> Option<IpAddr> {
         .trim_start_matches('[')
         .trim_end_matches(']');
     host.parse::<IpAddr>().ok()
+}
+
+fn parse_endpoint_socket_addr(endpoint: &str) -> Option<SocketAddr> {
+    endpoint.parse::<SocketAddr>().ok()
 }
 
 fn endpoint_is_local_only(endpoint: &str) -> bool {
@@ -5020,6 +5822,7 @@ fn peer_endpoint_requires_public_signal(
     endpoint_is_local_only(selected_endpoint)
 }
 
+#[cfg(test)]
 fn nat_punch_targets(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -5028,6 +5831,23 @@ fn nat_punch_targets(
 ) -> Vec<SocketAddr> {
     let own_local_endpoints = runtime_local_signal_endpoints(app, listen_port);
     nat_punch_targets_for_local_endpoints(app, own_pubkey, peer_announcements, &own_local_endpoints)
+}
+
+fn pending_nat_punch_targets(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    listen_port: u16,
+) -> Vec<SocketAddr> {
+    let own_local_endpoints = runtime_local_signal_endpoints(app, listen_port);
+    pending_nat_punch_targets_for_local_endpoints(
+        app,
+        own_pubkey,
+        peer_announcements,
+        runtime_peers,
+        &own_local_endpoints,
+    )
 }
 
 #[cfg(test)]
@@ -5045,6 +5865,24 @@ fn nat_punch_targets_for_local_endpoint(
     )
 }
 
+#[cfg(test)]
+fn pending_nat_punch_targets_for_local_endpoint(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    own_local_endpoint: &str,
+) -> Vec<SocketAddr> {
+    pending_nat_punch_targets_for_local_endpoints(
+        app,
+        own_pubkey,
+        peer_announcements,
+        runtime_peers,
+        &[own_local_endpoint.to_string()],
+    )
+}
+
+#[cfg(test)]
 fn nat_punch_targets_for_local_endpoints(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -5057,6 +5895,50 @@ fn nat_punch_targets_for_local_endpoints(
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
         .filter_map(|participant| peer_announcements.get(participant))
         .filter_map(|announcement| {
+            let selected_endpoint =
+                select_peer_endpoint_from_local_endpoints(announcement, own_local_endpoints);
+            if peer_endpoint_requires_public_signal(
+                app,
+                announcement,
+                &selected_endpoint,
+                own_local_endpoints,
+            ) {
+                return None;
+            }
+
+            if own_local_endpoints.iter().any(|own_local_endpoint| {
+                endpoints_share_local_only_ipv4_subnet(&selected_endpoint, own_local_endpoint)
+            }) {
+                return None;
+            }
+
+            selected_endpoint.parse::<SocketAddr>().ok()
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn pending_nat_punch_targets_for_local_endpoints(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    own_local_endpoints: &[String],
+) -> Vec<SocketAddr> {
+    let mut targets = app
+        .participant_pubkeys_hex()
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+        .filter_map(|participant| {
+            let announcement = peer_announcements.get(participant)?;
+            if peer_runtime_lookup(announcement, runtime_peers)
+                .is_some_and(peer_has_recent_handshake)
+            {
+                return None;
+            }
+
             let selected_endpoint =
                 select_peer_endpoint_from_local_endpoints(announcement, own_local_endpoints);
             if peer_endpoint_requires_public_signal(
@@ -5147,16 +6029,18 @@ fn maybe_run_nat_punch(
     if public_endpoint_for_listen_port(public_signal_endpoint.as_ref(), listen_port).is_none() {
         refresh_public_signal_endpoint(app, listen_port, public_signal_endpoint);
     }
-    let targets = nat_punch_targets(app, own_pubkey, peer_announcements, listen_port);
+    let runtime_peers = tunnel_runtime.peer_status().ok();
+    let targets = pending_nat_punch_targets(
+        app,
+        own_pubkey,
+        peer_announcements,
+        runtime_peers.as_ref(),
+        listen_port,
+    );
     let Some(fingerprint) = nat_punch_fingerprint(&targets, listen_port) else {
         *last_attempt = None;
         return Ok(());
     };
-
-    if runtime_has_handshake(tunnel_runtime) {
-        *last_attempt = None;
-        return Ok(());
-    }
 
     let should_retry = match last_attempt {
         Some((last_fingerprint, last_at)) => {
@@ -5214,11 +6098,9 @@ fn pending_tunnel_heartbeat_ips(
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
         .filter_map(|participant| {
             let announcement = peer_announcements.get(participant)?;
-            let peer_pubkey_hex = key_b64_to_hex(&announcement.public_key).ok()?;
-            let has_handshake = runtime_peers
-                .and_then(|peers| peers.get(&peer_pubkey_hex))
-                .is_some_and(WireGuardPeerStatus::has_handshake);
-            if has_handshake {
+            if peer_runtime_lookup(announcement, runtime_peers)
+                .is_some_and(peer_has_recent_handshake)
+            {
                 return None;
             }
 
@@ -5297,6 +6179,36 @@ fn route_targets_for_tunnel_peers(peers: &[TunnelPeer]) -> Vec<String> {
         .collect::<Vec<_>>();
     route_targets.sort();
     route_targets.dedup();
+    route_targets
+}
+
+fn route_targets_for_planned_tunnel_peers(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    planned_peers: &[PlannedTunnelPeer],
+) -> Vec<String> {
+    let mut route_targets = route_targets_for_tunnel_peers(
+        &planned_peers
+            .iter()
+            .map(|planned| planned.peer.clone())
+            .collect::<Vec<_>>(),
+    );
+
+    #[cfg(any(target_os = "macos", test))]
+    if selected_exit_node_participant(app, own_pubkey, peer_announcements)
+        .as_deref()
+        .is_some_and(|participant| {
+            planned_peers
+                .iter()
+                .any(|planned| planned.participant == participant)
+        })
+        && !route_targets.iter().any(|route| route == "0.0.0.0/0")
+    {
+        route_targets.push("0.0.0.0/0".to_string());
+        route_targets.sort();
+    }
+
     route_targets
 }
 
@@ -5954,7 +6866,6 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut expected_peers = expected_peer_count(&app);
     let state_file = daemon_state_file_path(&config_path);
     let peer_cache_file = daemon_peer_cache_file_path(&config_path);
-    trim_debug_logs(&config_path);
     let _ = fs::remove_file(daemon_control_file_path(&config_path));
     let mut presence = PeerPresenceBook::default();
     let mut path_book = PeerPathBook::default();
@@ -5973,7 +6884,6 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut port_mapping_runtime = PortMappingRuntime::default();
     let mut public_signal_endpoint = None;
     let mut last_written_peer_cache = None;
-    let mut last_log_trim_at = Instant::now();
     let mut relay_operator_runtime = LocalRelayOperatorRuntime {
         status: if app.relay_for_others {
             "Waiting for relay operator startup".to_string()
@@ -6076,8 +6986,6 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
     announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut control_interval = tokio::time::interval(Duration::from_millis(100));
-    control_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut state_interval = tokio::time::interval(Duration::from_secs(1));
     state_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut reconnect_interval = tokio::time::interval(Duration::from_secs(1));
@@ -6119,6 +7027,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             expected_peers,
             &presence,
             &tunnel_runtime,
+            public_signal_endpoint.as_ref(),
             &session_status,
             relay_connected,
             &network_snapshot.summary(network_changed_at, captive_portal),
@@ -6143,406 +7052,6 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             }
             _ = &mut terminate_wait => {
                 break;
-            }
-            _ = control_interval.tick() => {
-                let Some(request) = take_daemon_control_request(&config_path) else {
-                    continue;
-                };
-                eprintln!("daemon: handling control request {}", request.as_str());
-                let control_result = match request {
-                    DaemonControlRequest::Stop => break,
-                    DaemonControlRequest::Pause => {
-                        let was_session_active =
-                            daemon_session_active(session_enabled, expected_peers);
-                        let join_requests_active = app.join_requests_enabled();
-                        let had_relay_connection = relay_connected;
-                        session_enabled = false;
-                        reconnect_attempt = 0;
-                        reconnect_due = Instant::now();
-                        presence = PeerPresenceBook::default();
-                        relay_sessions.clear();
-                        standby_relay_sessions.clear();
-                        relay_failures.clear();
-                        relay_provider_verifications.clear();
-                        pending_relay_requests.clear();
-                        outbound_announces.clear();
-                        last_nat_punch_attempt = None;
-                        if !join_requests_active {
-                            relay_connected = false;
-                        }
-
-                        let mut control_result = Ok(());
-                        if let Err(error) = apply_presence_runtime_update(
-                            &app,
-                            own_pubkey.as_deref(),
-                            &presence,
-                            &relay_sessions,
-                            &mut path_book,
-                            unix_timestamp(),
-                            &mut tunnel_runtime,
-                            magic_dns_runtime.as_ref(),
-                        ) {
-                            session_status = format!("Pause failed ({error})");
-                        } else {
-                            session_status = daemon_session_idle_status(
-                                session_enabled,
-                                expected_peers,
-                                join_requests_active,
-                            )
-                            .to_string();
-                            if let Err(error) = persist_daemon_runtime_state(
-                                &state_file,
-                                &app,
-                                session_enabled,
-                                expected_peers,
-                                &presence,
-                                &tunnel_runtime,
-                                &session_status,
-                                relay_connected,
-                                &network_snapshot.summary(network_changed_at, captive_portal),
-                                &port_mapping_runtime.status(),
-                                &relay_operator_runtime,
-                            ) {
-                                control_result = Err(anyhow!(
-                                    "failed to persist daemon state while pausing: {error}"
-                                ));
-                            }
-                        }
-
-                        if had_relay_connection && was_session_active {
-                            let _ = client
-                                .publish(SignalPayload::Disconnect {
-                                    node_id: app.node.id.clone(),
-                                })
-                                .await;
-                        }
-                        if !join_requests_active {
-                            client.disconnect().await;
-                        }
-                        port_mapping_runtime.stop().await;
-                        public_signal_endpoint = None;
-                        control_result
-                    }
-                    DaemonControlRequest::Resume => {
-                        let mut control_result = Ok(());
-                        if !session_enabled {
-                            session_enabled = true;
-                            relay_connected = false;
-                            reconnect_attempt = 0;
-                            reconnect_due = Instant::now();
-                            let _restored_peer_cache = if daemon_session_active(
-                                session_enabled,
-                                expected_peers,
-                            ) {
-                                match restore_daemon_peer_cache(
-                                    DaemonPeerCacheRestore {
-                                        path: &peer_cache_file,
-                                        app: &app,
-                                        network_id: &network_id,
-                                        own_pubkey: own_pubkey.as_deref(),
-                                        now: unix_timestamp(),
-                                        announce_interval_secs: args.announce_interval_secs,
-                                    },
-                                    &mut presence,
-                                    &mut path_book,
-                                ) {
-                                    Ok(restored) => restored,
-                                    Err(error) => {
-                                        eprintln!(
-                                            "daemon: failed to restore peer cache on resume: {error}"
-                                        );
-                                        false
-                                    }
-                                }
-                            } else {
-                                false
-                            };
-                            if let Err(error) = apply_presence_runtime_update(
-                                &app,
-                                own_pubkey.as_deref(),
-                                &presence,
-                                &relay_sessions,
-                                &mut path_book,
-                                unix_timestamp(),
-                                &mut tunnel_runtime,
-                                magic_dns_runtime.as_ref(),
-                            ) {
-                                session_status = format!("Resume failed ({error})");
-                            } else if daemon_session_active(session_enabled, expected_peers) {
-                                session_status = "Resuming".to_string();
-                                if let Err(error) = persist_daemon_runtime_state(
-                                    &state_file,
-                                    &app,
-                                    session_enabled,
-                                    expected_peers,
-                                    &presence,
-                                    &tunnel_runtime,
-                                    &session_status,
-                                    relay_connected,
-                                    &network_snapshot.summary(network_changed_at, captive_portal),
-                                    &port_mapping_runtime.status(),
-                                    &relay_operator_runtime,
-                                ) {
-                                    control_result = Err(anyhow!(
-                                        "failed to persist daemon state while resuming: {error}"
-                                    ));
-                                }
-                                let runtime_listen_port = tunnel_runtime
-                                    .active_listen_port
-                                    .unwrap_or(app.node.listen_port);
-                                refresh_public_signal_endpoint_with_port_mapping(
-                                    &app,
-                                    &network_snapshot,
-                                    runtime_listen_port,
-                                    &mut port_mapping_runtime,
-                                    &mut public_signal_endpoint,
-                                )
-                                .await;
-                            } else {
-                                port_mapping_runtime.stop().await;
-                                public_signal_endpoint = None;
-                                session_status = daemon_session_idle_status(
-                                    session_enabled,
-                                    expected_peers,
-                                    app.join_requests_enabled(),
-                                )
-                                .to_string();
-                                if let Err(error) = persist_daemon_runtime_state(
-                                    &state_file,
-                                    &app,
-                                    session_enabled,
-                                    expected_peers,
-                                    &presence,
-                                    &tunnel_runtime,
-                                    &session_status,
-                                    relay_connected,
-                                    &network_snapshot.summary(network_changed_at, captive_portal),
-                                    &port_mapping_runtime.status(),
-                                    &relay_operator_runtime,
-                                ) {
-                                    control_result = Err(anyhow!(
-                                        "failed to persist daemon state while resuming: {error}"
-                                    ));
-                                }
-                            }
-                        }
-                        control_result
-                    }
-                    DaemonControlRequest::Reload => {
-                        match update_daemon_config_from_staged_request(&config_path) {
-                            Ok(staged_config_applied) => {
-                                match load_config_with_overrides(
-                                    &config_path,
-                                    network_override.clone(),
-                                    participants_override.clone(),
-                                ) {
-                                    Ok((reloaded_app, reloaded_network_id)) => {
-                                        let reload = build_daemon_reload_config(
-                                            reloaded_app,
-                                            reloaded_network_id,
-                                            &args.relay,
-                                        );
-                                        let configured_set = reload
-                                            .configured_participants
-                                            .iter()
-                                            .cloned()
-                                            .collect::<HashSet<_>>();
-                                        app = reload.app;
-                                        network_id = reload.network_id;
-                                        expected_peers = reload.expected_peers;
-                                        own_pubkey = reload.own_pubkey;
-                                        relays = reload.relays;
-
-                                        presence.retain_participants(&configured_set);
-                                        path_book.retain_participants(&configured_set);
-                                        outbound_announces.retain_participants(&configured_set);
-                                        outbound_announces.clear();
-                                        last_nat_punch_attempt = None;
-                                        client.disconnect().await;
-                                        match NostrSignalingClient::from_secret_key_with_networks(
-                                            &app.nostr.secret_key,
-                                            signaling_networks_for_app(&app),
-                                        ) {
-                                            Ok(new_client) => {
-                                                client = new_client;
-                                                let join_requests_active = app.join_requests_enabled();
-                                                let session_active =
-                                                    daemon_session_active(session_enabled, expected_peers);
-                                                if relay_session_active(
-                                                    session_enabled,
-                                                    expected_peers,
-                                                    join_requests_active,
-                                                ) {
-                                                    match client.connect(&relays).await {
-                                                        Ok(()) => {
-                                                            relay_connected = true;
-                                                            reconnect_attempt = 0;
-                                                            reconnect_due = Instant::now();
-                                                            if let Err(error) =
-                                                                publish_active_network_roster(
-                                                                    &client,
-                                                                    &app,
-                                                                    None,
-                                                                )
-                                                                .await
-                                                            {
-                                                                eprintln!(
-                                                                    "daemon: roster publish failed after config reload: {error}"
-                                                                );
-                                                            }
-                                                            session_status = if session_active {
-                                                                "Config reloaded".to_string()
-                                                            } else {
-                                                                daemon_session_idle_status(
-                                                                    session_enabled,
-                                                                    expected_peers,
-                                                                    join_requests_active,
-                                                                )
-                                                                .to_string()
-                                                            };
-                                                            if session_active {
-                                                                if let Err(error) = publish_private_announce_to_known_peers(
-                                                                    &client,
-                                                                    &app,
-                                                                    own_pubkey.as_deref(),
-                                                                    &presence,
-                                                                    &tunnel_runtime,
-                                                                    public_signal_endpoint.as_ref(),
-                                                                    &relay_sessions,
-                                                                    &mut outbound_announces,
-                                                                ).await {
-                                                                    session_status = format!(
-                                                                        "Config reloaded; private announce failed ({})",
-                                                                        error
-                                                                    );
-                                                                }
-                                                                if let Err(error) = client.publish(SignalPayload::Hello).await {
-                                                                    session_status = format!(
-                                                                        "Config reloaded; hello publish failed ({})",
-                                                                        error
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(error) => {
-                                                            relay_connected = false;
-                                                            reconnect_attempt = reconnect_attempt.saturating_add(1);
-                                                            let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
-                                                            reconnect_due = Instant::now() + delay;
-                                                            session_status = format!(
-                                                                "Config reloaded; relay reconnect failed (retry in {}s: {})",
-                                                                delay.as_secs(),
-                                                                error
-                                                            );
-                                                        }
-                                                    }
-                                                } else {
-                                                    relay_connected = false;
-                                                    reconnect_attempt = 0;
-                                                    reconnect_due = Instant::now();
-                                                    port_mapping_runtime.stop().await;
-                                                    public_signal_endpoint = None;
-                                                    session_status = if session_enabled {
-                                                        daemon_session_idle_status(
-                                                            session_enabled,
-                                                            expected_peers,
-                                                            join_requests_active,
-                                                        )
-                                                        .to_string()
-                                                    } else {
-                                                        "Config reloaded (paused)".to_string()
-                                                    };
-                                                }
-                                            }
-                                            Err(error) => {
-                                                session_status = format!(
-                                                    "Config reload failed (signal client init): {}",
-                                                    error
-                                                );
-                                            }
-                                        }
-
-                                        if let Err(error) = apply_presence_runtime_update(
-                                            &app,
-                                            own_pubkey.as_deref(),
-                                            &presence,
-                                            &relay_sessions,
-                                            &mut path_book,
-                                            unix_timestamp(),
-                                            &mut tunnel_runtime,
-                                            magic_dns_runtime.as_ref(),
-                                        ) {
-                                            session_status = format!(
-                                                "Config reloaded; tunnel update failed ({})",
-                                                error
-                                            );
-                                        } else if daemon_session_active(session_enabled, expected_peers) {
-                                            let runtime_listen_port = tunnel_runtime
-                                                .active_listen_port
-                                                .unwrap_or(app.node.listen_port);
-                                            refresh_public_signal_endpoint_with_port_mapping(
-                                                &app,
-                                                &network_snapshot,
-                                                runtime_listen_port,
-                                                &mut port_mapping_runtime,
-                                                &mut public_signal_endpoint,
-                                            )
-                                            .await;
-                                        }
-                                        Ok(())
-                                    }
-                                    Err(error) => {
-                                        session_status = if staged_config_applied {
-                                            format!("Config apply failed (reload: {error})")
-                                        } else {
-                                            format!("Config reload failed ({error})")
-                                        };
-                                        Err(error)
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                session_status = format!("Config apply failed ({error})");
-                                Err(error)
-                            }
-                        }
-                    }
-                };
-                if let Err(error) = sync_local_relay_operator(
-                    &config_path,
-                    &app,
-                    &relays,
-                    public_signal_endpoint.as_ref(),
-                    &mut relay_operator_process,
-                    &mut relay_operator_runtime,
-                ) {
-                    eprintln!("relay operator: sync failed after control request: {error}");
-                }
-                let persist_result = persist_daemon_runtime_state(
-                    &state_file,
-                    &app,
-                    session_enabled,
-                    expected_peers,
-                    &presence,
-                    &tunnel_runtime,
-                    &session_status,
-                    relay_connected,
-                    &network_snapshot.summary(network_changed_at, captive_portal),
-                    &port_mapping_runtime.status(),
-                    &relay_operator_runtime,
-                )
-                .map_err(|error| anyhow!("failed to persist daemon state after control request: {error}"));
-                let control_result = control_result.and(persist_result);
-                match &control_result {
-                    Ok(()) => eprintln!("daemon: control request {} completed", request.as_str()),
-                    Err(error) => {
-                        eprintln!(
-                            "daemon: control request {} failed: {error}",
-                            request.as_str()
-                        );
-                    }
-                }
-                let _ = write_daemon_control_result(&config_path, request, control_result);
             }
             _ = reconnect_interval.tick() => {
                 let join_requests_active = app.join_requests_enabled();
@@ -6942,6 +7451,337 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     }
                 }
 
+                if let Some(request) = take_daemon_control_request(&config_path) {
+                    let control_result = match request {
+                        DaemonControlRequest::Stop => break,
+                        DaemonControlRequest::Pause => {
+                            let was_session_active =
+                                daemon_session_active(session_enabled, expected_peers);
+                            if relay_connected && was_session_active {
+                                let _ = client
+                                    .publish(SignalPayload::Disconnect {
+                                        node_id: app.node.id.clone(),
+                                    })
+                                    .await;
+                            }
+                            session_enabled = false;
+                            let join_requests_active = app.join_requests_enabled();
+                            if !join_requests_active {
+                                client.disconnect().await;
+                                relay_connected = false;
+                            }
+                            reconnect_attempt = 0;
+                            reconnect_due = Instant::now();
+                            port_mapping_runtime.stop().await;
+                            public_signal_endpoint = None;
+                            presence = PeerPresenceBook::default();
+                            relay_sessions.clear();
+                            standby_relay_sessions.clear();
+                            relay_failures.clear();
+                            relay_provider_verifications.clear();
+                            pending_relay_requests.clear();
+                            outbound_announces.clear();
+                            last_nat_punch_attempt = None;
+                            if let Err(error) = apply_presence_runtime_update(
+                                &app,
+                                own_pubkey.as_deref(),
+                                &presence,
+                                &relay_sessions,
+                                &mut path_book,
+                                unix_timestamp(),
+                                &mut tunnel_runtime,
+                                magic_dns_runtime.as_ref(),
+                            ) {
+                                session_status = format!("Pause failed ({error})");
+                            } else {
+                                session_status = daemon_session_idle_status(
+                                    session_enabled,
+                                    expected_peers,
+                                    join_requests_active,
+                                )
+                                .to_string();
+                            }
+                            Ok(())
+                        }
+                        DaemonControlRequest::Resume => {
+                            if !session_enabled {
+                                session_enabled = true;
+                                relay_connected = false;
+                                reconnect_attempt = 0;
+                                reconnect_due = Instant::now();
+                                let _restored_peer_cache = if daemon_session_active(
+                                    session_enabled,
+                                    expected_peers,
+                                ) {
+                                    match restore_daemon_peer_cache(
+                                        DaemonPeerCacheRestore {
+                                            path: &peer_cache_file,
+                                            app: &app,
+                                            network_id: &network_id,
+                                            own_pubkey: own_pubkey.as_deref(),
+                                            now: unix_timestamp(),
+                                            announce_interval_secs: args.announce_interval_secs,
+                                        },
+                                        &mut presence,
+                                        &mut path_book,
+                                    ) {
+                                        Ok(restored) => restored,
+                                        Err(error) => {
+                                            eprintln!("daemon: failed to restore peer cache on resume: {error}");
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    false
+                                };
+                                if let Err(error) = apply_presence_runtime_update(
+                                    &app,
+                                    own_pubkey.as_deref(),
+                                    &presence,
+                                    &relay_sessions,
+                                    &mut path_book,
+                                    unix_timestamp(),
+                                    &mut tunnel_runtime,
+                                    magic_dns_runtime.as_ref(),
+                                ) {
+                                    session_status = format!("Resume failed ({error})");
+                                } else if daemon_session_active(session_enabled, expected_peers) {
+                                    let runtime_listen_port = tunnel_runtime
+                                        .active_listen_port
+                                        .unwrap_or(app.node.listen_port);
+                                    refresh_public_signal_endpoint_with_port_mapping(
+                                        &app,
+                                        &network_snapshot,
+                                        runtime_listen_port,
+                                        &mut port_mapping_runtime,
+                                        &mut public_signal_endpoint,
+                                    )
+                                    .await;
+                                    session_status = "Resuming".to_string();
+                                } else {
+                                    port_mapping_runtime.stop().await;
+                                    public_signal_endpoint = None;
+                                    session_status = daemon_session_idle_status(
+                                        session_enabled,
+                                        expected_peers,
+                                        app.join_requests_enabled(),
+                                    )
+                                    .to_string();
+                                }
+                            }
+                            Ok(())
+                        }
+                        DaemonControlRequest::Reload => {
+                            match update_daemon_config_from_staged_request(&config_path) {
+                                Ok(staged_config_applied) => {
+                            match load_config_with_overrides(
+                                &config_path,
+                                network_override.clone(),
+                                participants_override.clone(),
+                            ) {
+                                Ok((reloaded_app, reloaded_network_id)) => {
+                                    let reload = build_daemon_reload_config(
+                                        reloaded_app,
+                                        reloaded_network_id,
+                                        &args.relay,
+                                    );
+                                    let configured_set = reload
+                                        .configured_participants
+                                        .iter()
+                                        .cloned()
+                                        .collect::<HashSet<_>>();
+                                    app = reload.app;
+                                    network_id = reload.network_id;
+                                    expected_peers = reload.expected_peers;
+                                    own_pubkey = reload.own_pubkey;
+                                    relays = reload.relays;
+
+                                    presence.retain_participants(&configured_set);
+                                    path_book.retain_participants(&configured_set);
+                                    outbound_announces.retain_participants(&configured_set);
+                                    outbound_announces.clear();
+                                    last_nat_punch_attempt = None;
+                                    client.disconnect().await;
+                                    match NostrSignalingClient::from_secret_key_with_networks(
+                                        &app.nostr.secret_key,
+                                        signaling_networks_for_app(&app),
+                                    ) {
+                                        Ok(new_client) => {
+                                            client = new_client;
+                                            let join_requests_active = app.join_requests_enabled();
+                                            let session_active =
+                                                daemon_session_active(session_enabled, expected_peers);
+                                            if relay_session_active(
+                                                session_enabled,
+                                                expected_peers,
+                                                join_requests_active,
+                                            ) {
+                                                match client.connect(&relays).await {
+                                                    Ok(()) => {
+                                                        relay_connected = true;
+                                                        reconnect_attempt = 0;
+                                                        reconnect_due = Instant::now();
+                                                        if let Err(error) =
+                                                            publish_active_network_roster(
+                                                                &client,
+                                                                &app,
+                                                                None,
+                                                            )
+                                                            .await
+                                                        {
+                                                            eprintln!(
+                                                                "daemon: roster publish failed after config reload: {error}"
+                                                            );
+                                                        }
+                                                        session_status = if session_active {
+                                                            "Config reloaded".to_string()
+                                                        } else {
+                                                            daemon_session_idle_status(
+                                                                session_enabled,
+                                                                expected_peers,
+                                                                join_requests_active,
+                                                            )
+                                                            .to_string()
+                                                        };
+                                                        if session_active {
+                                                            if let Err(error) = publish_private_announce_to_known_peers(
+                                                                &client,
+                                                                &app,
+                                                                own_pubkey.as_deref(),
+                                                                &presence,
+                                                                &tunnel_runtime,
+                                                                public_signal_endpoint.as_ref(),
+                                                                &relay_sessions,
+                                                                &mut outbound_announces,
+                                                            ).await {
+                                                                session_status = format!(
+                                                                    "Config reloaded; private announce failed ({})",
+                                                                    error
+                                                                );
+                                                            }
+                                                            if let Err(error) = client.publish(SignalPayload::Hello).await {
+                                                                session_status = format!(
+                                                                    "Config reloaded; hello publish failed ({})",
+                                                                    error
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        relay_connected = false;
+                                                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                                        let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
+                                                        reconnect_due = Instant::now() + delay;
+                                                        session_status = format!(
+                                                            "Config reloaded; relay reconnect failed (retry in {}s: {})",
+                                                            delay.as_secs(),
+                                                            error
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                relay_connected = false;
+                                                reconnect_attempt = 0;
+                                                reconnect_due = Instant::now();
+                                                port_mapping_runtime.stop().await;
+                                                public_signal_endpoint = None;
+                                                session_status = if session_enabled {
+                                                    daemon_session_idle_status(
+                                                        session_enabled,
+                                                        expected_peers,
+                                                        join_requests_active,
+                                                    )
+                                                    .to_string()
+                                                } else {
+                                                    "Config reloaded (paused)".to_string()
+                                                };
+                                            }
+                                        }
+                                        Err(error) => {
+                                            session_status = format!(
+                                                "Config reload failed (signal client init): {}",
+                                                error
+                                            );
+                                        }
+                                    }
+
+                                    if let Err(error) = apply_presence_runtime_update(
+                                        &app,
+                                        own_pubkey.as_deref(),
+                                        &presence,
+                                        &relay_sessions,
+                                        &mut path_book,
+                                        unix_timestamp(),
+                                        &mut tunnel_runtime,
+                                        magic_dns_runtime.as_ref(),
+                                    ) {
+                                        session_status = format!(
+                                            "Config reloaded; tunnel update failed ({})",
+                                            error
+                                        );
+                                    } else if daemon_session_active(session_enabled, expected_peers) {
+                                        let runtime_listen_port = tunnel_runtime
+                                            .active_listen_port
+                                            .unwrap_or(app.node.listen_port);
+                                        refresh_public_signal_endpoint_with_port_mapping(
+                                            &app,
+                                            &network_snapshot,
+                                            runtime_listen_port,
+                                            &mut port_mapping_runtime,
+                                            &mut public_signal_endpoint,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    session_status = if staged_config_applied {
+                                        format!("Config apply failed (reload: {error})")
+                                    } else {
+                                        format!("Config reload failed ({error})")
+                                    };
+                                    Err(error)
+                                }
+                            }
+                                }
+                                Err(error) => {
+                                    session_status = format!("Config apply failed ({error})");
+                                    Err(error)
+                                }
+                            }
+                        }
+                    };
+                    let _ = write_daemon_control_result(&config_path, request, control_result);
+                    if let Err(error) = sync_local_relay_operator(
+                        &config_path,
+                        &app,
+                        &relays,
+                        public_signal_endpoint.as_ref(),
+                        &mut relay_operator_process,
+                        &mut relay_operator_runtime,
+                    ) {
+                        eprintln!("relay operator: sync failed after control request: {error}");
+                    }
+                    let _ = persist_daemon_runtime_state(
+                        &state_file,
+                        &app,
+                        session_enabled,
+                        expected_peers,
+                        &presence,
+                        &tunnel_runtime,
+                        public_signal_endpoint.as_ref(),
+                        &session_status,
+                        relay_connected,
+                        &network_snapshot.summary(network_changed_at, captive_portal),
+                        &port_mapping_runtime.status(),
+                        &relay_operator_runtime,
+                    );
+                    if let Err(error) =
+                        persist_daemon_network_cleanup_state(&config_path, &tunnel_runtime)
+                    {
+                        eprintln!("daemon: failed to persist network cleanup state: {error}");
+                    }
+                }
                 if let Some((executable, launched_fingerprint)) =
                     supervised_service_executable.as_ref()
                 {
@@ -7032,15 +7872,17 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     expected_peers,
                     &presence,
                     &tunnel_runtime,
+                    public_signal_endpoint.as_ref(),
                     &session_status,
                     relay_connected,
                     &network_snapshot.summary(network_changed_at, captive_portal),
                     &port_mapping_runtime.status(),
                     &relay_operator_runtime,
                 );
-                if last_log_trim_at.elapsed() >= Duration::from_secs(30) {
-                    trim_debug_logs(&config_path);
-                    last_log_trim_at = Instant::now();
+                if let Err(error) =
+                    persist_daemon_network_cleanup_state(&config_path, &tunnel_runtime)
+                {
+                    eprintln!("daemon: failed to persist network cleanup state: {error}");
                 }
             }
             message = async {
@@ -7409,10 +8251,16 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     );
     port_mapping_runtime.stop().await;
     tunnel_runtime.stop();
+    if let Err(error) = persist_daemon_network_cleanup_state(&config_path, &tunnel_runtime) {
+        eprintln!("daemon: failed to clear network cleanup state: {error}");
+    }
 
     let final_state = DaemonRuntimeState {
         updated_at: unix_timestamp(),
         binary_version: PRODUCT_VERSION.to_string(),
+        local_endpoint: String::new(),
+        advertised_endpoint: String::new(),
+        listen_port: 0,
         session_active: false,
         relay_connected: false,
         session_status: "Disconnected".to_string(),
@@ -7557,6 +8405,7 @@ fn build_daemon_runtime_state(
     expected_peers: usize,
     presence: &PeerPresenceBook,
     tunnel_runtime: &CliTunnelRuntime,
+    public_signal_endpoint: Option<&DiscoveredPublicSignalEndpoint>,
     session_status: &str,
     relay_connected: bool,
     network: &NetworkSummary,
@@ -7566,6 +8415,10 @@ fn build_daemon_runtime_state(
     let own_pubkey = app.own_nostr_pubkey_hex().ok();
     let runtime_peers = tunnel_runtime.peer_status().ok();
     let now = unix_timestamp();
+    let listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+    let local_endpoint = local_signal_endpoint(app, listen_port);
+    let advertised_endpoint = public_endpoint_for_listen_port(public_signal_endpoint, listen_port)
+        .unwrap_or_else(|| local_endpoint.clone());
     let mut peers = Vec::new();
 
     for participant in &app.participant_pubkeys_hex() {
@@ -7637,6 +8490,9 @@ fn build_daemon_runtime_state(
     DaemonRuntimeState {
         updated_at: now,
         binary_version: PRODUCT_VERSION.to_string(),
+        local_endpoint,
+        advertised_endpoint,
+        listen_port,
         session_active,
         relay_connected,
         session_status: session_status.to_string(),
@@ -7663,6 +8519,7 @@ fn persist_daemon_runtime_state(
     expected_peers: usize,
     presence: &PeerPresenceBook,
     tunnel_runtime: &CliTunnelRuntime,
+    public_signal_endpoint: Option<&DiscoveredPublicSignalEndpoint>,
     session_status: &str,
     relay_connected: bool,
     network: &NetworkSummary,
@@ -7677,6 +8534,7 @@ fn persist_daemon_runtime_state(
             expected_peers,
             presence,
             tunnel_runtime,
+            public_signal_endpoint,
             session_status,
             relay_connected,
             network,
@@ -7744,10 +8602,7 @@ fn stop_daemon(args: StopArgs) -> Result<()> {
     let daemon_pids = daemon_candidate_pids(&config_path, current_pid)?;
 
     if daemon_pids.is_empty() {
-        let _ = fs::remove_file(&status.pid_file);
-        let _ = fs::remove_file(daemon_control_file_path(&config_path));
-        println!("daemon: not running");
-        return Ok(());
+        return finish_stop_daemon(&config_path, &status, false);
     }
 
     #[cfg(target_os = "windows")]
@@ -7777,10 +8632,7 @@ fn stop_daemon(args: StopArgs) -> Result<()> {
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
         if daemon_candidate_pids(&config_path, current_pid)?.is_empty() {
-            let _ = fs::remove_file(&status.pid_file);
-            let _ = fs::remove_file(daemon_control_file_path(&config_path));
-            println!("daemon stopped");
-            return Ok(());
+            return finish_stop_daemon(&config_path, &status, true);
         }
         thread::sleep(Duration::from_millis(120));
     }
@@ -7806,10 +8658,7 @@ fn stop_daemon(args: StopArgs) -> Result<()> {
         let started = std::time::Instant::now();
         while started.elapsed() < timeout {
             if daemon_candidate_pids(&config_path, current_pid)?.is_empty() {
-                let _ = fs::remove_file(&status.pid_file);
-                let _ = fs::remove_file(daemon_control_file_path(&config_path));
-                println!("daemon stopped");
-                return Ok(());
+                return finish_stop_daemon(&config_path, &status, true);
             }
             thread::sleep(Duration::from_millis(120));
         }
@@ -7833,9 +8682,50 @@ fn stop_daemon(args: StopArgs) -> Result<()> {
         ));
     }
 
+    finish_stop_daemon(&config_path, &status, true)
+}
+
+fn finish_stop_daemon(config_path: &Path, status: &DaemonStatus, was_running: bool) -> Result<()> {
+    let repaired = repair_saved_network_state(config_path);
     let _ = fs::remove_file(&status.pid_file);
-    let _ = fs::remove_file(daemon_control_file_path(&config_path));
-    println!("daemon stopped");
+    let _ = fs::remove_file(daemon_control_file_path(config_path));
+
+    match repaired {
+        Ok(true) if was_running => println!("daemon stopped; repaired network state"),
+        Ok(true) => println!("daemon: not running; repaired network state"),
+        Ok(false) if was_running => println!("daemon stopped"),
+        Ok(false) => println!("daemon: not running"),
+        Err(error) => {
+            return Err(anyhow!(
+                "{} but failed to repair network state: {error}",
+                if was_running {
+                    "daemon stopped"
+                } else {
+                    "daemon is not running"
+                }
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn repair_network(args: RepairNetworkArgs) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    if let Some(pid) = daemon_candidate_pids(&config_path, std::process::id())?
+        .into_iter()
+        .next()
+    {
+        return Err(anyhow!(
+            "daemon is still running with pid {pid}; stop it before repairing network state"
+        ));
+    }
+
+    if repair_saved_network_state(&config_path)? {
+        println!("network state repaired");
+    } else {
+        println!("network state already clean");
+    }
     Ok(())
 }
 
@@ -7862,25 +8752,29 @@ fn control_daemon(args: ControlArgs, request: DaemonControlRequest) -> Result<()
     }
 
     write_daemon_control_request(&config_path, request)?;
-    wait_for_daemon_control_ack(&config_path, Duration::from_secs(3))?;
+    let ack_result = wait_for_daemon_control_ack(&config_path, Duration::from_secs(3));
     match request {
         DaemonControlRequest::Pause => {
-            wait_for_daemon_control_completion(
-                &config_path,
-                request,
-                Some(false),
-                Duration::from_secs(6),
-            )?;
+            let session_result =
+                wait_for_daemon_session_active(&config_path, false, Duration::from_secs(2));
+            match (ack_result, session_result) {
+                (Ok(()), Ok(())) | (Err(_), Ok(())) => {}
+                (Ok(()), Err(error)) => return Err(error),
+                (Err(error), Err(_)) => return Err(error),
+            }
         }
         DaemonControlRequest::Resume => {
-            wait_for_daemon_control_completion(
-                &config_path,
-                request,
-                Some(true),
-                Duration::from_secs(6),
-            )?;
+            let session_result =
+                wait_for_daemon_session_active(&config_path, true, Duration::from_secs(2));
+            match (ack_result, session_result) {
+                (Ok(()), Ok(())) | (Err(_), Ok(())) => {}
+                (Ok(()), Err(error)) => return Err(error),
+                (Err(error), Err(_)) => return Err(error),
+            }
         }
-        DaemonControlRequest::Reload | DaemonControlRequest::Stop => {}
+        DaemonControlRequest::Reload | DaemonControlRequest::Stop => {
+            ack_result?;
+        }
     }
 
     match request {
@@ -7902,6 +8796,15 @@ fn daemon_status(config_path: &Path) -> Result<DaemonStatus> {
         .into_iter()
         .next();
     let running = running_pid.is_some();
+
+    if !running {
+        match repair_saved_network_state(config_path) {
+            Ok(true) => eprintln!("daemon: repaired saved network state"),
+            Ok(false) => {}
+            Err(error) => eprintln!("daemon: failed to repair saved network state: {error}"),
+        }
+    }
+
     let pid = running_pid.or(pid_from_record);
     let state = read_daemon_state(&state_file)?;
 
@@ -7938,6 +8841,25 @@ fn daemon_status_json(config_path: &Path) -> Result<serde_json::Value> {
     }))
 }
 
+fn status_endpoint(app: &AppConfig, daemon: &DaemonStatus) -> String {
+    daemon
+        .state
+        .as_ref()
+        .and_then(|state| {
+            let endpoint = state.advertised_endpoint.trim();
+            (!endpoint.is_empty()).then(|| endpoint.to_string())
+        })
+        .unwrap_or_else(|| app.node.endpoint.clone())
+}
+
+fn status_listen_port(app: &AppConfig, daemon: &DaemonStatus) -> u16 {
+    daemon
+        .state
+        .as_ref()
+        .and_then(|state| (state.listen_port > 0).then_some(state.listen_port))
+        .unwrap_or(app.node.listen_port)
+}
+
 fn daemon_pid_file_path(config_path: &Path) -> PathBuf {
     let parent = config_path
         .parent()
@@ -7964,6 +8886,13 @@ fn daemon_state_file_path(config_path: &Path) -> PathBuf {
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
     parent.join("daemon.state.json")
+}
+
+fn daemon_network_cleanup_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("daemon.cleanup.json")
 }
 
 fn daemon_control_file_path(config_path: &Path) -> PathBuf {
@@ -8006,65 +8935,6 @@ fn relay_operator_state_file_path(config_path: &Path) -> PathBuf {
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
     parent.join("relay.operator.json")
-}
-
-fn trim_debug_log_file(path: &Path) -> Result<bool> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    };
-    if metadata.len() <= DEBUG_LOG_MAX_BYTES {
-        return Ok(false);
-    }
-
-    let mut reader = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .with_context(|| format!("failed to open {} for trimming", path.display()))?;
-    let read_len = usize::try_from(metadata.len().min(DEBUG_LOG_KEEP_BYTES as u64))
-        .unwrap_or(DEBUG_LOG_KEEP_BYTES);
-    reader
-        .seek(SeekFrom::End(
-            -(i64::try_from(read_len).unwrap_or(i64::MAX)),
-        ))
-        .with_context(|| format!("failed to seek {}", path.display()))?;
-    let mut tail = vec![0_u8; read_len];
-    reader
-        .read_exact(&mut tail)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-
-    if let Some(newline) = tail.iter().position(|byte| *byte == b'\n')
-        && newline + 1 < tail.len()
-    {
-        tail.drain(..=newline);
-    }
-
-    let mut writer = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .with_context(|| format!("failed to rewrite {}", path.display()))?;
-    writer
-        .write_all(&tail)
-        .with_context(|| format!("failed to trim {}", path.display()))?;
-    Ok(true)
-}
-
-fn trim_debug_logs(config_path: &Path) {
-    for path in [
-        daemon_log_file_path(config_path),
-        relay_operator_log_file_path(config_path),
-    ] {
-        if let Err(error) = trim_debug_log_file(&path) {
-            eprintln!(
-                "daemon: failed to trim debug log {}: {error}",
-                path.display()
-            );
-        }
-    }
 }
 
 const LOCAL_NAT_ASSIST_PORT: u16 = 3478;
@@ -8380,7 +9250,6 @@ fn write_daemon_control_request(config_path: &Path, request: DaemonControlReques
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    clear_daemon_control_result(config_path);
     fs::write(&control_file, format!("{}\n", request.as_str())).with_context(|| {
         format!(
             "failed to write daemon control request {}",
@@ -8471,67 +9340,6 @@ fn wait_for_daemon_control_result(
     ))
 }
 
-fn daemon_status_matches_expected_session(status: &DaemonStatus, expected_active: bool) -> bool {
-    let current_state = status.state.as_ref();
-    let current_active = current_state
-        .map(|state| state.session_active)
-        .unwrap_or(status.running);
-    let resumed_waiting_for_participants = expected_active
-        && current_state
-            .is_some_and(|state| state.session_status == WAITING_FOR_PARTICIPANTS_STATUS);
-    current_active == expected_active || resumed_waiting_for_participants
-}
-
-fn wait_for_daemon_control_completion(
-    config_path: &Path,
-    request: DaemonControlRequest,
-    expected_active: Option<bool>,
-    timeout: Duration,
-) -> Result<()> {
-    let result_file = daemon_control_result_file_path(config_path);
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if let Some(result) = read_daemon_control_result(config_path)?
-            && result.request == request.as_str()
-        {
-            let _ = fs::remove_file(&result_file);
-            return if result.ok {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "{}",
-                    result
-                        .error
-                        .unwrap_or_else(|| "daemon control request failed".to_string())
-                ))
-            };
-        }
-
-        if let Some(expected_active) = expected_active
-            && let Ok(status) = daemon_status(config_path)
-            && daemon_status_matches_expected_session(&status, expected_active)
-        {
-            return Ok(());
-        }
-
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    if let Some(expected_active) = expected_active {
-        let verb = if expected_active { "resume" } else { "pause" };
-        Err(anyhow!(
-            "daemon acknowledged control request but did not {verb} within {}s; background service may be busy or stuck. try again, or restart/reinstall the app/service if it keeps happening",
-            timeout.as_secs()
-        ))
-    } else {
-        Err(anyhow!(
-            "daemon did not report result for {} within {}s; background service may be busy or stuck. try again, or restart/reinstall the app/service if it keeps happening",
-            request.as_str(),
-            timeout.as_secs()
-        ))
-    }
-}
-
 fn stage_daemon_config_apply(config_path: &Path, source_path: &Path) -> Result<()> {
     let staged_path = daemon_staged_config_file_path(config_path);
     if let Some(parent) = staged_path.parent() {
@@ -8609,7 +9417,6 @@ fn wait_for_daemon_control_ack(config_path: &Path, timeout: Duration) -> Result<
     ))
 }
 
-#[cfg(test)]
 fn wait_for_daemon_session_active(
     config_path: &Path,
     expected_active: bool,
@@ -8617,10 +9424,17 @@ fn wait_for_daemon_session_active(
 ) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if let Ok(status) = daemon_status(config_path)
-            && daemon_status_matches_expected_session(&status, expected_active)
-        {
-            return Ok(());
+        if let Ok(status) = daemon_status(config_path) {
+            let current_state = status.state.as_ref();
+            let current_active = current_state
+                .map(|state| state.session_active)
+                .unwrap_or(status.running);
+            let resumed_waiting_for_participants = expected_active
+                && current_state
+                    .is_some_and(|state| state.session_status == WAITING_FOR_PARTICIPANTS_STATUS);
+            if current_active == expected_active || resumed_waiting_for_participants {
+                return Ok(());
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -8719,6 +9533,236 @@ fn write_daemon_state(path: &Path, state: &DaemonRuntimeState) -> Result<()> {
         .with_context(|| format!("failed to write daemon state file {}", path.display()))?;
     set_daemon_runtime_file_permissions(path)?;
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_daemon_network_cleanup_state(path: &Path) -> Result<Option<MacosNetworkCleanupState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read(path)
+        .with_context(|| format!("failed to read daemon cleanup file {}", path.display()))?;
+    match serde_json::from_slice::<MacosNetworkCleanupState>(&raw) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(parse_error) => {
+            let trimmed = trim_runtime_json_padding(&raw);
+            if trimmed.len() != raw.len()
+                && !trimmed.is_empty()
+                && let Ok(parsed) = serde_json::from_slice::<MacosNetworkCleanupState>(trimmed)
+            {
+                if let Err(error) = write_runtime_file_atomically(path, trimmed) {
+                    eprintln!(
+                        "daemon: parsed padded cleanup file {} but failed to rewrite clean copy: {}",
+                        path.display(),
+                        error
+                    );
+                } else {
+                    let _ = set_daemon_runtime_file_permissions(path);
+                }
+                return Ok(Some(parsed));
+            }
+
+            quarantine_corrupt_runtime_file(path, "daemon cleanup", &parse_error);
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn write_daemon_network_cleanup_state(path: &Path, state: &MacosNetworkCleanupState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(state)?;
+    write_runtime_file_atomically(path, raw.as_bytes())
+        .with_context(|| format!("failed to write daemon cleanup file {}", path.display()))?;
+    set_daemon_runtime_file_permissions(path)?;
+    Ok(())
+}
+
+fn remove_runtime_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn persist_daemon_network_cleanup_state(
+    config_path: &Path,
+    tunnel_runtime: &CliTunnelRuntime,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = daemon_network_cleanup_file_path(config_path);
+        if let Some(state) = tunnel_runtime.macos_network_cleanup_state() {
+            write_daemon_network_cleanup_state(&path, &state)?;
+        } else {
+            remove_runtime_file_if_exists(&path)?;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (config_path, tunnel_runtime);
+    }
+
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_route_delete_error_is_absent(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not in table")
+        || lower.contains("no such process")
+        || lower.contains("no such route")
+}
+
+#[cfg(target_os = "macos")]
+fn repair_legacy_macos_network_state(config_path: &Path) -> Result<bool> {
+    let app = load_or_default_config(config_path)?;
+    let mut repaired = false;
+
+    if let Ok(tunnel_ip) = strip_cidr(&app.node.tunnel_ip).parse::<Ipv4Addr>() {
+        let default_routes = macos_default_routes()?;
+        let underlay_default = macos_underlay_default_route_from_routes(&default_routes);
+        let mut tunnel_default_ifaces = Vec::new();
+
+        for route in default_routes {
+            if !route.interface.starts_with("utun") {
+                continue;
+            }
+
+            match macos_iface_has_ipv4_address(&route.interface, tunnel_ip) {
+                Ok(true) => tunnel_default_ifaces.push(route.interface),
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "repair-network: failed to inspect macOS interface {}: {}",
+                        route.interface, error
+                    );
+                }
+            }
+        }
+
+        if let Some(underlay_default) = underlay_default {
+            for iface in tunnel_default_ifaces {
+                match delete_macos_default_route_for_interface(&iface) {
+                    Ok(()) => repaired = true,
+                    Err(error) if macos_route_delete_error_is_absent(&error.to_string()) => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to remove legacy macOS default route on {iface}")
+                        });
+                    }
+                }
+            }
+
+            if repaired {
+                restore_macos_default_route(&underlay_default)
+                    .context("failed to restore legacy macOS default route")?;
+            }
+        }
+    }
+
+    let route_families =
+        linux_exit_node_default_route_families(&runtime_effective_advertised_routes(&app));
+    if route_families.ipv4 {
+        if let Err(error) = cleanup_macos_pf_nat() {
+            eprintln!("repair-network: failed to clear legacy macOS PF NAT rules: {error}");
+        } else {
+            repaired = true;
+        }
+
+        match read_macos_ip_forward() {
+            Ok(true) => {
+                write_macos_ip_forward(false)
+                    .context("failed to restore legacy macOS IPv4 forwarding state")?;
+                repaired = true;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(error).context("failed to read legacy macOS IPv4 forwarding state");
+            }
+        }
+    }
+
+    Ok(repaired)
+}
+
+fn repair_saved_network_state(config_path: &Path) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = daemon_network_cleanup_file_path(config_path);
+        let Some(state) = read_daemon_network_cleanup_state(&path)? else {
+            return repair_legacy_macos_network_state(config_path);
+        };
+
+        let mut failures = Vec::new();
+        for route in &state.endpoint_bypass_routes {
+            if let Err(error) = delete_macos_endpoint_bypass_route(route)
+                && !macos_route_delete_error_is_absent(&error.to_string())
+            {
+                failures.push(format!("remove bypass route {route}: {error}"));
+            }
+        }
+
+        if let Some(route) = state.original_default_route.as_ref() {
+            if route.interface != state.iface
+                && let Err(error) = delete_macos_default_route_for_interface(&state.iface)
+                && !macos_route_delete_error_is_absent(&error.to_string())
+            {
+                failures.push(format!(
+                    "remove default route on {}: {}",
+                    state.iface, error
+                ));
+            }
+            if let Err(error) = restore_macos_default_route(route) {
+                failures.push(format!("restore default route: {error}"));
+            }
+        } else if !state.iface.trim().is_empty()
+            && let Err(error) = delete_macos_default_route_for_interface(&state.iface)
+            && !macos_route_delete_error_is_absent(&error.to_string())
+        {
+            failures.push(format!(
+                "remove default route on {}: {}",
+                state.iface, error
+            ));
+        }
+
+        if state.pf_was_enabled.is_some() {
+            if let Err(error) = cleanup_macos_pf_nat() {
+                failures.push(format!("remove PF NAT rules: {error}"));
+            }
+            if state.pf_was_enabled == Some(false)
+                && let Err(error) = run_checked(ProcessCommand::new("pfctl").arg("-d"))
+            {
+                failures.push(format!("restore PF enabled state: {error}"));
+            }
+        }
+
+        if let Some(previous) = state.ipv4_forward_was_enabled
+            && let Err(error) = write_macos_ip_forward(previous)
+        {
+            failures.push(format!("restore IPv4 forwarding: {error}"));
+        }
+
+        if !failures.is_empty() {
+            return Err(anyhow!(failures.join("; ")))
+                .with_context(|| format!("failed to repair {}", path.display()));
+        }
+
+        remove_runtime_file_if_exists(&path)?;
+        return Ok(true);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config_path;
+        Ok(false)
+    }
 }
 
 fn read_daemon_peer_cache(path: &Path) -> Result<Option<DaemonPeerCacheState>> {
@@ -9638,7 +10682,7 @@ fn service_install(args: ServiceInstallArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        macos_install_service(
+        macos_service::macos_install_service(
             &executable,
             &config_path,
             &args.iface,
@@ -9688,11 +10732,11 @@ fn service_install(args: ServiceInstallArgs) -> Result<()> {
 }
 
 fn service_uninstall(args: ServiceUninstallArgs) -> Result<()> {
-    let _ = args.config.unwrap_or_else(default_config_path);
+    let config_path = args.config.unwrap_or_else(default_config_path);
 
     #[cfg(target_os = "macos")]
     {
-        macos_uninstall_service()
+        macos_service::macos_uninstall_service(&config_path)
     }
 
     #[cfg(target_os = "linux")]
@@ -9714,11 +10758,11 @@ fn service_uninstall(args: ServiceUninstallArgs) -> Result<()> {
 }
 
 fn service_enable(args: ServiceControlArgs) -> Result<()> {
-    let _ = args.config.unwrap_or_else(default_config_path);
+    let config_path = args.config.unwrap_or_else(default_config_path);
 
     #[cfg(target_os = "macos")]
     {
-        macos_enable_service()
+        macos_service::macos_enable_service(&config_path)
     }
 
     #[cfg(target_os = "windows")]
@@ -9735,11 +10779,11 @@ fn service_enable(args: ServiceControlArgs) -> Result<()> {
 }
 
 fn service_disable(args: ServiceControlArgs) -> Result<()> {
-    let _ = args.config.unwrap_or_else(default_config_path);
+    let config_path = args.config.unwrap_or_else(default_config_path);
 
     #[cfg(target_os = "macos")]
     {
-        macos_disable_service()
+        macos_service::macos_disable_service(&config_path)
     }
 
     #[cfg(target_os = "windows")]
@@ -9756,8 +10800,8 @@ fn service_disable(args: ServiceControlArgs) -> Result<()> {
 }
 
 fn service_status(args: ServiceStatusArgs) -> Result<()> {
-    let _ = args.config.unwrap_or_else(default_config_path);
-    let status = query_service_status()?;
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let status = query_service_status(&config_path)?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -9778,14 +10822,21 @@ fn service_status(args: ServiceStatusArgs) -> Result<()> {
     if let Some(pid) = status.pid {
         println!("service_pid: {pid}");
     }
+    if !status.binary_path.trim().is_empty() {
+        println!("service_binary: {}", status.binary_path);
+    }
+    if !status.binary_version.trim().is_empty() {
+        println!("service_binary_version: {}", status.binary_version);
+    }
 
     Ok(())
 }
 
-fn query_service_status() -> Result<ServiceStatusView> {
+fn query_service_status(config_path: &Path) -> Result<ServiceStatusView> {
     #[cfg(target_os = "macos")]
     {
-        let plist_path = macos_service_plist_path();
+        let plist_path = macos_service::macos_service_plist_path(config_path);
+        let label = macos_service::macos_service_label(config_path);
         let installed = plist_path.exists();
         if !installed {
             return Ok(ServiceStatusView {
@@ -9795,24 +10846,31 @@ fn query_service_status() -> Result<ServiceStatusView> {
                 loaded: false,
                 running: false,
                 pid: None,
-                label: MACOS_SERVICE_LABEL.to_string(),
+                label,
                 plist_path: plist_path.display().to_string(),
+                binary_path: String::new(),
+                binary_version: String::new(),
             });
         }
 
-        let disabled = macos_service_disabled().unwrap_or(false);
+        let disabled = macos_service::macos_service_disabled(config_path).unwrap_or(false);
         let (loaded, running, pid) = if disabled {
             (false, false, None)
         } else {
-            match macos_service_print() {
+            match macos_service::macos_service_print(config_path) {
                 Ok(output) => (
                     true,
-                    macos_service_print_is_running(&output),
-                    macos_service_print_pid(&output),
+                    macos_service::macos_service_print_is_running(&output),
+                    macos_service::macos_service_print_pid(&output),
                 ),
                 Err(_) => (false, false, None),
             }
         };
+        let service_binary = macos_service::macos_service_executable_path(&plist_path);
+        let binary_version = service_binary
+            .as_ref()
+            .and_then(|path| query_binary_version(path))
+            .unwrap_or_default();
 
         Ok(ServiceStatusView {
             supported: true,
@@ -9821,8 +10879,12 @@ fn query_service_status() -> Result<ServiceStatusView> {
             loaded,
             running,
             pid,
-            label: MACOS_SERVICE_LABEL.to_string(),
+            label,
             plist_path: plist_path.display().to_string(),
+            binary_path: service_binary
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            binary_version,
         })
     }
 
@@ -9847,333 +10909,29 @@ fn query_service_status() -> Result<ServiceStatusView> {
             pid: None,
             label: "nvpn".to_string(),
             plist_path: String::new(),
+            binary_path: String::new(),
+            binary_version: String::new(),
         })
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_service_plist_path() -> PathBuf {
-    PathBuf::from(format!(
-        "/Library/LaunchDaemons/{MACOS_SERVICE_LABEL}.plist"
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_target() -> String {
-    format!("system/{MACOS_SERVICE_LABEL}")
-}
-
-#[cfg(target_os = "macos")]
-fn macos_install_service(
-    executable: &Path,
-    config_path: &Path,
-    iface: &str,
-    announce_interval_secs: u64,
-    log_path: &Path,
-    force: bool,
-) -> Result<()> {
-    let plist_path = macos_service_plist_path();
-    if plist_path.exists() && !force {
-        println!(
-            "service already installed at {} (pass --force to reinstall)",
-            plist_path.display()
-        );
-        return Ok(());
-    }
-
-    macos_service_bootout(true)?;
-    stop_existing_daemons_before_service_install(config_path)?;
-    let plist = macos_service_plist_content(
-        executable,
-        config_path,
-        iface,
-        announce_interval_secs,
-        log_path,
-    );
-
-    if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let temp = plist_path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temp, plist).with_context(|| format!("failed to write {}", temp.display()))?;
-    #[cfg(unix)]
-    fs::set_permissions(&temp, fs::Permissions::from_mode(0o644))
-        .with_context(|| format!("failed to chmod {}", temp.display()))?;
-    fs::rename(&temp, &plist_path).with_context(|| {
-        format!(
-            "failed to move {} into {}",
-            temp.display(),
-            plist_path.display()
-        )
-    })?;
-
-    macos_service_bootstrap(&plist_path)?;
-    macos_service_enable()?;
-    macos_service_kickstart()?;
-    println!("installed system service: {}", plist_path.display());
-    println!("label: {}", MACOS_SERVICE_LABEL);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_uninstall_service() -> Result<()> {
-    macos_service_bootout(true)?;
-    macos_service_disable(true)?;
-    let plist_path = macos_service_plist_path();
-    if plist_path.exists() {
-        fs::remove_file(&plist_path)
-            .with_context(|| format!("failed to remove {}", plist_path.display()))?;
-        println!("removed system service plist: {}", plist_path.display());
-    } else {
-        println!("system service plist not found: {}", plist_path.display());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_enable_service() -> Result<()> {
-    let plist_path = macos_service_plist_path();
-    if !plist_path.exists() {
-        return Err(anyhow!(
-            "system service plist not found: {}",
-            plist_path.display()
-        ));
-    }
-
-    macos_service_enable()?;
-    macos_service_bootout(true)?;
-    macos_service_bootstrap(&plist_path)?;
-    macos_service_kickstart()?;
-    println!("enabled system service: {}", plist_path.display());
-    println!("label: {}", MACOS_SERVICE_LABEL);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_disable_service() -> Result<()> {
-    let plist_path = macos_service_plist_path();
-    if !plist_path.exists() {
-        return Err(anyhow!(
-            "system service plist not found: {}",
-            plist_path.display()
-        ));
-    }
-
-    macos_service_bootout(true)?;
-    macos_service_disable(false)?;
-    println!("disabled system service: {}", plist_path.display());
-    println!("label: {}", MACOS_SERVICE_LABEL);
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_service_plist_content(
-    executable: &Path,
-    config_path: &Path,
-    iface: &str,
-    announce_interval_secs: u64,
-    log_path: &Path,
-) -> String {
-    let exec = xml_escape(&executable.display().to_string());
-    let config = xml_escape(&config_path.display().to_string());
-    let iface = xml_escape(iface);
-    let interval = announce_interval_secs.to_string();
-    let log = xml_escape(&log_path.display().to_string());
-
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{MACOS_SERVICE_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exec}</string>
-    <string>daemon</string>
-    <string>--service</string>
-    <string>--config</string>
-    <string>{config}</string>
-    <string>--iface</string>
-    <string>{iface}</string>
-    <string>--announce-interval-secs</string>
-    <string>{interval}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ProcessType</key>
-  <string>Background</string>
-  <key>StandardOutPath</key>
-  <string>{log}</string>
-  <key>StandardErrorPath</key>
-  <string>{log}</string>
-</dict>
-</plist>
-"#
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_bootstrap(plist_path: &Path) -> Result<()> {
-    let plist = plist_path
-        .to_str()
-        .ok_or_else(|| anyhow!("plist path is not valid UTF-8"))?;
-    run_launchctl_checked(&["bootstrap", "system", plist], "bootstrap service")
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_enable() -> Result<()> {
-    let target = macos_service_target();
-    run_launchctl_checked(&["enable", target.as_str()], "enable service")
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_disable(ignore_missing: bool) -> Result<()> {
-    let target = macos_service_target();
-    run_launchctl_allow_missing(
-        &["disable", target.as_str()],
-        "disable service",
-        ignore_missing,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_kickstart() -> Result<()> {
-    let target = macos_service_target();
-    run_launchctl_checked(&["kickstart", "-k", target.as_str()], "kickstart service")
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_bootout(ignore_missing: bool) -> Result<()> {
-    let target = macos_service_target();
-    run_launchctl_allow_missing(
-        &["bootout", target.as_str()],
-        "bootout service",
-        ignore_missing,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_print() -> Result<String> {
-    let target = macos_service_target();
-    let output = run_launchctl_raw(&["print", target.as_str()], "print service")?;
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_print_is_running(print_output: &str) -> bool {
-    print_output
-        .lines()
-        .map(str::trim)
-        .any(|line| line == "state = running")
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_print_pid(print_output: &str) -> Option<u32> {
-    for line in print_output.lines().map(str::trim) {
-        if let Some(value) = line.strip_prefix("pid = ")
-            && let Ok(pid) = value.trim().parse::<u32>()
-        {
-            return Some(pid);
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn macos_service_disabled() -> Result<bool> {
-    let output = run_launchctl_raw(&["print-disabled", "system"], "print disabled services")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(anyhow!(
-            "launchctl print disabled services failed\nstdout: {}\nstderr: {}",
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(macos_service_disabled_from_print_disabled_output(
-        &stdout,
-        MACOS_SERVICE_LABEL,
-    ))
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_service_disabled_from_print_disabled_output(output: &str, label: &str) -> bool {
-    for line in output.lines().map(str::trim) {
-        let Some((entry_label, state)) = line.split_once("=>") else {
-            continue;
-        };
-        if entry_label.trim().trim_matches('"') != label {
-            continue;
-        }
-
-        return state.trim().trim_end_matches(',') == "disabled";
-    }
-
-    false
-}
-
-#[cfg(target_os = "macos")]
-fn run_launchctl_checked(args: &[&str], context: &str) -> Result<()> {
-    let output = run_launchctl_raw(args, context)?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(anyhow!(
-        "launchctl {context} failed\nstdout: {}\nstderr: {}",
-        stdout.trim(),
-        stderr.trim()
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn run_launchctl_allow_missing(args: &[&str], context: &str, ignore_missing: bool) -> Result<()> {
-    let output = run_launchctl_raw(args, context)?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let details = format!("{}\n{}", stdout.trim(), stderr.trim());
-    if ignore_missing && launchctl_missing_service_message(&details) {
-        return Ok(());
-    }
-
-    Err(anyhow!(
-        "launchctl {context} failed\nstdout: {}\nstderr: {}",
-        stdout.trim(),
-        stderr.trim()
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn run_launchctl_raw(args: &[&str], context: &str) -> Result<std::process::Output> {
-    ProcessCommand::new("launchctl")
-        .args(args)
+fn query_binary_version(path: &Path) -> Option<String> {
+    let output = ProcessCommand::new(path)
+        .args(["version", "--json"])
         .output()
-        .with_context(|| format!("failed to launchctl {context}"))
-}
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
 
-#[cfg(target_os = "macos")]
-fn launchctl_missing_service_message(details: &str) -> bool {
-    let lowered = details.to_ascii_lowercase();
-    lowered.contains("could not find service")
-        || lowered.contains("service is disabled")
-        || lowered.contains("no such process")
-        || lowered.contains("no such file")
-        || lowered.contains("domain does not support specified action")
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let info = serde_json::from_str::<VersionInfoView>(stdout.trim()).ok()?;
+    let version = info.version.trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -10268,6 +11026,11 @@ fn linux_uninstall_service() -> Result<()> {
 fn linux_query_service_status() -> Result<ServiceStatusView> {
     let unit_path = linux_service_unit_path();
     let installed = unit_path.exists();
+    let service_binary = linux_service_executable_path(&unit_path);
+    let binary_version = service_binary
+        .as_ref()
+        .and_then(|path| query_binary_version(path))
+        .unwrap_or_default();
     if !linux_systemctl_available() {
         return Ok(ServiceStatusView {
             supported: false,
@@ -10278,6 +11041,10 @@ fn linux_query_service_status() -> Result<ServiceStatusView> {
             pid: None,
             label: LINUX_SERVICE_UNIT_NAME.to_string(),
             plist_path: unit_path.display().to_string(),
+            binary_path: service_binary
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            binary_version,
         });
     }
 
@@ -10301,6 +11068,10 @@ fn linux_query_service_status() -> Result<ServiceStatusView> {
             pid: None,
             label: LINUX_SERVICE_UNIT_NAME.to_string(),
             plist_path: unit_path.display().to_string(),
+            binary_path: service_binary
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            binary_version,
         });
     }
 
@@ -10316,7 +11087,37 @@ fn linux_query_service_status() -> Result<ServiceStatusView> {
         pid,
         label: LINUX_SERVICE_UNIT_NAME.to_string(),
         plist_path: unit_path.display().to_string(),
+        binary_path: service_binary
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        binary_version,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_service_executable_path(unit_path: &Path) -> Option<PathBuf> {
+    let unit = fs::read_to_string(unit_path).ok()?;
+    linux_service_executable_path_from_unit_contents(&unit).map(PathBuf::from)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_service_executable_path_from_unit_contents(unit: &str) -> Option<String> {
+    for line in unit.lines() {
+        let Some(command) = line.trim().strip_prefix("ExecStart=") else {
+            continue;
+        };
+        if let Some(quoted) = command.strip_prefix('"') {
+            let executable = quoted.split_once('"')?.0;
+            if !executable.trim().is_empty() {
+                return Some(executable.to_string());
+            }
+        }
+        let executable = command.split_whitespace().next()?.trim();
+        if !executable.is_empty() {
+            return Some(executable.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -10540,6 +11341,8 @@ fn windows_query_service_status() -> Result<ServiceStatusView> {
             pid: None,
             label: WINDOWS_SERVICE_NAME.to_string(),
             plist_path: WINDOWS_SERVICE_NAME.to_string(),
+            binary_path: String::new(),
+            binary_version: String::new(),
         });
     };
 
@@ -10549,6 +11352,11 @@ fn windows_query_service_status() -> Result<ServiceStatusView> {
     let config_text = String::from_utf8_lossy(&config.stdout);
     let (running, pid) = windows_service_status_from_query_output(&query_text);
     let disabled = windows_service_disabled_from_qc_output(&config_text);
+    let service_binary = windows_service_binary_path_from_sc_qc_output(&config_text);
+    let binary_version = service_binary
+        .as_ref()
+        .and_then(|path| query_binary_version(path))
+        .unwrap_or_default();
     Ok(ServiceStatusView {
         supported: true,
         installed: true,
@@ -10558,7 +11366,35 @@ fn windows_query_service_status() -> Result<ServiceStatusView> {
         pid,
         label: WINDOWS_SERVICE_NAME.to_string(),
         plist_path: WINDOWS_SERVICE_NAME.to_string(),
+        binary_path: service_binary
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        binary_version,
     })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_binary_path_from_sc_qc_output(output: &str) -> Option<PathBuf> {
+    let line = output
+        .lines()
+        .find(|line| line.trim_start().starts_with("BINARY_PATH_NAME"))?;
+    let (_, command) = line.split_once(':')?;
+    let command = command.trim();
+    if let Some(quoted) = command.strip_prefix('"') {
+        let executable = quoted.split_once('"')?.0;
+        if executable.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(executable))
+        }
+    } else {
+        let executable = command.split_whitespace().next()?.trim();
+        if executable.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(executable))
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -10825,6 +11661,16 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 fn install_cli(args: InstallCliArgs) -> Result<()> {
     let destination = args.path.unwrap_or_else(default_cli_install_path);
     install_cli_to_path(&destination, args.force)
@@ -10833,6 +11679,20 @@ fn install_cli(args: InstallCliArgs) -> Result<()> {
 fn uninstall_cli(args: UninstallCliArgs) -> Result<()> {
     let destination = args.path.unwrap_or_else(default_cli_install_path);
     uninstall_cli_path(&destination)
+}
+
+fn print_version(args: VersionArgs) -> Result<()> {
+    let info = VersionInfoView {
+        version: PRODUCT_VERSION.to_string(),
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        println!("{}", info.version);
+    }
+
+    Ok(())
 }
 
 fn default_tunnel_iface() -> String {
@@ -11363,6 +12223,14 @@ struct LinuxDefaultRouteSpec {
     dev: String,
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MacosEndpointBypassRoute {
+    target: String,
+    gateway: Option<String>,
+    interface: String,
+}
+
 #[cfg(target_os = "linux")]
 fn linux_default_route_from_output(output: &str) -> Option<LinuxDefaultRouteSpec> {
     let line = output.lines().find(|line| !line.trim().is_empty())?.trim();
@@ -11372,7 +12240,7 @@ fn linux_default_route_from_output(output: &str) -> Option<LinuxDefaultRouteSpec
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn command_stdout_checked(command: &mut ProcessCommand) -> Result<String> {
     let display = format!("{command:?}");
     let output = command
@@ -11439,7 +12307,7 @@ fn flush_linux_route_cache() -> Result<()> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn relay_bypass_ipv4_hosts(app: &AppConfig) -> Vec<Ipv4Addr> {
     let mut hosts = app
         .nostr
@@ -11452,7 +12320,7 @@ fn relay_bypass_ipv4_hosts(app: &AppConfig) -> Vec<Ipv4Addr> {
     hosts
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn relay_ipv4_hosts(relay: &str) -> Vec<Ipv4Addr> {
     let Some((host, port)) = relay_host_port(relay) else {
         return Vec::new();
@@ -11479,7 +12347,7 @@ fn relay_ipv4_hosts(relay: &str) -> Vec<Ipv4Addr> {
         .unwrap_or_default()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn relay_host_port(relay: &str) -> Option<(String, u16)> {
     let relay = relay.trim();
     if relay.is_empty() {
@@ -11498,7 +12366,117 @@ fn relay_host_port(relay: &str) -> Option<(String, u16)> {
     split_host_port(authority, default_port)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn stun_host_port(server: &str) -> Option<(String, u16)> {
+    let server = server.trim();
+    if server.is_empty() {
+        return None;
+    }
+
+    let authority = server
+        .strip_prefix("stun://")
+        .or_else(|| server.strip_prefix("stun:"))
+        .unwrap_or(server);
+
+    split_host_port(authority, 3478)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn stun_ipv4_hosts(app: &AppConfig) -> Vec<Ipv4Addr> {
+    let mut hosts = app
+        .nat
+        .stun_servers
+        .iter()
+        .filter_map(|server| stun_host_port(server))
+        .flat_map(|(host, port)| {
+            if let Ok(ip) = host.parse::<Ipv4Addr>() {
+                return vec![ip];
+            }
+
+            if host.parse::<IpAddr>().is_ok() {
+                return Vec::new();
+            }
+
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addrs| {
+                    addrs
+                        .filter_map(|addr| match addr.ip() {
+                            IpAddr::V4(ip) => Some(ip),
+                            IpAddr::V6(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn reflector_ipv4_hosts(app: &AppConfig) -> Vec<Ipv4Addr> {
+    let mut hosts = app
+        .nat
+        .reflectors
+        .iter()
+        .filter_map(|reflector| reflector.parse::<SocketAddr>().ok())
+        .filter_map(|addr| match addr.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn management_ipv4_hosts_from_interfaces(interfaces: &[NetworkInterface]) -> Vec<Ipv4Addr> {
+    let mut hosts = interfaces
+        .iter()
+        .filter(|interface| interface.is_up() && !interface.is_loopback() && !interface.is_tun())
+        .flat_map(|interface| {
+            let gateways = interface
+                .gateway
+                .iter()
+                .flat_map(|gateway| gateway.ipv4.iter().copied());
+            let dns_servers = interface
+                .dns_servers
+                .iter()
+                .filter_map(|server| match server {
+                    IpAddr::V4(ip) => Some(*ip),
+                    IpAddr::V6(_) => None,
+                });
+            gateways.chain(dns_servers).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn control_plane_bypass_ipv4_hosts_from_interfaces(
+    app: &AppConfig,
+    interfaces: &[NetworkInterface],
+) -> Vec<Ipv4Addr> {
+    let mut hosts = relay_bypass_ipv4_hosts(app);
+    hosts.extend(stun_ipv4_hosts(app));
+    hosts.extend(reflector_ipv4_hosts(app));
+    hosts.extend(management_ipv4_hosts_from_interfaces(interfaces));
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn control_plane_bypass_ipv4_hosts(app: &AppConfig) -> Vec<Ipv4Addr> {
+    control_plane_bypass_ipv4_hosts_from_interfaces(app, &get_interfaces())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
     let authority = authority.trim();
     if authority.is_empty() {
@@ -11537,7 +12515,7 @@ fn linux_bypass_route_specs(
             Some(IpAddr::V4(ip)) => Some(ip),
             _ => None,
         })
-        .chain(relay_bypass_ipv4_hosts(app))
+        .chain(control_plane_bypass_ipv4_hosts(app))
         .collect::<Vec<_>>();
     hosts.sort_unstable();
     hosts.dedup();
@@ -11605,6 +12583,110 @@ fn delete_linux_endpoint_bypass_route(target: &str) -> Result<()> {
     )
 }
 
+#[cfg(test)]
+fn macos_route_get_spec_from_output(output: &str) -> Option<MacosRouteSpec> {
+    macos_network::macos_route_get_spec_from_output(output)
+}
+
+#[cfg(test)]
+fn macos_default_routes_from_netstat(output: &str) -> Vec<MacosRouteSpec> {
+    macos_network::macos_default_routes_from_netstat(output)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_underlay_default_route_from_routes(routes: &[MacosRouteSpec]) -> Option<MacosRouteSpec> {
+    macos_network::macos_underlay_default_route_from_routes(routes)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_route() -> Result<MacosRouteSpec> {
+    macos_network::macos_default_route()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_routes() -> Result<Vec<MacosRouteSpec>> {
+    macos_network::macos_default_routes()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bypass_route_specs(
+    app: &AppConfig,
+    peers: &[TunnelPeer],
+    tunnel_iface: &str,
+    original_default_route: Option<&MacosRouteSpec>,
+) -> Result<Vec<MacosEndpointBypassRoute>> {
+    macos_network::macos_bypass_route_specs(app, peers, tunnel_iface, original_default_route)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_endpoint_bypass_route(route: &MacosEndpointBypassRoute) -> Result<()> {
+    macos_network::apply_macos_endpoint_bypass_route(route)
+}
+
+#[cfg(target_os = "macos")]
+fn delete_macos_endpoint_bypass_route(target: &str) -> Result<()> {
+    macos_network::delete_macos_endpoint_bypass_route(target)
+}
+
+#[cfg(target_os = "macos")]
+fn restore_macos_default_route(route: &MacosRouteSpec) -> Result<()> {
+    macos_network::restore_macos_default_route(route)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_default_route(gateway: Option<&str>, ifscope: Option<&str>) -> Result<()> {
+    macos_network::apply_macos_default_route(gateway, ifscope)
+}
+
+#[cfg(target_os = "macos")]
+fn delete_macos_default_route_for_interface(iface: &str) -> Result<()> {
+    macos_network::delete_macos_default_route_for_interface(iface)
+}
+
+#[cfg(test)]
+fn macos_ifconfig_has_ipv4(output: &str, needle: Ipv4Addr) -> bool {
+    macos_network::macos_ifconfig_has_ipv4(output, needle)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_iface_has_ipv4_address(iface: &str, needle: Ipv4Addr) -> Result<bool> {
+    macos_network::macos_iface_has_ipv4_address(iface, needle)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_route_spec(
+    target: &str,
+    gateway: Option<&str>,
+    ifscope: Option<&str>,
+) -> Result<()> {
+    macos_network::apply_macos_route_spec(target, gateway, ifscope)
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_ip_forward() -> Result<bool> {
+    macos_network::read_macos_ip_forward()
+}
+
+#[cfg(target_os = "macos")]
+fn write_macos_ip_forward(enabled: bool) -> Result<()> {
+    macos_network::write_macos_ip_forward(enabled)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_ip_forwarding(enabled: bool, runtime: &mut MacosExitNodeRuntime) -> Result<()> {
+    macos_network::ensure_macos_ip_forwarding(enabled, runtime)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_pf_nat(outbound_iface: &str, runtime: &mut MacosExitNodeRuntime) -> Result<()> {
+    macos_network::ensure_macos_pf_nat(outbound_iface, runtime)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_macos_pf_nat() -> Result<()> {
+    macos_network::cleanup_macos_pf_nat()
+}
+
 #[cfg(target_os = "linux")]
 fn read_linux_ip_forward(family: LinuxExitNodeIpFamily) -> Result<bool> {
     let path = linux_ip_forward_path(family);
@@ -11646,14 +12728,14 @@ enum LinuxExitNodeIpFamily {
     V6,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LinuxExitNodeDefaultRouteFamilies {
     ipv4: bool,
     ipv6: bool,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn linux_exit_node_default_route_families(routes: &[String]) -> LinuxExitNodeDefaultRouteFamilies {
     LinuxExitNodeDefaultRouteFamilies {
         ipv4: routes.iter().any(|route| route == "0.0.0.0/0"),
@@ -11881,6 +12963,11 @@ fn apply_local_interface_network(
                 .arg("255.255.255.0")
                 .arg("up"),
         )?;
+        eprintln!(
+            "tunnel: applying macOS interface {} with routes [{}]",
+            iface,
+            route_targets.join(", ")
+        );
         for target in route_targets {
             apply_macos_route(iface, target)?;
         }
@@ -11911,56 +12998,11 @@ fn linux_route_target_is_ipv4(target: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn apply_macos_route(iface: &str, target: &str) -> Result<()> {
-    let target_ip = strip_cidr(target);
-    let is_host = target.ends_with("/32") || !target.contains('/');
-
-    let add_result = if is_host {
-        run_checked(
-            ProcessCommand::new("route")
-                .arg("-n")
-                .arg("add")
-                .arg("-host")
-                .arg(target_ip)
-                .arg("-interface")
-                .arg(iface),
-        )
-    } else {
-        run_checked(
-            ProcessCommand::new("route")
-                .arg("-n")
-                .arg("add")
-                .arg("-net")
-                .arg(target)
-                .arg("-interface")
-                .arg(iface),
-        )
-    };
-
-    if add_result.is_ok() {
-        return Ok(());
+    if target == "0.0.0.0/0" {
+        eprintln!("tunnel: applying macOS default route via interface {iface}");
+        return apply_macos_default_route(None, Some(iface));
     }
-
-    if is_host {
-        run_checked(
-            ProcessCommand::new("route")
-                .arg("-n")
-                .arg("change")
-                .arg("-host")
-                .arg(target_ip)
-                .arg("-interface")
-                .arg(iface),
-        )
-    } else {
-        run_checked(
-            ProcessCommand::new("route")
-                .arg("-n")
-                .arg("change")
-                .arg("-net")
-                .arg(target)
-                .arg("-interface")
-                .arg(iface),
-        )
-    }
+    apply_macos_route_spec(target, None, Some(iface))
 }
 
 #[cfg(unix)]
@@ -12125,67 +13167,17 @@ fn run_checked(command: &mut ProcessCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
-    use std::time::Duration;
-
-    use anyhow::anyhow;
     use clap::CommandFactory;
-    use nostr_sdk::prelude::ToBech32;
-    use nostr_vpn_core::config::NetworkConfig;
-
-    use crate::{ServiceStatusView, unix_timestamp};
-
-    use super::{
-        ActiveRelaySession, AppConfig, Cli, DaemonPeerCacheEntry, DaemonPeerCacheRestore,
-        DaemonPeerCacheState, DaemonRuntimeState, DiscoveredPublicSignalEndpoint, InstallCliArgs,
-        LinuxExitNodeIpFamily, OutboundAnnounceBook, PeerAnnouncement, PendingRelayRequest,
-        PlannedTunnelPeer, RelayAllocationGranted, RelayAllocationRejected, RelayGrantAction,
-        RelayProviderVerification, TunnelPeer, UninstallCliArgs, WireGuardPeerStatus,
-        active_private_announce_participants, announcement_fingerprint, apply_config_file,
-        apply_participants_override, build_daemon_reload_config, build_peer_announcement,
-        build_runtime_magic_dns_records, can_reuse_active_listen_port,
-        connected_peer_count_for_runtime, daemon_control_file_path, daemon_peer_cache_file_path,
-        daemon_peer_transport_state, daemon_pids_from_ps_output, daemon_reconnect_backoff_delay,
-        daemon_session_active, daemon_session_idle_status, daemon_staged_config_file_path,
-        default_cli_install_path, endpoint_with_listen_port, install_cli,
-        is_uapi_addr_in_use_error, key_b64_to_hex, kill_error_requires_control_fallback,
-        known_private_announce_participants, linux_default_route_device_from_output,
-        linux_exit_node_default_route_families, linux_exit_node_firewall_binary,
-        linux_exit_node_forward_in_rule, linux_exit_node_forward_out_rule,
-        linux_exit_node_ipv4_masquerade_rule, linux_exit_node_source_cidr, linux_ipv4_route_source,
-        linux_route_get_spec_from_output, linux_route_target_is_ipv4,
-        linux_service_status_from_show_output, load_config_with_overrides,
-        local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
-        nat_punch_targets, nat_punch_targets_for_local_endpoint,
-        nat_punch_targets_for_local_endpoints, parse_exit_node_arg, parse_nonzero_pid,
-        participants_needing_relay, peer_has_recent_handshake, peer_path_cache_timeout_secs,
-        peer_runtime_lookup, peer_signal_timeout_secs, pending_tunnel_heartbeat_ips,
-        persisted_path_cache_timeout_secs, persisted_peer_cache_timeout_secs, planned_tunnel_peers,
-        planned_tunnel_peers_for_local_endpoints, public_endpoint_for_listen_port,
-        public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
-        read_daemon_peer_cache, read_daemon_state, record_successful_runtime_paths,
-        relay_connection_action, request_daemon_reload, request_daemon_stop,
-        restore_daemon_peer_cache, route_targets_for_tunnel_peers,
-        route_targets_require_endpoint_bypass, runtime_endpoint_requires_refresh,
-        runtime_local_signal_endpoint, runtime_peer_endpoints_require_refresh, runtime_signal_ipv4,
-        stage_daemon_config_apply, take_daemon_control_request, uninstall_cli,
-        update_daemon_config_from_staged_request, utun_interface_candidates,
-        windows_service_bin_path, windows_service_disabled_from_qc_output,
-        windows_service_status_from_query_output, windows_should_apply_config_via_service,
-        write_daemon_peer_cache,
-    };
-    use std::collections::HashMap;
-    use std::fs;
-    use std::net::Ipv4Addr;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use nostr_sdk::prelude::Keys;
-    use nostr_vpn_core::crypto::generate_keypair;
-    use nostr_vpn_core::paths::PeerPathBook;
-    use nostr_vpn_core::presence::PeerPresenceBook;
-    use nostr_vpn_core::relay::RelayAllocationRejectReason;
-    use nostr_vpn_core::signaling::SignalPayload;
+    use crate::{Cli, PeerAnnouncement};
+
+    mod config_cache_split;
+    mod daemon_control_split;
+    mod peer_runtime_split;
+    mod routing_split;
+    mod runtime_misc_split;
+    mod service_split;
 
     fn sample_peer_announcement(public_key: String) -> PeerAnnouncement {
         PeerAnnouncement {
@@ -12219,6 +13211,7 @@ mod tests {
         for name in [
             "start",
             "stop",
+            "repair-network",
             "reload",
             "pause",
             "resume",
@@ -12237,6 +13230,7 @@ mod tests {
             "install-cli",
             "uninstall-cli",
             "service",
+            "version",
         ] {
             assert!(
                 command
@@ -12283,3324 +13277,6 @@ mod tests {
                 .any(|argument| argument.get_long() == Some("exit-node")),
             "missing --exit-node on set command"
         );
-    }
-
-    #[test]
-    fn clap_service_supports_install_uninstall_status() {
-        let command = Cli::command();
-        let service = command
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "service")
-            .expect("service subcommand exists");
-        for name in ["install", "enable", "disable", "uninstall", "status"] {
-            assert!(
-                service
-                    .get_subcommands()
-                    .any(|subcommand| subcommand.get_name() == name),
-                "missing service subcommand {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn linux_service_show_parser_extracts_running_state() {
-        let show = "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\n";
-        let (loaded, running, pid) = linux_service_status_from_show_output(show);
-        assert!(loaded);
-        assert!(running);
-        assert_eq!(pid, Some(4242));
-    }
-
-    #[test]
-    fn macos_service_disabled_parser_extracts_disabled_state() {
-        let output = r#"
-            disabled services = {
-                "to.nostrvpn.nvpn" => disabled
-                "com.example.other" => enabled
-            }
-        "#;
-
-        assert!(macos_service_disabled_from_print_disabled_output(
-            output,
-            "to.nostrvpn.nvpn"
-        ));
-        assert!(!macos_service_disabled_from_print_disabled_output(
-            output,
-            "com.example.other"
-        ));
-        assert!(!macos_service_disabled_from_print_disabled_output(
-            output,
-            "missing.service"
-        ));
-    }
-
-    #[test]
-    fn macos_service_plist_runs_service_supervised_daemon() {
-        let plist = super::macos_service_plist_content(
-            Path::new("/Applications/Nostr VPN.app/Contents/MacOS/nvpn"),
-            Path::new("/Users/sirius/Library/Application Support/nvpn/config.toml"),
-            "utun100",
-            20,
-            Path::new("/Users/sirius/Library/Logs/nvpn/daemon.log"),
-        );
-
-        assert!(plist.contains("<string>daemon</string>"));
-        assert!(plist.contains("<string>--service</string>"));
-        assert!(plist.contains("<string>--config</string>"));
-    }
-
-    #[test]
-    fn linux_service_unit_runs_service_supervised_daemon() {
-        let unit = super::linux_service_unit_content(
-            Path::new("/usr/local/bin/nvpn"),
-            Path::new("/home/sirius/.config/nvpn/config.toml"),
-            "nvpn",
-            20,
-            Path::new("/home/sirius/.local/state/nvpn/daemon.log"),
-        );
-
-        assert!(unit.contains("ExecStart=\"/usr/local/bin/nvpn\" daemon --service --config"));
-        assert!(unit.contains("--iface \"nvpn\""));
-        assert!(unit.contains("--announce-interval-secs 20"));
-    }
-
-    #[test]
-    fn daemon_session_requires_remote_participants_to_be_active() {
-        assert!(!daemon_session_active(true, 0));
-        assert!(daemon_session_active(true, 1));
-        assert!(!daemon_session_active(false, 1));
-    }
-
-    #[test]
-    fn daemon_session_idle_status_distinguishes_waiting_from_paused() {
-        assert_eq!(
-            daemon_session_idle_status(true, 0, false),
-            super::WAITING_FOR_PARTICIPANTS_STATUS
-        );
-        assert_eq!(
-            daemon_session_idle_status(false, 0, true),
-            "Listening for join requests"
-        );
-        assert_eq!(daemon_session_idle_status(false, 0, false), "Paused");
-        assert_eq!(daemon_session_idle_status(true, 2, false), "Paused");
-    }
-
-    #[test]
-    fn windows_service_query_parser_extracts_running_state() {
-        let query = "SERVICE_NAME: NvpnService\n        TYPE               : 10  WIN32_OWN_PROCESS\n        STATE              : 4  RUNNING\n                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)\n        WIN32_EXIT_CODE    : 0  (0x0)\n        SERVICE_EXIT_CODE  : 0  (0x0)\n        CHECKPOINT         : 0x0\n        WAIT_HINT          : 0x0\n        PID                : 1234\n        FLAGS              :\n";
-        let (running, pid) = windows_service_status_from_query_output(query);
-        assert!(running);
-        assert_eq!(pid, Some(1234));
-    }
-
-    #[test]
-    fn windows_service_config_parser_extracts_disabled_state() {
-        let query = "SERVICE_NAME: NvpnService\n        TYPE               : 10  WIN32_OWN_PROCESS\n        START_TYPE         : 4   DISABLED\n        ERROR_CONTROL      : 1   NORMAL\n        BINARY_PATH_NAME   : \"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --service --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\"\n";
-        assert!(windows_service_disabled_from_qc_output(query));
-
-        let auto_start = "SERVICE_NAME: NvpnService\n        TYPE               : 10  WIN32_OWN_PROCESS\n        START_TYPE         : 2   AUTO_START\n";
-        assert!(!windows_service_disabled_from_qc_output(auto_start));
-    }
-
-    #[test]
-    fn windows_apply_config_uses_installed_enabled_service() {
-        let enabled_service = ServiceStatusView {
-            supported: true,
-            installed: true,
-            disabled: false,
-            loaded: true,
-            running: false,
-            pid: None,
-            label: "NvpnService".to_string(),
-            plist_path: "NvpnService".to_string(),
-        };
-        assert!(windows_should_apply_config_via_service(&enabled_service));
-
-        let disabled_service = ServiceStatusView {
-            disabled: true,
-            ..enabled_service.clone()
-        };
-        assert!(!windows_should_apply_config_via_service(&disabled_service));
-
-        let missing_service = ServiceStatusView {
-            installed: false,
-            loaded: false,
-            ..enabled_service
-        };
-        assert!(!windows_should_apply_config_via_service(&missing_service));
-    }
-
-    #[test]
-    fn parse_nonzero_pid_rejects_zero_and_invalid_values() {
-        assert_eq!(parse_nonzero_pid("4242"), Some(4242));
-        assert_eq!(parse_nonzero_pid("0"), None);
-        assert_eq!(parse_nonzero_pid("not-a-number"), None);
-    }
-
-    #[test]
-    fn daemon_reconnect_backoff_is_bounded_exponential() {
-        assert_eq!(daemon_reconnect_backoff_delay(1).as_secs(), 1);
-        assert_eq!(daemon_reconnect_backoff_delay(2).as_secs(), 2);
-        assert_eq!(daemon_reconnect_backoff_delay(3).as_secs(), 4);
-        assert_eq!(daemon_reconnect_backoff_delay(4).as_secs(), 8);
-        assert_eq!(daemon_reconnect_backoff_delay(5).as_secs(), 16);
-        assert_eq!(daemon_reconnect_backoff_delay(6).as_secs(), 30);
-        assert_eq!(daemon_reconnect_backoff_delay(99).as_secs(), 30);
-    }
-
-    #[test]
-    fn reconnect_only_for_connection_class_errors() {
-        assert!(publish_error_requires_reconnect(
-            "client not connected to relays"
-        ));
-        assert!(publish_error_requires_reconnect("relay pool shutdown"));
-        assert!(publish_error_requires_reconnect(
-            "event not published: relay not connected (status changed)"
-        ));
-        assert!(publish_error_requires_reconnect(
-            "event not published: recv message response timeout"
-        ));
-        assert!(publish_error_requires_reconnect(
-            "connection closed by peer"
-        ));
-
-        assert!(!publish_error_requires_reconnect(
-            "private signaling event rejected by all relays"
-        ));
-        assert!(!publish_error_requires_reconnect(
-            "event not published: Policy violated and pubkey is not in our web of trust."
-        ));
-    }
-
-    #[test]
-    fn peer_signal_timeout_has_reasonable_floor_and_scale() {
-        assert_eq!(peer_signal_timeout_secs(1), 20);
-        assert_eq!(peer_signal_timeout_secs(5), 20);
-        assert_eq!(peer_signal_timeout_secs(10), 30);
-    }
-
-    #[test]
-    fn peer_path_cache_timeout_keeps_endpoint_memory_longer_than_presence_timeout() {
-        assert_eq!(peer_path_cache_timeout_secs(1), 60);
-        assert_eq!(peer_path_cache_timeout_secs(5), 60);
-        assert_eq!(peer_path_cache_timeout_secs(10), 90);
-    }
-
-    #[test]
-    fn outbound_announce_book_republishes_after_peer_forget() {
-        let mut book = OutboundAnnounceBook::default();
-        assert!(book.needs_send("peer-a", "fp1"));
-        book.mark_sent("peer-a", "fp1");
-        assert!(!book.needs_send("peer-a", "fp1"));
-        assert!(book.needs_send("peer-a", "fp2"));
-
-        book.forget("peer-a");
-        assert!(book.needs_send("peer-a", "fp1"));
-    }
-
-    #[test]
-    fn hello_signal_forces_targeted_private_announce_republish() {
-        let mut book = OutboundAnnounceBook::default();
-        book.mark_sent("peer-a", "fp1");
-        super::maybe_reset_targeted_announce_cache_for_hello(
-            &mut book,
-            "peer-a",
-            &SignalPayload::Hello,
-        );
-        assert!(book.needs_send("peer-a", "fp1"));
-
-        book.mark_sent("peer-a", "fp1");
-        super::maybe_reset_targeted_announce_cache_for_hello(
-            &mut book,
-            "peer-a",
-            &SignalPayload::Announce(PeerAnnouncement {
-                node_id: "node-a".to_string(),
-                public_key: "pubkey".to_string(),
-                endpoint: "192.0.2.10:51820".to_string(),
-                local_endpoint: None,
-                public_endpoint: Some("198.51.100.20:51820".to_string()),
-                relay_endpoint: None,
-                relay_pubkey: None,
-                relay_expires_at: None,
-                tunnel_ip: "10.44.0.2/32".to_string(),
-                advertised_routes: Vec::new(),
-                timestamp: 1,
-            }),
-        );
-        assert!(!book.needs_send("peer-a", "fp1"));
-    }
-
-    #[test]
-    fn cached_peerbook_keeps_connected_peer_count_after_presence_expires() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: None,
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 1,
-        };
-
-        let mut presence = PeerPresenceBook::default();
-        assert!(presence.apply_signal(
-            participant.clone(),
-            SignalPayload::Announce(announcement.clone()),
-            100,
-        ));
-        assert_eq!(presence.prune_stale(200, 20), vec![participant.clone()]);
-        assert!(presence.active().is_empty());
-        assert!(presence.announcement_for(&participant).is_some());
-
-        let now = 1_700_000_000;
-        let runtime_peers = HashMap::from([(
-            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
-            WireGuardPeerStatus {
-                endpoint: Some("203.0.113.20:51820".to_string()),
-                last_handshake_sec: Some(5),
-                last_handshake_nsec: Some(0),
-                ..WireGuardPeerStatus::default()
-            },
-        )]);
-
-        assert_eq!(
-            connected_peer_count_for_runtime(&config, None, &presence, Some(&runtime_peers), now),
-            1
-        );
-
-        let runtime_peer = peer_runtime_lookup(&announcement, Some(&runtime_peers))
-            .expect("runtime peer should resolve from cached announcement");
-        assert!(peer_has_recent_handshake(runtime_peer));
-    }
-
-    #[test]
-    fn known_private_announce_participants_include_cached_inactive_peers() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: None,
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: vec!["0.0.0.0/0".to_string()],
-            timestamp: 1,
-        };
-
-        let mut presence = PeerPresenceBook::default();
-        assert!(presence.apply_signal(
-            participant.clone(),
-            SignalPayload::Announce(announcement),
-            100,
-        ));
-        assert_eq!(presence.prune_stale(200, 20), vec![participant.clone()]);
-        assert!(presence.active().is_empty());
-        assert!(presence.announcement_for(&participant).is_some());
-
-        assert!(
-            active_private_announce_participants(&config, None, &presence).is_empty(),
-            "inactive cached peers should not be part of active announce refreshes"
-        );
-        assert_eq!(
-            known_private_announce_participants(&config, None, &presence),
-            vec![participant]
-        );
-    }
-
-    #[test]
-    fn idle_handshake_within_wireguard_session_window_counts_mesh_as_ready() {
-        let runtime_peer = WireGuardPeerStatus {
-            endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(120),
-            last_handshake_nsec: Some(0),
-            ..WireGuardPeerStatus::default()
-        };
-
-        assert!(peer_has_recent_handshake(&runtime_peer));
-    }
-
-    #[test]
-    fn stale_handshake_does_not_count_mesh_as_ready() {
-        let runtime_peer = WireGuardPeerStatus {
-            endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(181),
-            last_handshake_nsec: Some(0),
-            ..WireGuardPeerStatus::default()
-        };
-
-        assert!(!peer_has_recent_handshake(&runtime_peer));
-    }
-
-    #[test]
-    fn daemon_peer_transport_state_reports_missing_signal() {
-        let state = daemon_peer_transport_state(None, false, None, 1_700_000_000);
-
-        assert!(!state.reachable);
-        assert_eq!(state.last_handshake_at, None);
-        assert_eq!(state.error.as_deref(), Some("no signal yet"));
-    }
-
-    #[test]
-    fn daemon_peer_transport_state_reports_invalid_peer_key() {
-        let announcement = sample_peer_announcement("not-a-wireguard-key".to_string());
-
-        let state = daemon_peer_transport_state(Some(&announcement), true, None, 1_700_000_000);
-
-        assert!(!state.reachable);
-        assert_eq!(state.error.as_deref(), Some("invalid peer key"));
-    }
-
-    #[test]
-    fn daemon_peer_transport_state_reports_signal_stale_before_runtime_error() {
-        let keys = generate_keypair();
-        let announcement = sample_peer_announcement(keys.public_key);
-
-        let state = daemon_peer_transport_state(Some(&announcement), false, None, 1_700_000_000);
-
-        assert!(!state.reachable);
-        assert_eq!(state.error.as_deref(), Some("signal stale"));
-    }
-
-    #[test]
-    fn daemon_peer_transport_state_reports_missing_runtime_peer_for_fresh_signal() {
-        let keys = generate_keypair();
-        let announcement = sample_peer_announcement(keys.public_key);
-
-        let state = daemon_peer_transport_state(Some(&announcement), true, None, 1_700_000_000);
-
-        assert!(!state.reachable);
-        assert_eq!(state.error.as_deref(), Some("peer not in tunnel runtime"));
-    }
-
-    #[test]
-    fn daemon_peer_transport_state_reports_awaiting_handshake_when_runtime_peer_is_idle() {
-        let keys = generate_keypair();
-        let announcement = sample_peer_announcement(keys.public_key);
-        let runtime_peer = WireGuardPeerStatus {
-            endpoint: Some("203.0.113.20:51820".to_string()),
-            ..WireGuardPeerStatus::default()
-        };
-
-        let state = daemon_peer_transport_state(
-            Some(&announcement),
-            true,
-            Some(&runtime_peer),
-            1_700_000_000,
-        );
-
-        assert!(!state.reachable);
-        assert_eq!(state.last_handshake_at, None);
-        assert_eq!(state.error.as_deref(), Some("awaiting handshake"));
-    }
-
-    #[test]
-    fn handshake_age_converts_to_observed_epoch() {
-        let runtime_peer = WireGuardPeerStatus {
-            endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(5),
-            last_handshake_nsec: Some(0),
-            ..WireGuardPeerStatus::default()
-        };
-
-        assert_eq!(
-            runtime_peer.last_handshake_at(1_700_000_000),
-            Some(1_699_999_995)
-        );
-    }
-
-    #[test]
-    fn parse_wg_peer_status_extracts_transfer_counters() {
-        let response = "\
-public_key=peer-a\n\
-endpoint=203.0.113.20:51820\n\
-last_handshake_time_sec=5\n\
-last_handshake_time_nsec=0\n\
-tx_bytes=1234\n\
-rx_bytes=5678\n\
-errno=0\n";
-
-        let peers = super::parse_wg_peer_status(response);
-        let peer = peers.get("peer-a").expect("peer should parse");
-
-        assert_eq!(peer.endpoint.as_deref(), Some("203.0.113.20:51820"));
-        assert_eq!(peer.tx_bytes, 1234);
-        assert_eq!(peer.rx_bytes, 5678);
-    }
-
-    #[test]
-    fn participants_override_targets_the_active_network() {
-        let alice = Keys::generate().public_key().to_hex();
-        let bob = Keys::generate().public_key().to_hex();
-        let carol = Keys::generate().public_key().to_hex();
-
-        let mut config = AppConfig::generated();
-        config.networks = vec![
-            NetworkConfig {
-                id: "home".to_string(),
-                name: "Home".to_string(),
-                enabled: false,
-                network_id: "mesh-home".to_string(),
-                participants: vec![alice.clone()],
-                admins: Vec::new(),
-                listen_for_join_requests: true,
-                invite_inviter: String::new(),
-                outbound_join_request: None,
-                inbound_join_requests: Vec::new(),
-                shared_roster_updated_at: 0,
-                shared_roster_signed_by: String::new(),
-            },
-            NetworkConfig {
-                id: "work".to_string(),
-                name: "Work".to_string(),
-                enabled: true,
-                network_id: "mesh-work".to_string(),
-                participants: vec![bob],
-                admins: Vec::new(),
-                listen_for_join_requests: true,
-                invite_inviter: String::new(),
-                outbound_join_request: None,
-                inbound_join_requests: Vec::new(),
-                shared_roster_updated_at: 0,
-                shared_roster_signed_by: String::new(),
-            },
-        ];
-        config.ensure_defaults();
-
-        apply_participants_override(&mut config, vec![carol.clone()]).expect("apply override");
-
-        assert_eq!(config.participant_pubkeys_hex(), vec![carol.clone()]);
-        assert_eq!(
-            config
-                .network_by_id("home")
-                .expect("home network")
-                .participants,
-            vec![alice]
-        );
-        assert_eq!(
-            config
-                .network_by_id("work")
-                .expect("work network")
-                .participants,
-            vec![carol]
-        );
-    }
-
-    #[test]
-    fn config_overrides_set_the_active_network_mesh_id() {
-        let nonce = unix_timestamp();
-        let dir = std::env::temp_dir().join(format!("nvpn-load-config-override-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let config_path = dir.join("config.toml");
-
-        let mut config = AppConfig::generated();
-        config.networks = vec![
-            NetworkConfig {
-                id: "home".to_string(),
-                name: "Home".to_string(),
-                enabled: false,
-                network_id: "mesh-home".to_string(),
-                participants: vec!["11".repeat(32)],
-                admins: Vec::new(),
-                listen_for_join_requests: true,
-                invite_inviter: String::new(),
-                outbound_join_request: None,
-                inbound_join_requests: Vec::new(),
-                shared_roster_updated_at: 0,
-                shared_roster_signed_by: String::new(),
-            },
-            NetworkConfig {
-                id: "work".to_string(),
-                name: "Work".to_string(),
-                enabled: true,
-                network_id: "mesh-work".to_string(),
-                participants: vec!["22".repeat(32)],
-                admins: Vec::new(),
-                listen_for_join_requests: true,
-                invite_inviter: String::new(),
-                outbound_join_request: None,
-                inbound_join_requests: Vec::new(),
-                shared_roster_updated_at: 0,
-                shared_roster_signed_by: String::new(),
-            },
-        ];
-        config.ensure_defaults();
-        config.save(&config_path).expect("save temp config");
-
-        let (loaded, network_id) =
-            load_config_with_overrides(&config_path, Some("mesh-override".to_string()), Vec::new())
-                .expect("load config with override");
-
-        assert_eq!(network_id, "mesh-override");
-        assert_eq!(loaded.effective_network_id(), "mesh-override");
-        assert_eq!(
-            loaded
-                .network_by_id("home")
-                .expect("home network")
-                .network_id,
-            "mesh-home"
-        );
-        assert_eq!(
-            loaded
-                .network_by_id("work")
-                .expect("work network")
-                .network_id,
-            "mesh-override"
-        );
-
-        let _ = fs::remove_file(&config_path);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn persisted_peer_cache_roundtrips_known_peers_and_path_hints() {
-        let nonce = unix_timestamp();
-        let dir = std::env::temp_dir().join(format!("nvpn-peer-cache-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp cache dir");
-        let config_path = dir.join("config.toml");
-        let cache_path = daemon_peer_cache_file_path(&config_path);
-
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-        let network_id = config.effective_network_id();
-        let own_pubkey = config.own_nostr_pubkey_hex().ok();
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 100,
-        };
-
-        let mut path_book = PeerPathBook::default();
-        assert!(path_book.note_success(participant.clone(), "203.0.113.20:51820", 120,));
-
-        let cache = DaemonPeerCacheState {
-            version: 1,
-            network_id: network_id.clone(),
-            own_pubkey: own_pubkey.clone(),
-            updated_at: 130,
-            peers: vec![DaemonPeerCacheEntry {
-                participant_pubkey: participant.clone(),
-                announcement: announcement.clone(),
-                last_signal_seen_at: Some(110),
-                cached_at: 125,
-            }],
-            path_book,
-        };
-        write_daemon_peer_cache(&cache_path, &cache).expect("write peer cache");
-        let loaded = read_daemon_peer_cache(&cache_path)
-            .expect("read peer cache")
-            .expect("cache should exist");
-        assert_eq!(loaded.network_id, network_id);
-        assert_eq!(loaded.peers.len(), 1);
-
-        let mut restored_presence = PeerPresenceBook::default();
-        let mut restored_paths = PeerPathBook::default();
-        assert!(
-            restore_daemon_peer_cache(
-                DaemonPeerCacheRestore {
-                    path: &cache_path,
-                    app: &config,
-                    network_id: &network_id,
-                    own_pubkey: own_pubkey.as_deref(),
-                    now: 130,
-                    announce_interval_secs: 20,
-                },
-                &mut restored_presence,
-                &mut restored_paths,
-            )
-            .expect("restore peer cache")
-        );
-        assert!(restored_presence.active().is_empty());
-        assert!(restored_presence.known().contains_key(&participant));
-
-        let planned = planned_tunnel_peers(
-            &config,
-            own_pubkey.as_deref(),
-            restored_presence.known(),
-            &mut restored_paths,
-            Some("10.0.0.33:51820"),
-            130,
-        )
-        .expect("planned peers from restored cache");
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].endpoint, "203.0.113.20:51820");
-
-        let _ = fs::remove_file(&cache_path);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stale_persisted_peer_cache_is_ignored() {
-        let nonce = unix_timestamp();
-        let dir = std::env::temp_dir().join(format!("nvpn-stale-peer-cache-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp cache dir");
-        let config_path = dir.join("config.toml");
-        let cache_path = daemon_peer_cache_file_path(&config_path);
-
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-        let network_id = config.effective_network_id();
-        let own_pubkey = config.own_nostr_pubkey_hex().ok();
-
-        let cache = DaemonPeerCacheState {
-            version: 1,
-            network_id: network_id.clone(),
-            own_pubkey: own_pubkey.clone(),
-            updated_at: 10,
-            peers: vec![DaemonPeerCacheEntry {
-                participant_pubkey: participant,
-                announcement: PeerAnnouncement {
-                    node_id: "peer-a".to_string(),
-                    public_key: generate_keypair().public_key,
-                    endpoint: "203.0.113.20:51820".to_string(),
-                    local_endpoint: None,
-                    public_endpoint: Some("203.0.113.20:51820".to_string()),
-                    relay_endpoint: None,
-                    relay_pubkey: None,
-                    relay_expires_at: None,
-                    tunnel_ip: "10.44.0.2/32".to_string(),
-                    advertised_routes: Vec::new(),
-                    timestamp: 1,
-                },
-                last_signal_seen_at: Some(10),
-                cached_at: 10,
-            }],
-            path_book: PeerPathBook::default(),
-        };
-        write_daemon_peer_cache(&cache_path, &cache).expect("write stale peer cache");
-
-        let mut restored_presence = PeerPresenceBook::default();
-        let mut restored_paths = PeerPathBook::default();
-        assert!(
-            !restore_daemon_peer_cache(
-                DaemonPeerCacheRestore {
-                    path: &cache_path,
-                    app: &config,
-                    network_id: &network_id,
-                    own_pubkey: own_pubkey.as_deref(),
-                    now: 10 + persisted_peer_cache_timeout_secs(20) + 1,
-                    announce_interval_secs: 20,
-                },
-                &mut restored_presence,
-                &mut restored_paths,
-            )
-            .expect("restore stale cache")
-        );
-        assert!(restored_presence.known().is_empty());
-        assert!(!restored_paths.prune_stale(
-            10 + persisted_path_cache_timeout_secs(20) + 1,
-            persisted_path_cache_timeout_secs(20),
-        ));
-
-        let _ = fs::remove_file(&cache_path);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn utun_candidates_expand_for_default_style_names() {
-        let candidates = utun_interface_candidates("utun100");
-        assert_eq!(candidates.len(), 16);
-        assert_eq!(candidates[0], "utun100");
-        assert_eq!(candidates[1], "utun101");
-        assert_eq!(candidates[15], "utun115");
-    }
-
-    #[test]
-    fn utun_candidates_keep_custom_iface_as_is() {
-        let candidates = utun_interface_candidates("wg0");
-        assert_eq!(candidates, vec!["wg0".to_string()]);
-    }
-
-    #[test]
-    fn uapi_addr_in_use_matcher_detects_common_errnos() {
-        assert!(is_uapi_addr_in_use_error("uapi set failed: errno=48"));
-        assert!(is_uapi_addr_in_use_error("uapi set failed: errno=98"));
-        assert!(!is_uapi_addr_in_use_error("uapi set failed: errno=1"));
-    }
-
-    #[test]
-    fn endpoint_listen_port_rewrite_updates_socket_port() {
-        assert_eq!(
-            endpoint_with_listen_port("192.168.1.10:51820", 52000),
-            "192.168.1.10:52000"
-        );
-        assert_eq!(
-            endpoint_with_listen_port("[2001:db8::1]:51820", 52000),
-            "[2001:db8::1]:52000"
-        );
-        assert_eq!(
-            endpoint_with_listen_port("not-a-socket", 52000),
-            "not-a-socket"
-        );
-    }
-
-    #[test]
-    fn local_interface_address_for_tunnel_preserves_host_prefix() {
-        assert_eq!(
-            local_interface_address_for_tunnel("10.44.0.1/32"),
-            "10.44.0.1/32"
-        );
-        assert_eq!(
-            local_interface_address_for_tunnel("10.44.0.1"),
-            "10.44.0.1/32"
-        );
-    }
-
-    #[test]
-    fn route_targets_for_tunnel_peers_use_peer_allowed_ips() {
-        let routes = route_targets_for_tunnel_peers(&[
-            TunnelPeer {
-                pubkey_hex: "a".repeat(64),
-                endpoint: "203.0.113.10:51820".to_string(),
-                allowed_ips: vec!["10.44.0.3/32".to_string()],
-            },
-            TunnelPeer {
-                pubkey_hex: "b".repeat(64),
-                endpoint: "203.0.113.11:51820".to_string(),
-                allowed_ips: vec!["10.44.0.2/32".to_string(), "10.55.0.0/24".to_string()],
-            },
-            TunnelPeer {
-                pubkey_hex: "c".repeat(64),
-                endpoint: "203.0.113.12:51820".to_string(),
-                allowed_ips: vec!["10.44.0.2/32".to_string()],
-            },
-        ]);
-
-        assert_eq!(
-            routes,
-            vec![
-                "10.44.0.2/32".to_string(),
-                "10.44.0.3/32".to_string(),
-                "10.55.0.0/24".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn route_targets_detect_when_endpoint_bypass_is_required() {
-        assert!(!route_targets_require_endpoint_bypass(&[
-            "10.44.0.2/32".to_string()
-        ]));
-        assert!(route_targets_require_endpoint_bypass(&[
-            "10.55.0.0/24".to_string()
-        ]));
-        assert!(route_targets_require_endpoint_bypass(&[
-            "0.0.0.0/0".to_string()
-        ]));
-    }
-
-    #[test]
-    fn linux_ipv4_route_source_uses_tunnel_ipv4_address() {
-        assert_eq!(
-            linux_ipv4_route_source("10.44.93.37/32"),
-            Some("10.44.93.37".to_string())
-        );
-        assert_eq!(linux_ipv4_route_source("fd00::1/128"), None);
-    }
-
-    #[test]
-    fn linux_route_target_is_ipv4_detects_ipv4_and_ipv6_targets() {
-        assert!(linux_route_target_is_ipv4("0.0.0.0/0"));
-        assert!(linux_route_target_is_ipv4("10.44.93.37/32"));
-        assert!(!linux_route_target_is_ipv4("::/0"));
-    }
-
-    #[test]
-    fn linux_exit_node_default_route_families_detect_ipv4_and_ipv6_defaults() {
-        let ipv6_only = linux_exit_node_default_route_families(&["::/0".to_string()]);
-        assert!(!ipv6_only.ipv4);
-        assert!(ipv6_only.ipv6);
-
-        let dual_stack = linux_exit_node_default_route_families(&[
-            "10.55.0.0/24".to_string(),
-            "0.0.0.0/0".to_string(),
-            "::/0".to_string(),
-        ]);
-        assert!(dual_stack.ipv4);
-        assert!(dual_stack.ipv6);
-    }
-
-    #[test]
-    fn linux_exit_node_ipv6_forward_rules_use_ip6tables_shape() {
-        assert_eq!(
-            linux_exit_node_firewall_binary(LinuxExitNodeIpFamily::V4),
-            "iptables"
-        );
-        assert_eq!(
-            linux_exit_node_firewall_binary(LinuxExitNodeIpFamily::V6),
-            "ip6tables"
-        );
-        assert_eq!(
-            linux_exit_node_ipv4_masquerade_rule("eth0", "10.44.0.0/24"),
-            vec![
-                "POSTROUTING".to_string(),
-                "-o".to_string(),
-                "eth0".to_string(),
-                "-s".to_string(),
-                "10.44.0.0/24".to_string(),
-                "-m".to_string(),
-                "comment".to_string(),
-                "--comment".to_string(),
-                "nvpn-exit-masq".to_string(),
-                "-j".to_string(),
-                "MASQUERADE".to_string(),
-            ]
-        );
-        assert_eq!(
-            linux_exit_node_forward_in_rule("utun100", LinuxExitNodeIpFamily::V6),
-            vec![
-                "FORWARD".to_string(),
-                "-i".to_string(),
-                "utun100".to_string(),
-                "-m".to_string(),
-                "comment".to_string(),
-                "--comment".to_string(),
-                "nvpn-exit6-forward-in".to_string(),
-                "-j".to_string(),
-                "ACCEPT".to_string(),
-            ]
-        );
-        assert_eq!(
-            linux_exit_node_forward_out_rule("utun100", LinuxExitNodeIpFamily::V6),
-            vec![
-                "FORWARD".to_string(),
-                "-o".to_string(),
-                "utun100".to_string(),
-                "-m".to_string(),
-                "conntrack".to_string(),
-                "--ctstate".to_string(),
-                "RELATED,ESTABLISHED".to_string(),
-                "-m".to_string(),
-                "comment".to_string(),
-                "--comment".to_string(),
-                "nvpn-exit6-forward-out".to_string(),
-                "-j".to_string(),
-                "ACCEPT".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn linux_exit_node_source_cidr_uses_full_auto_mesh_range() {
-        assert_eq!(
-            linux_exit_node_source_cidr("10.44.183.163/32"),
-            Some("10.44.0.0/16".to_string())
-        );
-    }
-
-    #[test]
-    fn linux_exit_node_source_cidr_preserves_custom_non_mesh_prefixes() {
-        assert_eq!(
-            linux_exit_node_source_cidr("10.55.7.9/32"),
-            Some("10.55.7.0/24".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_exit_node_arg_normalizes_and_clears() {
-        let peer = Keys::generate();
-        let peer_hex = peer.public_key().to_hex();
-        let peer_npub = peer.public_key().to_bech32().expect("peer npub");
-
-        assert_eq!(
-            parse_exit_node_arg(&peer_npub).expect("parse exit node"),
-            Some(peer_hex)
-        );
-        assert_eq!(parse_exit_node_arg("off").expect("clear"), None);
-        assert_eq!(parse_exit_node_arg("none").expect("clear"), None);
-        assert_eq!(parse_exit_node_arg("").expect("clear"), None);
-    }
-
-    #[test]
-    fn runtime_local_signal_endpoint_prefers_detected_ipv4_for_private_configured_endpoint() {
-        assert_eq!(
-            runtime_local_signal_endpoint(
-                "192.168.178.55:51820",
-                52000,
-                Some(Ipv4Addr::new(172, 20, 10, 2)),
-            ),
-            "172.20.10.2:52000"
-        );
-        assert_eq!(
-            runtime_local_signal_endpoint(
-                "127.0.0.1:51820",
-                52000,
-                Some(Ipv4Addr::new(172, 20, 10, 2)),
-            ),
-            "172.20.10.2:52000"
-        );
-    }
-
-    #[test]
-    fn runtime_local_signal_endpoint_prefers_detected_ipv4_for_cgnat_configured_endpoint() {
-        assert_eq!(
-            runtime_local_signal_endpoint(
-                "100.110.224.101:51820",
-                52000,
-                Some(Ipv4Addr::new(192, 168, 178, 80)),
-            ),
-            "192.168.178.80:52000"
-        );
-    }
-
-    #[test]
-    fn runtime_local_signal_endpoint_keeps_public_configured_endpoint() {
-        assert_eq!(
-            runtime_local_signal_endpoint(
-                "93.184.216.34:51820",
-                52000,
-                Some(Ipv4Addr::new(172, 20, 10, 2)),
-            ),
-            "93.184.216.34:52000"
-        );
-    }
-
-    #[test]
-    fn runtime_signal_ipv4_ignores_tunnel_address() {
-        assert_eq!(
-            runtime_signal_ipv4(Some(Ipv4Addr::new(10, 44, 110, 128)), "10.44.110.128/32"),
-            None
-        );
-        assert_eq!(
-            runtime_signal_ipv4(Some(Ipv4Addr::new(192, 168, 178, 80)), "10.44.110.128/32"),
-            Some(Ipv4Addr::new(192, 168, 178, 80))
-        );
-    }
-
-    #[test]
-    fn public_endpoint_for_listen_port_requires_matching_discovery_port() {
-        let endpoint = DiscoveredPublicSignalEndpoint {
-            listen_port: 51820,
-            endpoint: "198.51.100.20:43127".to_string(),
-        };
-
-        assert_eq!(
-            public_endpoint_for_listen_port(Some(&endpoint), 51820),
-            Some("198.51.100.20:43127".to_string())
-        );
-        assert_eq!(
-            public_endpoint_for_listen_port(Some(&endpoint), 51821),
-            None
-        );
-    }
-
-    #[test]
-    fn mapped_public_signal_endpoint_rejects_cgnat_address() {
-        assert_eq!(
-            public_signal_endpoint_from_mapping(51820, "100.99.218.131:51821".to_string()),
-            None
-        );
-    }
-
-    #[test]
-    fn mapped_public_signal_endpoint_accepts_public_address() {
-        assert_eq!(
-            public_signal_endpoint_from_mapping(51820, "198.51.100.20:51821".to_string()),
-            Some(DiscoveredPublicSignalEndpoint {
-                listen_port: 51820,
-                endpoint: "198.51.100.20:51821".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn peer_announcement_includes_effective_advertised_routes() {
-        let mut config = AppConfig::generated();
-        config.node.advertise_exit_node = true;
-        config.node.advertised_routes = vec!["10.0.0.0/24".to_string()];
-        config.ensure_defaults();
-
-        let announcement = build_peer_announcement(&config, 51820, None);
-
-        assert_eq!(
-            announcement.advertised_routes,
-            vec![
-                "10.0.0.0/24".to_string(),
-                "0.0.0.0/0".to_string(),
-                "::/0".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn announcement_fingerprint_changes_when_routes_change() {
-        let mut config = AppConfig::generated();
-        let initial = build_peer_announcement(&config, 51820, None);
-        let initial_fingerprint = announcement_fingerprint(&initial);
-
-        config.node.advertise_exit_node = true;
-        let updated = build_peer_announcement(&config, 51820, None);
-
-        assert_ne!(initial_fingerprint, announcement_fingerprint(&updated));
-    }
-
-    #[test]
-    fn planned_tunnel_peers_assign_selected_exit_node_default_route() {
-        let mut config = AppConfig::generated();
-        let exit_participant = Keys::generate().public_key().to_hex();
-        let routed_participant = Keys::generate().public_key().to_hex();
-        config.networks[0].participants =
-            vec![exit_participant.clone(), routed_participant.clone()];
-        config.exit_node = exit_participant.clone();
-        config.ensure_defaults();
-
-        let announcements = HashMap::from([
-            (
-                exit_participant.clone(),
-                PeerAnnouncement {
-                    node_id: "exit-node".to_string(),
-                    public_key: generate_keypair().public_key,
-                    endpoint: "203.0.113.20:51820".to_string(),
-                    local_endpoint: None,
-                    public_endpoint: Some("203.0.113.20:51820".to_string()),
-                    relay_endpoint: None,
-                    relay_pubkey: None,
-                    relay_expires_at: None,
-                    tunnel_ip: "10.44.0.2/32".to_string(),
-                    advertised_routes: vec![
-                        "10.60.0.0/24".to_string(),
-                        "0.0.0.0/0".to_string(),
-                        "::/0".to_string(),
-                    ],
-                    timestamp: 1,
-                },
-            ),
-            (
-                routed_participant.clone(),
-                PeerAnnouncement {
-                    node_id: "routed-node".to_string(),
-                    public_key: generate_keypair().public_key,
-                    endpoint: "203.0.113.21:51820".to_string(),
-                    local_endpoint: None,
-                    public_endpoint: Some("203.0.113.21:51820".to_string()),
-                    relay_endpoint: None,
-                    relay_pubkey: None,
-                    relay_expires_at: None,
-                    tunnel_ip: "10.44.0.3/32".to_string(),
-                    advertised_routes: vec!["10.70.0.0/24".to_string()],
-                    timestamp: 1,
-                },
-            ),
-        ]);
-
-        let planned = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            Some("192.0.2.10:51820"),
-            10,
-        )
-        .expect("planned tunnel peers");
-
-        let exit_peer = planned
-            .iter()
-            .find(|planned| planned.participant == exit_participant)
-            .expect("exit peer");
-        assert_eq!(
-            exit_peer.peer.allowed_ips,
-            vec![
-                "10.44.0.2/32".to_string(),
-                "0.0.0.0/0".to_string(),
-                "10.60.0.0/24".to_string(),
-            ]
-        );
-
-        let routed_peer = planned
-            .iter()
-            .find(|planned| planned.participant == routed_participant)
-            .expect("routed peer");
-        assert_eq!(
-            routed_peer.peer.allowed_ips,
-            vec!["10.44.0.3/32".to_string(), "10.70.0.0/24".to_string()]
-        );
-    }
-
-    #[test]
-    fn planned_tunnel_peers_ignore_default_route_without_selected_exit_node() {
-        let mut config = AppConfig::generated();
-        let exit_participant = Keys::generate().public_key().to_hex();
-        config.networks[0].participants = vec![exit_participant.clone()];
-        config.ensure_defaults();
-
-        let announcements = HashMap::from([(
-            exit_participant.clone(),
-            PeerAnnouncement {
-                node_id: "exit-node".to_string(),
-                public_key: generate_keypair().public_key,
-                endpoint: "203.0.113.20:51820".to_string(),
-                local_endpoint: None,
-                public_endpoint: Some("203.0.113.20:51820".to_string()),
-                relay_endpoint: None,
-                relay_pubkey: None,
-                relay_expires_at: None,
-                tunnel_ip: "10.44.0.2/32".to_string(),
-                advertised_routes: vec!["0.0.0.0/0".to_string(), "10.60.0.0/24".to_string()],
-                timestamp: 1,
-            },
-        )]);
-
-        let planned = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            Some("192.0.2.10:51820"),
-            10,
-        )
-        .expect("planned tunnel peers");
-
-        assert_eq!(
-            planned[0].peer.allowed_ips,
-            vec!["10.44.0.2/32".to_string(), "10.60.0.0/24".to_string()]
-        );
-    }
-
-    #[test]
-    fn linux_default_route_device_parser_extracts_interface() {
-        assert_eq!(
-            linux_default_route_device_from_output(
-                "default via 198.19.242.2 dev eth0 proto static\n"
-            ),
-            Some("eth0".to_string())
-        );
-    }
-
-    #[test]
-    fn linux_route_get_parser_extracts_gateway_interface_and_source() {
-        let spec = linux_route_get_spec_from_output(
-            "10.254.241.10 via 198.19.242.2 dev eth0 src 198.19.242.3 uid 0\n    cache\n",
-        )
-        .expect("linux route get spec");
-
-        assert_eq!(spec.gateway.as_deref(), Some("198.19.242.2"));
-        assert_eq!(spec.dev, "eth0");
-        assert_eq!(spec.src.as_deref(), Some("198.19.242.3"));
-    }
-
-    #[test]
-    fn reuses_running_listen_port_without_rebind() {
-        assert!(can_reuse_active_listen_port(true, true, Some(51820), 51820));
-        assert!(!can_reuse_active_listen_port(
-            true,
-            true,
-            Some(51820),
-            51821
-        ));
-        assert!(!can_reuse_active_listen_port(
-            false,
-            true,
-            Some(51820),
-            51820
-        ));
-        assert!(!can_reuse_active_listen_port(
-            true,
-            false,
-            Some(51820),
-            51820
-        ));
-        assert!(!can_reuse_active_listen_port(true, true, None, 51820));
-    }
-
-    #[test]
-    fn tunnel_heartbeat_targets_only_include_peers_without_handshake() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: None,
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 1,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-
-        let pending = pending_tunnel_heartbeat_ips(&config, None, &announcements, None);
-        assert_eq!(pending, vec![Ipv4Addr::new(10, 44, 0, 2)]);
-
-        let runtime_peers = HashMap::from([(
-            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
-            WireGuardPeerStatus {
-                endpoint: Some("203.0.113.20:51820".to_string()),
-                last_handshake_sec: Some(1),
-                last_handshake_nsec: Some(0),
-                ..WireGuardPeerStatus::default()
-            },
-        )]);
-        let pending =
-            pending_tunnel_heartbeat_ips(&config, None, &announcements, Some(&runtime_peers));
-        assert!(pending.is_empty(), "handshaken peer should not be probed");
-    }
-
-    #[test]
-    fn relay_connection_action_reconnects_only_when_disconnected() {
-        assert_eq!(
-            relay_connection_action(true),
-            super::RelayConnectionAction::KeepConnected
-        );
-        assert_eq!(
-            relay_connection_action(false),
-            super::RelayConnectionAction::ReconnectWhenDue
-        );
-    }
-
-    #[test]
-    fn runtime_handshake_updates_path_cache() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement.clone())]);
-        let mut paths = PeerPathBook::default();
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut paths,
-            Some("192.168.1.33:51820"),
-            10,
-        )
-        .expect("initial tunnel peers");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "192.168.1.20:51820");
-        paths.note_selected(&participant, &selected[0].endpoint, 10);
-
-        let runtime_peers = HashMap::from([(
-            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
-            WireGuardPeerStatus {
-                endpoint: Some("203.0.113.20:51820".to_string()),
-                last_handshake_sec: Some(1),
-                last_handshake_nsec: Some(0),
-                ..WireGuardPeerStatus::default()
-            },
-        )]);
-        assert!(record_successful_runtime_paths(
-            &announcements,
-            Some(&runtime_peers),
-            &mut paths,
-            &["192.168.1.33:51820".to_string()],
-            16,
-        ));
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut paths,
-            Some("192.168.1.33:51820"),
-            16,
-        )
-        .expect("tunnel peers after handshake");
-        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
-    }
-
-    #[test]
-    fn successful_local_path_rotates_to_public_after_network_change() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-        let mut paths = PeerPathBook::default();
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut paths,
-            Some("192.168.1.33:51820"),
-            10,
-        )
-        .expect("initial tunnel peers");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "192.168.1.20:51820");
-        paths.note_selected(&participant, &selected[0].endpoint, 10);
-        assert!(paths.note_success(participant.clone(), &selected[0].endpoint, 11));
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut paths,
-            Some("172.20.10.7:51820"),
-            12,
-        )
-        .expect("tunnel peers after network change");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
-    }
-
-    #[test]
-    fn runtime_endpoint_refresh_requires_cross_subnet_local_drift() {
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "10.254.241.10:51820".to_string(),
-            local_endpoint: Some("198.19.241.3:51820".to_string()),
-            public_endpoint: Some("10.254.241.10:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: vec!["0.0.0.0/0".to_string()],
-            timestamp: 10,
-        };
-
-        assert!(runtime_endpoint_requires_refresh(
-            "198.19.241.3:51820",
-            "10.254.241.10:51820",
-            &announcement,
-            &["198.19.242.3:51820".to_string()],
-        ));
-        assert!(!runtime_endpoint_requires_refresh(
-            "198.19.241.3:51820",
-            "10.254.241.10:51820",
-            &announcement,
-            &["198.19.241.4:51820".to_string()],
-        ));
-        assert!(runtime_endpoint_requires_refresh(
-            "198.19.242.1:6861",
-            "10.254.241.10:51820",
-            &announcement,
-            &["198.19.242.3:51820".to_string()],
-        ));
-        assert!(!runtime_endpoint_requires_refresh(
-            "203.0.113.20:51820",
-            "10.254.241.10:51820",
-            &announcement,
-            &["198.19.242.3:51820".to_string()],
-        ));
-    }
-
-    #[test]
-    fn record_successful_runtime_paths_ignores_cross_subnet_local_runtime_endpoint() {
-        let participant = "11".repeat(32);
-        let peer_keys = generate_keypair();
-        let announcements = HashMap::from([(
-            participant,
-            PeerAnnouncement {
-                node_id: "peer-a".to_string(),
-                public_key: peer_keys.public_key.clone(),
-                endpoint: "10.254.241.10:51820".to_string(),
-                local_endpoint: Some("198.19.241.3:51820".to_string()),
-                public_endpoint: Some("10.254.241.10:51820".to_string()),
-                relay_endpoint: None,
-                relay_pubkey: None,
-                relay_expires_at: None,
-                tunnel_ip: "10.44.0.2/32".to_string(),
-                advertised_routes: vec!["0.0.0.0/0".to_string()],
-                timestamp: 10,
-            },
-        )]);
-        let runtime_peers = HashMap::from([(
-            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
-            WireGuardPeerStatus {
-                endpoint: Some("198.19.241.3:51820".to_string()),
-                last_handshake_sec: Some(1),
-                last_handshake_nsec: Some(0),
-                ..WireGuardPeerStatus::default()
-            },
-        )]);
-        let mut paths = PeerPathBook::default();
-
-        assert!(!record_successful_runtime_paths(
-            &announcements,
-            Some(&runtime_peers),
-            &mut paths,
-            &["198.19.242.3:51820".to_string()],
-            12,
-        ));
-    }
-
-    #[test]
-    fn runtime_peer_endpoint_refresh_waits_for_handshake() {
-        let participant = "11".repeat(32);
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "10.254.241.10:51820".to_string(),
-            local_endpoint: Some("198.19.241.3:51820".to_string()),
-            public_endpoint: Some("10.254.241.10:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: vec!["0.0.0.0/0".to_string()],
-            timestamp: 10,
-        };
-        let planned = vec![PlannedTunnelPeer {
-            participant: participant.clone(),
-            endpoint: "10.254.241.10:51820".to_string(),
-            peer: TunnelPeer {
-                pubkey_hex: key_b64_to_hex(&announcement.public_key).expect("peer pubkey hex"),
-                endpoint: "10.254.241.10:51820".to_string(),
-                allowed_ips: vec!["10.44.0.2/32".to_string()],
-            },
-        }];
-        let announcements = HashMap::from([(participant, announcement)]);
-        let runtime_peers = HashMap::from([(
-            planned[0].peer.pubkey_hex.clone(),
-            WireGuardPeerStatus {
-                endpoint: Some("198.19.241.3:51820".to_string()),
-                last_handshake_sec: None,
-                last_handshake_nsec: None,
-                ..WireGuardPeerStatus::default()
-            },
-        )]);
-
-        assert!(!runtime_peer_endpoints_require_refresh(
-            &planned,
-            &announcements,
-            Some(&runtime_peers),
-            &["198.19.242.3:51820".to_string()],
-        ));
-    }
-
-    #[test]
-    fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expires() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.nat.enabled = false;
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let original = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let flapped = PeerAnnouncement {
-            public_endpoint: None,
-            endpoint: "192.168.1.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            timestamp: 20,
-            ..original.clone()
-        };
-
-        let mut paths = PeerPathBook::default();
-        let original_announcements = HashMap::from([(participant.clone(), original)]);
-        let runtime_peers = HashMap::from([(
-            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
-            WireGuardPeerStatus {
-                endpoint: Some("203.0.113.20:51820".to_string()),
-                last_handshake_sec: Some(1),
-                last_handshake_nsec: Some(0),
-                ..WireGuardPeerStatus::default()
-            },
-        )]);
-        assert!(record_successful_runtime_paths(
-            &original_announcements,
-            Some(&runtime_peers),
-            &mut paths,
-            &["10.0.0.33:51820".to_string()],
-            12,
-        ));
-
-        let flapped_announcements = HashMap::from([(participant.clone(), flapped.clone())]);
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &flapped_announcements,
-            &mut paths,
-            Some("10.0.0.33:51820"),
-            21,
-        )
-        .expect("cached tunnel peers");
-        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
-
-        paths.prune_stale(200, peer_path_cache_timeout_secs(5));
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &flapped_announcements,
-            &mut paths,
-            Some("10.0.0.33:51820"),
-            200,
-        )
-        .expect("fallback tunnel peers");
-        assert_eq!(selected[0].endpoint, "192.168.1.20:51820");
-    }
-
-    #[test]
-    fn nat_remote_peer_waits_for_public_endpoint_before_runtime_apply() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.nat.enabled = true;
-        config.node.endpoint = "198.19.241.3:51820".to_string();
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "198.19.242.3:51820".to_string(),
-            local_endpoint: Some("198.19.242.3:51820".to_string()),
-            public_endpoint: None,
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            Some("198.19.241.3:51820"),
-            10,
-        )
-        .expect("planned tunnel peers");
-        assert!(selected.is_empty());
-        assert!(nat_punch_targets(&config, None, &announcements, 51820).is_empty());
-    }
-
-    #[test]
-    fn nat_same_subnet_peer_can_use_local_endpoint_without_public_signal() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.nat.enabled = true;
-        config.node.endpoint = "198.19.241.3:51820".to_string();
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "198.19.241.11:51820".to_string(),
-            local_endpoint: Some("198.19.241.11:51820".to_string()),
-            public_endpoint: None,
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            Some("198.19.241.3:51820"),
-            10,
-        )
-        .expect("planned tunnel peers");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "198.19.241.11:51820");
-        assert!(
-            nat_punch_targets_for_local_endpoint(
-                &config,
-                None,
-                &announcements,
-                "198.19.241.3:51820"
-            )
-            .is_empty(),
-            "same-subnet peer should not trigger nat punch"
-        );
-    }
-
-    #[test]
-    fn cgnat_configured_host_endpoint_still_plans_same_lan_peer() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.nat.enabled = true;
-        config.node.endpoint = "100.110.224.101:51820".to_string();
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "192.168.178.44:51820".to_string(),
-            local_endpoint: Some("192.168.178.44:51820".to_string()),
-            public_endpoint: None,
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.1.158/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-        let own_local_endpoint = runtime_local_signal_endpoint(
-            &config.node.endpoint,
-            51820,
-            Some(Ipv4Addr::new(192, 168, 178, 80)),
-        );
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            Some(&own_local_endpoint),
-            10,
-        )
-        .expect("planned tunnel peers");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "192.168.178.44:51820");
-        assert!(
-            nat_punch_targets_for_local_endpoint(
-                &config,
-                None,
-                &announcements,
-                &own_local_endpoint
-            )
-            .is_empty(),
-            "same-lan peer should not trigger nat punch when local endpoint is known"
-        );
-    }
-
-    #[test]
-    fn secondary_local_subnet_peer_is_planned_without_public_signal() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.nat.enabled = true;
-        config.node.endpoint = "192.168.178.80:51820".to_string();
-        config.networks[0].participants = vec![participant.clone()];
-
-        let peer_keys = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: peer_keys.public_key.clone(),
-            endpoint: "10.211.55.3:51820".to_string(),
-            local_endpoint: Some("10.211.55.3:51820".to_string()),
-            public_endpoint: None,
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.199.77/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-        let own_local_endpoints = local_endpoints(&["192.168.178.80:51820", "10.211.55.2:51820"]);
-
-        let selected = planned_tunnel_peers_for_local_endpoints(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            &own_local_endpoints,
-            10,
-        )
-        .expect("planned tunnel peers");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "10.211.55.3:51820");
-        assert!(
-            nat_punch_targets_for_local_endpoints(
-                &config,
-                None,
-                &announcements,
-                &own_local_endpoints
-            )
-            .is_empty(),
-            "peer reachable on a secondary local subnet should not require nat punch"
-        );
-    }
-
-    #[test]
-    fn explicit_announcement_keeps_local_endpoint_for_private_override() {
-        let announcement = super::build_explicit_peer_announcement(
-            "peer-a".to_string(),
-            generate_keypair().public_key,
-            "10.211.55.3:51820".to_string(),
-            "10.211.55.3:51820".to_string(),
-            "10.44.199.77/32".to_string(),
-            Vec::new(),
-        );
-
-        assert_eq!(announcement.endpoint, "10.211.55.3:51820");
-        assert_eq!(
-            announcement.local_endpoint.as_deref(),
-            Some("10.211.55.3:51820")
-        );
-        assert!(announcement.public_endpoint.is_none());
-    }
-
-    #[test]
-    fn explicit_announcement_keeps_public_and_local_endpoints_separate() {
-        let announcement = super::build_explicit_peer_announcement(
-            "peer-a".to_string(),
-            generate_keypair().public_key,
-            "203.0.113.20:51820".to_string(),
-            "192.168.178.80:51820".to_string(),
-            "10.44.0.239/32".to_string(),
-            Vec::new(),
-        );
-
-        assert_eq!(announcement.endpoint, "203.0.113.20:51820");
-        assert_eq!(
-            announcement.local_endpoint.as_deref(),
-            Some("192.168.178.80:51820")
-        );
-        assert_eq!(
-            announcement.public_endpoint.as_deref(),
-            Some("203.0.113.20:51820")
-        );
-    }
-
-    #[test]
-    fn explicit_announcement_preserves_reflected_private_endpoint_from_distinct_subnet() {
-        let announcement = super::build_explicit_peer_announcement(
-            "peer-a".to_string(),
-            generate_keypair().public_key,
-            "10.254.241.10:51820".to_string(),
-            "198.19.241.3:51820".to_string(),
-            "10.44.0.239/32".to_string(),
-            Vec::new(),
-        );
-
-        assert_eq!(announcement.endpoint, "10.254.241.10:51820");
-        assert_eq!(
-            announcement.local_endpoint.as_deref(),
-            Some("198.19.241.3:51820")
-        );
-        assert_eq!(
-            announcement.public_endpoint.as_deref(),
-            Some("10.254.241.10:51820")
-        );
-    }
-
-    #[test]
-    fn explicit_announcement_can_attach_active_relay_endpoint() {
-        let announcement = super::build_explicit_peer_announcement_with_relay(
-            "peer-a".to_string(),
-            generate_keypair().public_key,
-            "203.0.113.20:51820".to_string(),
-            "192.168.178.80:51820".to_string(),
-            "10.44.0.239/32".to_string(),
-            Vec::new(),
-            super::RelayAnnouncementDetails {
-                relay_endpoint: Some("198.51.100.30:40001".to_string()),
-                relay_pubkey: Some("relay-pubkey".to_string()),
-                relay_expires_at: Some(500),
-            },
-        );
-
-        assert_eq!(
-            announcement.relay_endpoint.as_deref(),
-            Some("198.51.100.30:40001")
-        );
-        assert_eq!(announcement.relay_pubkey.as_deref(), Some("relay-pubkey"));
-        assert_eq!(announcement.relay_expires_at, Some(500));
-    }
-
-    #[test]
-    fn relay_endpoint_is_preferred_when_active() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: Some("198.51.100.30:40001".to_string()),
-            relay_pubkey: Some("relay-pubkey".to_string()),
-            relay_expires_at: Some(500),
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            Some("10.0.0.33:51820"),
-            100,
-        )
-        .expect("planned tunnel peers");
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "198.51.100.30:40001");
-    }
-
-    #[test]
-    fn expired_relay_endpoint_is_ignored_for_planning() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: Some("198.51.100.30:40001".to_string()),
-            relay_pubkey: Some("relay-pubkey".to_string()),
-            relay_expires_at: Some(50),
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &announcements,
-            &mut PeerPathBook::default(),
-            Some("10.0.0.33:51820"),
-            100,
-        )
-        .expect("planned tunnel peers");
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
-    }
-
-    #[test]
-    fn local_relay_session_overrides_runtime_endpoint() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let announcements = HashMap::from([(participant.clone(), announcement)]);
-        let relay_sessions = HashMap::from([(
-            participant.clone(),
-            ActiveRelaySession {
-                relay_pubkey: "relay-pubkey".to_string(),
-                local_ingress_endpoint: "198.51.100.30:40001".to_string(),
-                advertised_ingress_endpoint: "198.51.100.30:40002".to_string(),
-                granted_at: 100,
-                verified_at: Some(101),
-                expires_at: 500,
-            },
-        )]);
-        let effective =
-            super::effective_peer_announcements_for_runtime(&announcements, &relay_sessions, 100);
-
-        assert_eq!(
-            effective
-                .get(&participant)
-                .and_then(|announcement| announcement.relay_endpoint.as_deref()),
-            Some("198.51.100.30:40001")
-        );
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &effective,
-            &mut PeerPathBook::default(),
-            Some("10.0.0.33:51820"),
-            100,
-        )
-        .expect("planned tunnel peers");
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "198.51.100.30:40001");
-    }
-
-    #[test]
-    fn relay_endpoint_waits_for_direct_retry_window_before_preempting() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let direct_only = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key.clone(),
-            endpoint: "10.203.1.11:51820".to_string(),
-            local_endpoint: Some("10.203.1.11:51820".to_string()),
-            public_endpoint: Some("10.203.1.11:51820".to_string()),
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 100,
-        };
-
-        let direct_and_relay = PeerAnnouncement {
-            relay_endpoint: Some("10.203.1.2:40001".to_string()),
-            relay_pubkey: Some("relay-pubkey".to_string()),
-            relay_expires_at: Some(500),
-            ..direct_only.clone()
-        };
-
-        let mut path_book = PeerPathBook::default();
-        let own_local_endpoints = vec!["10.203.1.10:51820".to_string()];
-        path_book.refresh_from_announcement(participant.clone(), &direct_only, 100);
-        let initially_selected = path_book
-            .select_endpoint_for_local_endpoints(
-                &participant,
-                &direct_only,
-                &own_local_endpoints,
-                100,
-                super::PEER_PATH_RETRY_AFTER_SECS,
-            )
-            .expect("initial endpoint");
-        assert_eq!(initially_selected, "10.203.1.11:51820");
-        path_book.note_selected(participant.clone(), &initially_selected, 100);
-
-        path_book.refresh_from_announcement(participant.clone(), &direct_and_relay, 101);
-        let selected_with_relay = path_book
-            .select_endpoint_for_local_endpoints(
-                &participant,
-                &direct_and_relay,
-                &own_local_endpoints,
-                101,
-                super::PEER_PATH_RETRY_AFTER_SECS,
-            )
-            .expect("direct endpoint before retry window");
-
-        assert_eq!(selected_with_relay, "10.203.1.11:51820");
-
-        let selected_after_retry = path_book
-            .select_endpoint_for_local_endpoints(
-                &participant,
-                &direct_and_relay,
-                &own_local_endpoints,
-                106,
-                super::PEER_PATH_RETRY_AFTER_SECS,
-            )
-            .expect("relay endpoint after retry window");
-
-        assert_eq!(selected_after_retry, "10.203.1.2:40001");
-    }
-
-    #[test]
-    fn planned_tunnel_peers_ignore_relay_endpoint_when_relay_routing_disabled() {
-        let mut config = AppConfig::generated();
-        config.use_public_relay_fallback = false;
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "203.0.113.20:51820".to_string(),
-            local_endpoint: Some("192.168.1.20:51820".to_string()),
-            public_endpoint: Some("203.0.113.20:51820".to_string()),
-            relay_endpoint: Some("198.51.100.30:40001".to_string()),
-            relay_pubkey: Some("relay-pubkey".to_string()),
-            relay_expires_at: Some(500),
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-
-        let mut path_book = PeerPathBook::default();
-        path_book.refresh_from_announcement(participant.clone(), &announcement, 10);
-
-        let selected = planned_tunnel_peers(
-            &config,
-            None,
-            &HashMap::from([(participant.clone(), announcement)]),
-            &mut path_book,
-            Some("10.0.0.33:51820"),
-            100,
-        )
-        .expect("planned tunnel peers");
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
-    }
-
-    #[test]
-    fn participants_needing_relay_wait_for_direct_handshake_grace() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let announcement = sample_peer_announcement(generate_keypair().public_key);
-        let mut presence = PeerPresenceBook::default();
-        presence.apply_signal(
-            participant.clone(),
-            SignalPayload::Announce(announcement),
-            100,
-        );
-
-        let fresh = participants_needing_relay(
-            &config,
-            None,
-            &presence,
-            None,
-            &HashMap::new(),
-            &HashMap::new(),
-            103,
-        );
-        assert!(
-            fresh.is_empty(),
-            "fresh direct attempts should keep trying first"
-        );
-
-        let after_grace = participants_needing_relay(
-            &config,
-            None,
-            &presence,
-            None,
-            &HashMap::new(),
-            &HashMap::new(),
-            106,
-        );
-        assert_eq!(after_grace, vec![participant]);
-    }
-
-    #[test]
-    fn participants_needing_relay_ignore_stale_known_peer_without_active_presence() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let mut presence = PeerPresenceBook::default();
-        presence.restore_known(
-            participant.clone(),
-            sample_peer_announcement(generate_keypair().public_key),
-            Some(100),
-        );
-
-        let selected = participants_needing_relay(
-            &config,
-            None,
-            &presence,
-            None,
-            &HashMap::new(),
-            &HashMap::new(),
-            200,
-        );
-
-        assert!(
-            selected.is_empty(),
-            "known-only peers should not trigger relay routing"
-        );
-    }
-
-    #[test]
-    fn participants_needing_relay_grace_survives_fresh_announces() {
-        let mut config = AppConfig::generated();
-        let participant = "11".repeat(32);
-        config.networks[0].participants = vec![participant.clone()];
-
-        let public_key = generate_keypair().public_key;
-        let mut first = sample_peer_announcement(public_key.clone());
-        first.timestamp = 100;
-
-        let mut refreshed = sample_peer_announcement(public_key);
-        refreshed.timestamp = 104;
-
-        let mut presence = PeerPresenceBook::default();
-        presence.apply_signal(participant.clone(), SignalPayload::Announce(first), 100);
-        presence.apply_signal(participant.clone(), SignalPayload::Announce(refreshed), 104);
-
-        let selected = participants_needing_relay(
-            &config,
-            None,
-            &presence,
-            None,
-            &HashMap::new(),
-            &HashMap::new(),
-            106,
-        );
-
-        assert_eq!(
-            selected,
-            vec![participant],
-            "repeat announces should not reset the direct-handshake grace window"
-        );
-    }
-
-    #[test]
-    fn relay_candidates_for_participant_skip_self_target_and_limit_count() {
-        let participant = "11".repeat(32);
-        let own_pubkey = "22".repeat(32);
-        let relay_pubkeys = vec![
-            participant.clone(),
-            own_pubkey.clone(),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
-            "66".repeat(32),
-        ];
-
-        let selected = super::relay_candidates_for_participant(
-            &relay_pubkeys,
-            &participant,
-            Some(&own_pubkey),
-            &HashMap::new(),
-            &HashMap::new(),
-            100,
-        );
-
-        assert_eq!(
-            selected,
-            vec![
-                "3333333333333333333333333333333333333333333333333333333333333333",
-                "4444444444444444444444444444444444444444444444444444444444444444",
-                "5555555555555555555555555555555555555555555555555555555555555555",
-            ]
-        );
-    }
-
-    #[test]
-    fn accept_relay_allocation_grant_queues_standby_after_first_activation() {
-        let participant = "11".repeat(32);
-        let mut pending_requests = HashMap::from([
-            (
-                "req-a".to_string(),
-                PendingRelayRequest {
-                    participant: participant.clone(),
-                    relay_pubkey: "relay-a".to_string(),
-                    requested_at: 100,
-                },
-            ),
-            (
-                "req-b".to_string(),
-                PendingRelayRequest {
-                    participant: participant.clone(),
-                    relay_pubkey: "relay-b".to_string(),
-                    requested_at: 100,
-                },
-            ),
-        ]);
-        let mut relay_sessions = HashMap::new();
-        let mut standby_relay_sessions = HashMap::new();
-        let relay_failures = HashMap::new();
-
-        let accepted = super::accept_relay_allocation_grant(
-            RelayAllocationGranted {
-                request_id: "req-a".to_string(),
-                network_id: "mesh-1".to_string(),
-                relay_pubkey: "relay-a".to_string(),
-                requester_ingress_endpoint: "198.51.100.10:41001".to_string(),
-                target_ingress_endpoint: "198.51.100.10:41002".to_string(),
-                expires_at: 500,
-            },
-            &mut pending_requests,
-            &mut relay_sessions,
-            &mut standby_relay_sessions,
-            &relay_failures,
-            200,
-        );
-
-        assert_eq!(accepted, RelayGrantAction::Activated(participant.clone()));
-        assert_eq!(
-            relay_sessions
-                .get(&participant)
-                .map(|session| session.relay_pubkey.as_str()),
-            Some("relay-a")
-        );
-        assert_eq!(pending_requests.len(), 1);
-
-        pending_requests.insert(
-            "req-c".to_string(),
-            PendingRelayRequest {
-                participant: participant.clone(),
-                relay_pubkey: "relay-c".to_string(),
-                requested_at: 200,
-            },
-        );
-        let queued = super::accept_relay_allocation_grant(
-            RelayAllocationGranted {
-                request_id: "req-b".to_string(),
-                network_id: "mesh-1".to_string(),
-                relay_pubkey: "relay-b".to_string(),
-                requester_ingress_endpoint: "198.51.100.11:42001".to_string(),
-                target_ingress_endpoint: "198.51.100.11:42002".to_string(),
-                expires_at: 500,
-            },
-            &mut pending_requests,
-            &mut relay_sessions,
-            &mut standby_relay_sessions,
-            &relay_failures,
-            201,
-        );
-
-        assert_eq!(queued, RelayGrantAction::QueuedStandby(participant.clone()));
-        assert_eq!(
-            relay_sessions
-                .get(&participant)
-                .map(|session| session.relay_pubkey.as_str()),
-            Some("relay-a")
-        );
-        assert_eq!(
-            standby_relay_sessions
-                .get(&participant)
-                .expect("standby relay")
-                .iter()
-                .map(|session| session.relay_pubkey.as_str())
-                .collect::<Vec<_>>(),
-            vec!["relay-b"]
-        );
-    }
-
-    #[test]
-    fn reconcile_active_relay_sessions_promotes_verified_standby_after_timeout() {
-        let participant = "11".repeat(32);
-        let peer_keys = generate_keypair();
-        let announcement = sample_peer_announcement(peer_keys.public_key.clone());
-        let mut presence = PeerPresenceBook::default();
-        assert!(presence.apply_signal(
-            participant.clone(),
-            SignalPayload::Announce(announcement.clone()),
-            100,
-        ));
-
-        let mut relay_sessions = HashMap::from([(
-            participant.clone(),
-            ActiveRelaySession {
-                relay_pubkey: "relay-a".to_string(),
-                local_ingress_endpoint: "198.51.100.10:41001".to_string(),
-                advertised_ingress_endpoint: "198.51.100.10:41002".to_string(),
-                granted_at: 200,
-                verified_at: None,
-                expires_at: 500,
-            },
-        )]);
-        let mut standby_relay_sessions = HashMap::from([(
-            participant.clone(),
-            vec![ActiveRelaySession {
-                relay_pubkey: "relay-b".to_string(),
-                local_ingress_endpoint: "198.51.100.20:42001".to_string(),
-                advertised_ingress_endpoint: "198.51.100.20:42002".to_string(),
-                granted_at: 201,
-                verified_at: None,
-                expires_at: 500,
-            }],
-        )]);
-        let mut relay_failures = HashMap::new();
-        let mut relay_provider_verifications = HashMap::new();
-        let mut pending_requests = HashMap::from([(
-            "req-z".to_string(),
-            PendingRelayRequest {
-                participant: participant.clone(),
-                relay_pubkey: "relay-z".to_string(),
-                requested_at: 205,
-            },
-        )]);
-
-        let changed = super::reconcile_active_relay_sessions(
-            &presence,
-            None,
-            &mut relay_sessions,
-            &mut standby_relay_sessions,
-            &mut relay_failures,
-            &mut relay_provider_verifications,
-            &mut pending_requests,
-            200 + super::RELAY_SESSION_VERIFY_TIMEOUT_SECS,
-        );
-
-        assert_eq!(changed, vec![participant.clone()]);
-        assert_eq!(
-            relay_sessions
-                .get(&participant)
-                .map(|session| session.relay_pubkey.as_str()),
-            Some("relay-b")
-        );
-        assert_eq!(
-            relay_sessions
-                .get(&participant)
-                .map(|session| session.granted_at),
-            Some(200 + super::RELAY_SESSION_VERIFY_TIMEOUT_SECS)
-        );
-        assert!(pending_requests.is_empty());
-        assert!(super::relay_is_in_failure_cooldown(
-            &relay_failures,
-            &participant,
-            "relay-a",
-            200 + super::RELAY_SESSION_VERIFY_TIMEOUT_SECS,
-        ));
-    }
-
-    #[test]
-    fn relay_candidates_for_participant_skip_cooled_down_relays() {
-        let participant = "11".repeat(32);
-        let relay_pubkeys = vec!["33".repeat(32), "44".repeat(32), "55".repeat(32)];
-        let mut relay_failures = HashMap::new();
-        relay_failures.insert(
-            format!(
-                "{}:{}",
-                participant, "3333333333333333333333333333333333333333333333333333333333333333"
-            ),
-            500,
-        );
-
-        let selected = super::relay_candidates_for_participant(
-            &relay_pubkeys,
-            &participant,
-            None,
-            &relay_failures,
-            &HashMap::new(),
-            400,
-        );
-
-        assert_eq!(
-            selected,
-            vec![
-                "4444444444444444444444444444444444444444444444444444444444444444",
-                "5555555555555555555555555555555555555555555555555555555555555555",
-            ]
-        );
-    }
-
-    #[test]
-    fn relay_candidates_prefer_recently_verified_providers() {
-        let participant = "11".repeat(32);
-        let relay_pubkeys = vec!["33".repeat(32), "44".repeat(32), "55".repeat(32)];
-        let relay_provider_verifications = HashMap::from([
-            (
-                "4444444444444444444444444444444444444444444444444444444444444444".to_string(),
-                RelayProviderVerification {
-                    verified_at: Some(250),
-                    failure_cooldown_until: None,
-                    last_failure_at: None,
-                    last_probe_attempt_at: Some(250),
-                    consecutive_failures: 0,
-                },
-            ),
-            (
-                "3333333333333333333333333333333333333333333333333333333333333333".to_string(),
-                RelayProviderVerification {
-                    verified_at: Some(200),
-                    failure_cooldown_until: None,
-                    last_failure_at: None,
-                    last_probe_attempt_at: Some(200),
-                    consecutive_failures: 0,
-                },
-            ),
-        ]);
-
-        let selected = super::relay_candidates_for_participant(
-            &relay_pubkeys,
-            &participant,
-            None,
-            &HashMap::new(),
-            &relay_provider_verifications,
-            300,
-        );
-
-        assert_eq!(
-            selected,
-            vec![
-                "4444444444444444444444444444444444444444444444444444444444444444",
-                "3333333333333333333333333333333333333333333333333333333333333333",
-                "5555555555555555555555555555555555555555555555555555555555555555",
-            ]
-        );
-    }
-
-    #[test]
-    fn relay_rejection_marks_provider_and_participant_failed() {
-        let participant = "11".repeat(32);
-        let relay_pubkey = "33".repeat(32);
-        let now = 200;
-        let mut pending_requests = HashMap::from([(
-            "req-a".to_string(),
-            PendingRelayRequest {
-                participant: participant.clone(),
-                relay_pubkey: relay_pubkey.clone(),
-                requested_at: 100,
-            },
-        )]);
-        let mut relay_failures = HashMap::new();
-        let mut relay_provider_verifications = HashMap::new();
-
-        let changed = super::accept_relay_allocation_rejection(
-            RelayAllocationRejected {
-                request_id: "req-a".to_string(),
-                network_id: "mesh-1".to_string(),
-                relay_pubkey: relay_pubkey.clone(),
-                reason: RelayAllocationRejectReason::OverCapacity,
-                retry_after_secs: Some(90),
-            },
-            &mut pending_requests,
-            &mut relay_failures,
-            &mut relay_provider_verifications,
-            now,
-        );
-
-        assert_eq!(changed.as_deref(), Some(participant.as_str()));
-        assert!(pending_requests.is_empty());
-        assert!(super::relay_is_in_failure_cooldown(
-            &relay_failures,
-            &participant,
-            &relay_pubkey,
-            now
-        ));
-        assert!(super::relay_provider_in_failure_cooldown(
-            &relay_provider_verifications,
-            &relay_pubkey,
-            now
-        ));
-        assert_eq!(
-            relay_provider_verifications
-                .get(&relay_pubkey)
-                .and_then(|verification| verification.failure_cooldown_until),
-            Some(now + 90)
-        );
-    }
-
-    #[test]
-    fn matching_peer_subnet_selects_secondary_local_signal_endpoint() {
-        let announcement = PeerAnnouncement {
-            node_id: "peer-a".to_string(),
-            public_key: generate_keypair().public_key,
-            endpoint: "10.211.55.3:51820".to_string(),
-            local_endpoint: Some("10.211.55.3:51820".to_string()),
-            public_endpoint: None,
-            relay_endpoint: None,
-            relay_pubkey: None,
-            relay_expires_at: None,
-            tunnel_ip: "10.44.199.77/32".to_string(),
-            advertised_routes: Vec::new(),
-            timestamp: 10,
-        };
-        let own_local_endpoints = local_endpoints(&[
-            "192.168.178.80:51820",
-            "10.211.55.2:51820",
-            "10.37.129.2:51820",
-        ]);
-
-        assert_eq!(
-            super::select_local_signal_endpoint_for_peer(&announcement, &own_local_endpoints)
-                .as_deref(),
-            Some("10.211.55.2:51820")
-        );
-    }
-
-    #[test]
-    fn runtime_magic_dns_records_prefer_live_announcement_tunnel_ip() {
-        let mut config = AppConfig::generated();
-        config.magic_dns_suffix = "nvpn".to_string();
-        config.networks[0].participants =
-            vec!["3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string()];
-        config.ensure_defaults();
-        config
-            .set_peer_alias(
-                "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645",
-                "pig",
-            )
-            .expect("set alias");
-
-        let mut announcements = HashMap::new();
-        announcements.insert(
-            "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string(),
-            PeerAnnouncement {
-                node_id: "peer-node".to_string(),
-                public_key: "pubkey".to_string(),
-                endpoint: "192.168.1.55:51820".to_string(),
-                local_endpoint: None,
-                public_endpoint: None,
-                relay_endpoint: None,
-                relay_pubkey: None,
-                relay_expires_at: None,
-                tunnel_ip: "10.44.0.113/32".to_string(),
-                advertised_routes: Vec::new(),
-                timestamp: 1,
-            },
-        );
-
-        let records = build_runtime_magic_dns_records(&config, &announcements);
-        assert_eq!(
-            records.get("pig.nvpn").map(|ip| ip.to_string()),
-            Some("10.44.0.113".to_string())
-        );
-        assert_eq!(
-            records.get("pig").map(|ip| ip.to_string()),
-            Some("10.44.0.113".to_string())
-        );
-    }
-
-    #[test]
-    fn runtime_magic_dns_records_follow_latest_announcement_ip() {
-        let mut config = AppConfig::generated();
-        config.magic_dns_suffix = "nvpn".to_string();
-        config.networks[0].participants =
-            vec!["3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string()];
-        config.ensure_defaults();
-        config
-            .set_peer_alias(
-                "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645",
-                "pig",
-            )
-            .expect("set alias");
-
-        let mut announcements = HashMap::new();
-        announcements.insert(
-            "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string(),
-            PeerAnnouncement {
-                node_id: "peer-node".to_string(),
-                public_key: "pubkey".to_string(),
-                endpoint: "192.168.1.55:51820".to_string(),
-                local_endpoint: None,
-                public_endpoint: None,
-                relay_endpoint: None,
-                relay_pubkey: None,
-                relay_expires_at: None,
-                tunnel_ip: "10.44.0.113/32".to_string(),
-                advertised_routes: Vec::new(),
-                timestamp: 1,
-            },
-        );
-        let first = build_runtime_magic_dns_records(&config, &announcements);
-        assert_eq!(
-            first.get("pig.nvpn").map(|ip| ip.to_string()),
-            Some("10.44.0.113".to_string())
-        );
-
-        announcements.insert(
-            "3d332ed94c79863e73ff8af62882de2853c77d6a5c1fe61d7598a90db1fab645".to_string(),
-            PeerAnnouncement {
-                node_id: "peer-node".to_string(),
-                public_key: "pubkey".to_string(),
-                endpoint: "192.168.1.55:51820".to_string(),
-                local_endpoint: None,
-                public_endpoint: None,
-                relay_endpoint: None,
-                relay_pubkey: None,
-                relay_expires_at: None,
-                tunnel_ip: "10.44.0.114/32".to_string(),
-                advertised_routes: Vec::new(),
-                timestamp: 2,
-            },
-        );
-        let second = build_runtime_magic_dns_records(&config, &announcements);
-        assert_eq!(
-            second.get("pig.nvpn").map(|ip| ip.to_string()),
-            Some("10.44.0.114".to_string())
-        );
-    }
-
-    #[test]
-    fn daemon_runtime_state_requires_advertised_routes() {
-        let raw = r#"{
-  "updated_at": 1773650797,
-  "session_active": true,
-  "relay_connected": true,
-  "session_status": "Connected",
-  "expected_peer_count": 1,
-  "connected_peer_count": 1,
-  "mesh_ready": true,
-  "peers": [
-    {
-      "participant_pubkey": "ed91c2fcdf6857157e72497d67be9dad91d865db6407bb0440ca53129e10cb1f",
-      "node_id": "6bea57f5-e06b-49d1-83b5-484ab0a3df12",
-      "tunnel_ip": "10.44.0.239/32",
-      "endpoint": "192.168.178.80:51820",
-      "public_key": "+fi3YvMFH0JQFNuQPiPy5xBXNKvpaCKIbbbgrlXT5yw=",
-      "presence_timestamp": 1773650779,
-      "last_signal_seen_at": 1773650779,
-      "reachable": true,
-      "last_handshake_at": null,
-      "error": null
-    }
-  ]
-}"#;
-
-        assert!(serde_json::from_str::<DaemonRuntimeState>(raw).is_err());
-    }
-
-    #[test]
-    fn read_daemon_state_trims_nul_padding() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-daemon-state-trim-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let state_path = dir.join("daemon.state.json");
-        let mut raw = br#"{
-  "updated_at": 1,
-  "binary_version": "test",
-  "session_active": true,
-  "relay_connected": false,
-  "session_status": "Ready",
-  "expected_peer_count": 0,
-  "connected_peer_count": 0,
-  "mesh_ready": false
-}"#
-        .to_vec();
-        raw.extend_from_slice(&[0, 0, b'\n']);
-        fs::write(&state_path, raw).expect("write padded daemon state");
-
-        let state = read_daemon_state(&state_path)
-            .expect("read daemon state")
-            .expect("daemon state should exist");
-        assert_eq!(state.session_status, "Ready");
-
-        let rewritten = fs::read(&state_path).expect("read rewritten daemon state");
-        assert!(!rewritten.contains(&0));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn daemon_status_ignores_and_quarantines_corrupt_daemon_state() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-daemon-status-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let config_path = dir.join("config.toml");
-        fs::write(&config_path, "").expect("write config placeholder");
-        let state_path = dir.join("daemon.state.json");
-        fs::write(&state_path, vec![0; 64]).expect("write corrupt daemon state");
-
-        let status = super::daemon_status(&config_path).expect("daemon status should succeed");
-        assert!(status.state.is_none());
-        assert!(!state_path.exists());
-
-        let quarantined: Vec<_> = fs::read_dir(&dir)
-            .expect("list temp dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|name| name.starts_with("daemon.state.json.corrupt-"))
-            })
-            .collect();
-        assert_eq!(quarantined.len(), 1);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn persist_daemon_runtime_state_marks_resuming_as_active() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-daemon-state-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let state_path = dir.join("daemon.state.json");
-
-        let mut config = AppConfig::generated();
-        config.networks[0].participants = vec!["11".repeat(32)];
-        let presence = PeerPresenceBook::default();
-        let tunnel_runtime = super::CliTunnelRuntime::new("utun100");
-
-        super::persist_daemon_runtime_state(
-            &state_path,
-            &config,
-            true,
-            1,
-            &presence,
-            &tunnel_runtime,
-            "Resuming",
-            false,
-            &nostr_vpn_core::diagnostics::NetworkSummary::default(),
-            &nostr_vpn_core::diagnostics::PortMappingStatus::default(),
-            &super::LocalRelayOperatorRuntime::default(),
-        )
-        .expect("persist daemon runtime state");
-
-        let state = read_daemon_state(&state_path)
-            .expect("read daemon state")
-            .expect("daemon state should exist");
-        assert!(state.session_active);
-        assert_eq!(state.session_status, "Resuming");
-        assert!(!state.relay_connected);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn daemon_pid_scan_matches_processes_for_config() {
-        let config_path = Path::new("/Users/sirius/Library/Application Support/nvpn/config.toml");
-        let ps = "  42063 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n\
-                  97597 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n\
-                  55555 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /tmp/other.toml --iface utun100\n";
-        let pids = daemon_pids_from_ps_output(ps, config_path);
-        assert_eq!(pids, vec![42063, 97597]);
-    }
-
-    #[test]
-    fn relay_operator_advertise_host_prefers_public_signal_endpoint() {
-        let mut config = AppConfig::generated();
-        config.node.endpoint = "192.168.1.40:51820".to_string();
-        let public_endpoint = super::DiscoveredPublicSignalEndpoint {
-            listen_port: 51820,
-            endpoint: "203.0.113.8:51820".to_string(),
-        };
-
-        assert_eq!(
-            super::relay_operator_advertise_host(&config, Some(&public_endpoint)),
-            Some("203.0.113.8".to_string())
-        );
-    }
-
-    #[test]
-    fn relay_operator_advertise_host_rejects_private_endpoint_without_public_mapping() {
-        let mut config = AppConfig::generated();
-        config.node.endpoint = "192.168.1.40:51820".to_string();
-        assert_eq!(super::relay_operator_advertise_host(&config, None), None);
-
-        config.node.endpoint = "198.51.100.7:51820".to_string();
-        assert_eq!(
-            super::relay_operator_advertise_host(&config, None),
-            Some("198.51.100.7".to_string())
-        );
-    }
-
-    #[test]
-    fn windows_daemon_pid_scan_matches_processes_for_config() {
-        let config_path = Path::new("C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml");
-        let cim_json = r#"[{"ProcessId":42063,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\" --iface NostrVPN"},{"ProcessId":97597,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\" --iface NostrVPN"},{"ProcessId":55555,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\temp\\other.toml\" --iface NostrVPN"}]"#;
-        let pids = super::daemon_pids_from_windows_cim_json(cim_json, config_path);
-        assert_eq!(pids, vec![42063, 97597]);
-    }
-
-    #[test]
-    fn windows_daemon_pid_scan_accepts_single_process_object() {
-        let config_path = Path::new("C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml");
-        let cim_json = r#"{"ProcessId":42063,"CommandLine":"\"C:\\Program Files\\Nostr VPN\\nvpn.exe\" daemon --config \"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\" --iface NostrVPN"}"#;
-        let pids = super::daemon_pids_from_windows_cim_json(cim_json, config_path);
-        assert_eq!(pids, vec![42063]);
-    }
-
-    #[test]
-    fn windows_service_bin_path_runs_hidden_service_daemon_with_same_config() {
-        let executable = Path::new("C:\\Program Files\\Nostr VPN\\nvpn.exe");
-        let config_path = Path::new("C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml");
-
-        let command = windows_service_bin_path(executable, config_path, "nvpn", 20);
-
-        assert!(command.starts_with("\"C:\\Program Files\\Nostr VPN\\nvpn.exe\""));
-        assert!(command.contains(" daemon "));
-        assert!(command.contains(" --service "));
-        assert!(command.contains(" --config "));
-        assert!(command.contains("\"C:\\Users\\sirius\\AppData\\Roaming\\nvpn\\config.toml\""));
-        assert!(command.contains(" --iface \"nvpn\""));
-        assert!(command.contains(" --announce-interval-secs 20"));
-    }
-
-    #[test]
-    fn windows_tasklist_pid_parser_extracts_pids() {
-        let output = "\"nvpn.exe\",\"9564\",\"Services\",\"0\",\"172,248 K\"\n\"nvpn.exe\",\"3496\",\"Console\",\"1\",\"19,472 K\"\n";
-        assert_eq!(super::tasklist_pids_from_output(output), vec![3496, 9564]);
-    }
-
-    #[test]
-    fn windows_tasklist_pid_parser_ignores_no_tasks_message() {
-        let output = "INFO: No tasks are running which match the specified criteria.\r\n";
-        assert!(super::tasklist_pids_from_output(output).is_empty());
-    }
-
-    #[test]
-    fn recent_windows_daemon_pid_candidate_uses_fresh_state_and_single_other_process() {
-        let state = DaemonRuntimeState {
-            updated_at: 100,
-            ..Default::default()
-        };
-        assert_eq!(
-            super::recent_windows_daemon_pid_candidate(Some(&state), 42, &[42, 9564], 103),
-            Some(9564)
-        );
-        assert_eq!(
-            super::recent_windows_daemon_pid_candidate(Some(&state), 42, &[42, 9564], 106),
-            None
-        );
-        assert_eq!(
-            super::recent_windows_daemon_pid_candidate(Some(&state), 42, &[42, 9564, 97597], 103),
-            None
-        );
-        assert_eq!(
-            super::recent_windows_daemon_pid_candidate(None, 42, &[42, 9564], 103),
-            None
-        );
-    }
-
-    #[test]
-    fn visible_daemon_state_for_status_keeps_state_while_running() {
-        let state = DaemonRuntimeState {
-            session_active: true,
-            ..Default::default()
-        };
-
-        let visible = super::visible_daemon_state_for_status(true, Some(&state));
-        assert!(visible.is_some());
-        assert!(visible.expect("visible state").session_active);
-    }
-
-    #[test]
-    fn visible_daemon_state_for_status_hides_state_when_stopped() {
-        let state = DaemonRuntimeState {
-            session_active: true,
-            ..Default::default()
-        };
-
-        assert!(super::visible_daemon_state_for_status(false, Some(&state)).is_none());
-    }
-
-    #[test]
-    fn daemon_reload_config_uses_reloaded_network_id() {
-        let mut app = AppConfig::generated();
-        app.set_active_network_id("mesh-home")
-            .expect("set initial network id");
-        app.networks[0].participants = vec!["11".repeat(32)];
-        let initial_network_id = app.effective_network_id();
-
-        app.set_active_network_id("mesh-work")
-            .expect("set reloaded network id");
-        app.networks[0].participants = vec!["22".repeat(32)];
-        let reloaded_network_id = app.effective_network_id();
-        assert_ne!(initial_network_id, reloaded_network_id);
-
-        let reload = build_daemon_reload_config(
-            app,
-            reloaded_network_id.clone(),
-            &["wss://relay.example.com".to_string()],
-        );
-
-        assert_eq!(reload.network_id, reloaded_network_id);
-        assert_eq!(reload.configured_participants, vec!["22".repeat(32)]);
-        assert_eq!(reload.relays, vec!["wss://relay.example.com".to_string()]);
-    }
-
-    #[test]
-    fn daemon_pid_scan_excludes_current_pid_when_filtering_duplicates() {
-        let config_path = Path::new("/Users/sirius/Library/Application Support/nvpn/config.toml");
-        let ps = "  42063 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n\
-                  97597 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n";
-        let mut pids = daemon_pids_from_ps_output(ps, config_path);
-        pids.retain(|pid| *pid != 97597);
-        assert_eq!(pids, vec![42063]);
-    }
-
-    #[test]
-    fn default_cli_install_path_uses_nvpn_filename() {
-        let path = default_cli_install_path();
-        assert_eq!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some(if cfg!(target_os = "windows") {
-                "nvpn.exe"
-            } else {
-                "nvpn"
-            })
-        );
-    }
-
-    #[test]
-    fn default_tunnel_iface_matches_platform() {
-        let iface = super::default_tunnel_iface();
-        assert_eq!(
-            iface,
-            if cfg!(target_os = "windows") {
-                "nvpn"
-            } else {
-                "utun100"
-            }
-        );
-    }
-
-    #[test]
-    fn install_cli_and_uninstall_cli_roundtrip_for_custom_path() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-install-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let target = dir.join("nvpn");
-
-        install_cli(InstallCliArgs {
-            path: Some(target.clone()),
-            force: false,
-        })
-        .expect("install custom cli target");
-        assert!(target.exists(), "installed target should exist");
-
-        let duplicate = install_cli(InstallCliArgs {
-            path: Some(target.clone()),
-            force: false,
-        });
-        assert!(duplicate.is_err(), "install without --force should fail");
-
-        install_cli(InstallCliArgs {
-            path: Some(target.clone()),
-            force: true,
-        })
-        .expect("force reinstall custom cli target");
-
-        uninstall_cli(UninstallCliArgs {
-            path: Some(target.clone()),
-        })
-        .expect("uninstall custom cli target");
-        assert!(!target.exists(), "uninstall should remove target");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn apply_config_file_writes_target_config() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-apply-config-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-
-        let source = dir.join("source.toml");
-        let target = dir.join("target.toml");
-        let mut config = AppConfig::generated();
-        config.node_name = "windows-box".to_string();
-        config.networks[0].participants = vec!["ab".repeat(32)];
-        config.save(&source).expect("save source config");
-
-        apply_config_file(&source, &target).expect("apply config should succeed");
-
-        let loaded = AppConfig::load(&target).expect("load target config");
-        assert_eq!(loaded.node_name, "windows-box");
-        assert_eq!(loaded.participant_pubkeys_hex(), vec!["ab".repeat(32)]);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stage_daemon_config_apply_writes_staged_file() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-stage-config-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-
-        let source = dir.join("source.toml");
-        let target = dir.join("config.toml");
-        let mut config = AppConfig::generated();
-        config.node_name = "staged-node".to_string();
-        config.save(&source).expect("save source config");
-
-        stage_daemon_config_apply(&target, &source).expect("stage config should succeed");
-
-        let staged = daemon_staged_config_file_path(&target);
-        let loaded = AppConfig::load(&staged).expect("load staged config");
-        assert_eq!(loaded.node_name, "staged-node");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn update_daemon_config_from_staged_request_replaces_target_and_cleans_up() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-stage-apply-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-
-        let source = dir.join("source.toml");
-        let target = dir.join("config.toml");
-        let mut source_config = AppConfig::generated();
-        source_config.node_name = "service-owned".to_string();
-        source_config.save(&source).expect("save source config");
-
-        let mut target_config = AppConfig::generated();
-        target_config.node_name = "old-name".to_string();
-        target_config.save(&target).expect("save target config");
-
-        stage_daemon_config_apply(&target, &source).expect("stage config should succeed");
-        update_daemon_config_from_staged_request(&target).expect("apply staged config");
-
-        let loaded = AppConfig::load(&target).expect("load target config");
-        assert_eq!(loaded.node_name, "service-owned");
-        assert!(
-            !daemon_staged_config_file_path(&target).exists(),
-            "staged config should be cleaned up"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn kill_error_fallback_matcher_detects_permission_denied() {
-        assert!(kill_error_requires_control_fallback(
-            "kill -TERM 123 failed\nstderr: Operation not permitted"
-        ));
-        assert!(kill_error_requires_control_fallback(
-            "kill -TERM 123 failed\nstderr: permission denied"
-        ));
-        assert!(!kill_error_requires_control_fallback(
-            "kill -TERM 123 failed\nstderr: no such process"
-        ));
-    }
-
-    #[test]
-    fn daemon_control_stop_request_roundtrip() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-control-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let config = dir.join("config.toml");
-        fs::write(&config, "node_name = \"test\"").expect("write config");
-
-        request_daemon_stop(&config).expect("write stop request");
-        assert!(
-            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Stop),
-            "daemon should read stop request"
-        );
-        request_daemon_reload(&config).expect("write reload request");
-        assert!(
-            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Reload),
-            "daemon should read reload request"
-        );
-        control_daemon_request_for_test(&config, super::DaemonControlRequest::Pause);
-        assert!(
-            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Pause),
-            "daemon should read pause request"
-        );
-        control_daemon_request_for_test(&config, super::DaemonControlRequest::Resume);
-        assert!(
-            take_daemon_control_request(&config) == Some(super::DaemonControlRequest::Resume),
-            "daemon should read resume request"
-        );
-        let _ = fs::remove_file(daemon_control_file_path(&config));
-        assert!(
-            take_daemon_control_request(&config).is_none(),
-            "without control file there should be no stop request"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn daemon_control_timeout_errors_use_generic_service_wording() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-control-timeout-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let config = dir.join("config.toml");
-        fs::write(&config, "node_name = \"test\"").expect("write config");
-
-        let ack_error = super::wait_for_daemon_control_ack(&config, Duration::from_millis(0))
-            .expect_err("ack wait should time out");
-        assert!(
-            ack_error
-                .to_string()
-                .contains("background service may be busy or stuck")
-        );
-        assert!(!ack_error.to_string().contains("newer nvpn binary"));
-
-        let result_error = super::wait_for_daemon_control_result(
-            &config,
-            super::DaemonControlRequest::Reload,
-            Duration::from_millis(0),
-        )
-        .expect_err("result wait should time out");
-        assert!(
-            result_error
-                .to_string()
-                .contains("background service may be busy or stuck")
-        );
-        assert!(!result_error.to_string().contains("newer nvpn binary"));
-
-        let session_error =
-            super::wait_for_daemon_session_active(&config, true, Duration::from_millis(0))
-                .expect_err("session wait should time out");
-        assert!(
-            session_error
-                .to_string()
-                .contains("background service may be busy or stuck")
-        );
-        assert!(
-            !session_error
-                .to_string()
-                .contains("older nvpn daemon binary is still running")
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn daemon_control_request_clears_stale_result_file() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-control-stale-result-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let config = dir.join("config.toml");
-        fs::write(&config, "node_name = \"test\"").expect("write config");
-
-        super::write_daemon_control_result(&config, super::DaemonControlRequest::Pause, Ok(()))
-            .expect("write stale result");
-        super::write_daemon_control_request(&config, super::DaemonControlRequest::Pause)
-            .expect("write control request");
-
-        assert!(
-            super::read_daemon_control_result(&config)
-                .expect("read control result")
-                .is_none(),
-            "writing a new control request should discard any stale result"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn daemon_control_completion_accepts_daemon_result_before_state_refresh() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("nvpn-control-completion-success-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let config = dir.join("config.toml");
-        fs::write(&config, "node_name = \"test\"").expect("write config");
-
-        let config_for_writer = config.clone();
-        let writer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            super::write_daemon_control_result(
-                &config_for_writer,
-                super::DaemonControlRequest::Pause,
-                Ok(()),
-            )
-            .expect("write control result");
-        });
-
-        super::wait_for_daemon_control_completion(
-            &config,
-            super::DaemonControlRequest::Pause,
-            Some(false),
-            Duration::from_secs(1),
-        )
-        .expect("pause should succeed once daemon reports completion");
-
-        writer.join().expect("join result writer");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn daemon_control_completion_returns_daemon_error() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("nvpn-control-completion-error-test-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let config = dir.join("config.toml");
-        fs::write(&config, "node_name = \"test\"").expect("write config");
-
-        let config_for_writer = config.clone();
-        let writer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            super::write_daemon_control_result(
-                &config_for_writer,
-                super::DaemonControlRequest::Resume,
-                Err(anyhow!("resume cleanup stalled")),
-            )
-            .expect("write control result");
-        });
-
-        let error = super::wait_for_daemon_control_completion(
-            &config,
-            super::DaemonControlRequest::Resume,
-            Some(true),
-            Duration::from_secs(1),
-        )
-        .expect_err("resume should surface daemon-side failure");
-        assert!(
-            error.to_string().contains("resume cleanup stalled"),
-            "unexpected error: {error}"
-        );
-
-        writer.join().expect("join result writer");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     fn control_daemon_request_for_test(config: &Path, request: super::DaemonControlRequest) {

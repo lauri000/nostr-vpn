@@ -1,4 +1,5 @@
 pub mod config;
+mod config_magic_dns;
 pub mod control;
 pub mod crypto;
 pub mod diagnostics;
