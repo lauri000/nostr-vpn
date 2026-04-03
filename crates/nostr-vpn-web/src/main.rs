@@ -14,11 +14,13 @@ use tower_http::services::{ServeDir, ServeFile};
 mod invite;
 mod nvpn_cli;
 mod ui_models;
+mod ui_types;
 
 pub(crate) use crate::ui_models::{
-    CliStatusResponse, current_unix_timestamp, is_already_running_message, is_not_running_message,
+    current_unix_timestamp, is_already_running_message, is_not_running_message,
     nvpn_gui_iface_override, to_npub,
 };
+pub(crate) use crate::ui_types::CliStatusResponse;
 
 use crate::invite::{
     apply_network_invite_to_active_network, is_valid_relay_url, parse_network_invite,
@@ -29,12 +31,14 @@ use crate::nvpn_cli::{
     ensure_config_exists, fetch_cli_status, load_config, resolve_nvpn_cli_path,
 };
 use crate::ui_models::{
+    bad_request, build_ui_state, finalize_config_change, internal_error,
+    local_join_request_listener_enabled, parse_advertised_routes_input, parse_exit_node_input,
+    set_action_status, update_config_and_reload as update_config_and_reload_impl,
+};
+use crate::ui_types::{
     AliasRequest, InviteRequest, JoinRequestAction, NameRequest, NetworkEnabledRequest,
     NetworkIdRequest, NetworkMeshRequest, NetworkNameRequest, NetworkPeerRequest,
-    ParticipantRequest, RelayRequest, SettingsPatch, UiState, bad_request, build_ui_state,
-    finalize_config_change, internal_error, local_join_request_listener_enabled,
-    parse_advertised_routes_input, parse_exit_node_input, set_action_status,
-    update_config_and_reload as update_config_and_reload_impl,
+    ParticipantRequest, RelayRequest, SettingsPatch, UiState,
 };
 use nostr_vpn_core::config::{
     AppConfig, PendingOutboundJoinRequest, normalize_nostr_pubkey, normalize_runtime_network_id,
