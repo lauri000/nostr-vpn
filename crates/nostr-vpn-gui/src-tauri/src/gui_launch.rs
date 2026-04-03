@@ -7,6 +7,8 @@ use anyhow::{Context, Result, anyhow};
 use nostr_vpn_core::config::{normalize_advertised_route, normalize_nostr_pubkey};
 use tauri::Manager;
 
+use crate::tauri_commands::with_backend;
+
 use super::{
     AUTOSTART_LAUNCH_ARG, AppState, DEBUG_AUTOMATION_DEEP_LINK_PREFIX, NETWORK_INVITE_PREFIX,
     NVPN_GUI_IFACE_ENV, NvpnBackend,
@@ -358,7 +360,7 @@ pub(crate) fn import_network_invite_from_deep_link<R: tauri::Runtime>(
         return Err(anyhow!("application state is unavailable"));
     };
 
-    super::with_backend(state, |backend| backend.import_network_invite(&invite))
+    with_backend(state, |backend| backend.import_network_invite(&invite))
         .map_err(|error| anyhow!(error))?;
     super::refresh_tray_menu(app);
     let _ = show_main_window(app);
@@ -376,7 +378,7 @@ pub(crate) fn run_debug_automation_from_deep_link<R: tauri::Runtime>(
         return Err(anyhow!("application state is unavailable"));
     };
 
-    super::with_backend(state, |backend| {
+    with_backend(state, |backend| {
         run_debug_automation_command(backend, &command)
     })
     .map_err(|error| anyhow!(error))?;
