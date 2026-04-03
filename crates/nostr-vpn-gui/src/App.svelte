@@ -26,8 +26,6 @@
   import {
     activeNetwork,
     formatCountdown,
-    healthBadgeClass,
-    healthSummaryText,
     heroBadgeText,
     heroDetailText,
     heroStateBadgeClass,
@@ -38,51 +36,49 @@
     onlineDeviceSummary,
     participantBadgeClass,
     participantPresenceBadgeText,
-    participantTrafficText,
     participantTransportBadgeText,
     platformLabel,
-    serviceLifecycleBadgeClass,
-    serviceLifecycleBadgeText,
-    serviceMetaText,
     short,
   } from './lib/app-view'
+  import AdvancedPanels from './AdvancedPanels.svelte'
   import InviteShareSection from './InviteShareSection.svelte'
-  import RoutingPanel from './RoutingPanel.svelte'
   import PublicServicesPanel from './PublicServicesPanel.svelte'
+  import RoutingPanel from './RoutingPanel.svelte'
   import SavedNetworksPanel from './SavedNetworksPanel.svelte'
   import ServiceActionPanel from './ServiceActionPanel.svelte'
-  import {
-    addAdmin,
-    addNetwork,
-    addParticipant,
-    addRelay,
-    acceptJoinRequest,
-    connectSession,
-    disableSystemService,
-    disconnectSession,
-    enableSystemService,
-    importNetworkInvite,
-    installCli,
-    installSystemService,
-    isAutostartEnabled,
-    removeNetwork,
-    removeAdmin,
-    removeParticipant,
-    removeRelay,
-    renameNetwork,
-    requestNetworkJoin,
-    setNetworkEnabled,
-    setNetworkJoinRequestsEnabled,
-    setNetworkMeshId,
-    setParticipantAlias,
-    setAutostartEnabled,
-    startLanPairing,
-    stopLanPairing,
-    tick,
-    uninstallCli,
-    uninstallSystemService,
-    updateSettings,
-  } from './lib/tauri'
+  import SystemPanel from './SystemPanel.svelte'
+import {
+  addAdmin,
+  addNetwork,
+  addParticipant,
+  addRelay,
+  acceptJoinRequest,
+  connectSession,
+  disableSystemService,
+  disconnectSession,
+  enableSystemService,
+  importNetworkInvite,
+  installCli,
+  installSystemService,
+  isAutostartEnabled,
+  removeNetwork,
+  removeAdmin,
+  removeParticipant,
+  removeRelay,
+  renameNetwork,
+  requestNetworkJoin,
+  setNetworkEnabled,
+  setNetworkJoinRequestsEnabled,
+  setNetworkMeshId,
+  setParticipantAlias,
+  setAutostartEnabled,
+  startLanPairing,
+  stopLanPairing,
+  tick,
+  uninstallCli,
+  uninstallSystemService,
+  updateSettings,
+} from './lib/tauri'
   import type {
     HealthIssue,
     NetworkView,
@@ -1415,376 +1411,32 @@
     </span>
     -->
 
-    {#if state.vpnSessionControlSupported}
-      <details class="panel collapsible-panel" open={state.health.length > 0}>
-        <summary class="collapsible-summary">
-          <div>
-            <div class="panel-kicker">Advanced</div>
-            <h2>Diagnostics</h2>
-          </div>
-          <div class="section-meta">{healthSummaryText(state)}</div>
-        </summary>
+    <AdvancedPanels
+      {state}
+      {activeNetworkView}
+      bind:relayInput
+      {onAddRelay}
+      onRemoveRelay={(relayUrl) => runAction(() => removeRelay(relayUrl))}
+      {onUpdateSettings}
+    />
 
-        <div class="collapsible-body diagnostics-panel">
-          <div class="row status-row diagnostics-badges">
-            <span class="badge muted">
-              IF {state.network.defaultInterface || 'unknown'}
-            </span>
-            <span
-              class={`badge ${
-                state.network.captivePortal === true
-                  ? 'bad'
-                  : state.network.captivePortal === false
-                    ? 'ok'
-                    : 'muted'
-              }`}
-            >
-              {state.network.captivePortal === true
-                ? 'Captive portal'
-                : state.network.captivePortal === false
-                  ? 'Open internet'
-                  : 'Portal unknown'}
-            </span>
-            <span class={`badge ${state.portMapping.activeProtocol ? 'ok' : 'muted'}`}>
-              Mapping {state.portMapping.activeProtocol || 'none'}
-            </span>
-          </div>
-
-          <div class="diagnostics-copy">
-            <div class="config-path">
-              Local addresses:
-              {state.network.primaryIpv4 || 'no IPv4'}
-              {#if state.network.primaryIpv6}
-                | {state.network.primaryIpv6}
-              {/if}
-            </div>
-            <div class="config-path">
-              Gateway:
-              {state.network.gatewayIpv4 || state.network.gatewayIpv6 || 'unknown'}
-            </div>
-            <div class="config-path">
-              External endpoint:
-              {state.portMapping.externalEndpoint || 'stun / direct only'}
-            </div>
-          </div>
-
-          {#if state.health.length === 0}
-            <div class="config-path" data-testid="health-empty">Daemon reports no active health warnings.</div>
-          {:else}
-            <div class="stack rows">
-              {#each state.health as issue}
-                <div class="health-card" data-testid="health-issue">
-                  <div class="row spread health-card-header">
-                    <div class="item-title">{issue.summary}</div>
-                    <span class={`badge ${healthBadgeClass(issue.severity)}`}>{issue.severity}</span>
-                  </div>
-                  <div class="item-sub">{issue.detail}</div>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      </details>
-    {/if}
-
-    {#if state.serviceSupported && !serviceInstallRecommended && !serviceEnableRecommended}
-      <details class="panel collapsible-panel service-panel" data-testid="service-panel">
-        <summary class="collapsible-summary">
-          <div>
-            <div class="panel-kicker">Advanced</div>
-            <h2>Background Service</h2>
-          </div>
-          <div class="section-meta">{serviceMetaText(state)}</div>
-        </summary>
-
-        <div class="collapsible-body">
-          <div class="row status-row">
-            <span class="badge ok">Installed</span>
-            <span class={`badge ${serviceLifecycleBadgeClass(state)}`}>
-              {serviceLifecycleBadgeText(state)}
-            </span>
-            <span class={`badge ${state.daemonRunning ? 'ok' : 'muted'}`}>
-              Daemon {state.daemonRunning ? 'reachable' : 'idle'}
-            </span>
-          </div>
-
-          <div class="service-panel-copy">
-            <div class="service-panel-title">
-              Background service manages privileged VPN runtime operations.
-            </div>
-            {#if state.serviceStatusDetail}
-              <div class="service-panel-detail" data-testid="service-status-detail">
-                {state.serviceStatusDetail}
-              </div>
-            {/if}
-            {#if serviceActionStatus}
-              <div class="service-panel-detail service-panel-detail-ok">{serviceActionStatus}</div>
-            {/if}
-          </div>
-
-          <div class="row service-actions-row">
-            <button
-              class="btn"
-              data-testid="install-service-btn"
-              on:click={() =>
-                serviceEnableRecommended ? onEnableSystemService() : onInstallSystemService()}
-            >
-              {serviceEnableRecommended ? 'Enable service' : 'Reinstall service'}
-            </button>
-            {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
-              <button
-                class="btn ghost"
-                data-testid="disable-service-btn"
-                on:click={onDisableSystemService}
-              >
-                Disable service
-              </button>
-            {/if}
-            <button
-              class="btn ghost"
-              data-testid="uninstall-service-btn"
-              on:click={onUninstallSystemService}
-            >
-              Uninstall
-            </button>
-          </div>
-        </div>
-      </details>
-    {/if}
-
-    <PublicServicesPanel {state} {onUpdateSettings} />
-
-    <details class="panel collapsible-panel">
-      <summary class="collapsible-summary">
-        <div>
-          <div class="panel-kicker">Advanced</div>
-          <h2>Relays</h2>
-        </div>
-        <div class="section-meta relay-health">
-          <span class="ok-text">{state.relaySummary.up}/{state.relays.length} connected</span>
-        </div>
-      </summary>
-
-      <div class="collapsible-body">
-        <div class="row form-row">
-          <input
-            class="text-input"
-            placeholder="Add relay URL"
-            data-testid="relay-input"
-            bind:value={relayInput}
-            on:keydown={(event) => event.key === 'Enter' && onAddRelay()}
-          />
-          <button class="btn" data-testid="relay-add" on:click={onAddRelay}>Add</button>
-        </div>
-
-        <div class="stack rows">
-          {#each state.relays as relay}
-            <div class="item-row" data-testid="relay-row">
-              <div class="item-main">
-                <div class="item-title relay-url">{relay.url}</div>
-                {#if relay.state !== 'unknown' && relay.statusText}
-                  <div class="item-sub">{relay.statusText}</div>
-                {/if}
-              </div>
-              <span class={`badge ${relay.state === 'up' ? 'ok' : relay.state === 'down' ? 'bad' : relay.state === 'checking' ? 'warn' : 'muted'}`}>
-                {relay.state}
-              </span>
-              <button
-                class="btn ghost icon-btn"
-                data-testid="relay-remove"
-                title="Delete relay"
-                aria-label="Delete relay"
-                on:click={() => runAction(() => removeRelay(relay.url))}
-              >
-                <Trash2 size={16} strokeWidth={2.2} />
-              </button>
-            </div>
-          {/each}
-        </div>
-      </div>
-    </details>
-
-    {#if state.vpnSessionControlSupported}
-      <details class="panel collapsible-panel">
-        <summary class="collapsible-summary">
-          <div>
-            <div class="panel-kicker">Connection</div>
-            <h2>Session & Relays</h2>
-          </div>
-          <div class="section-meta">Startup & relay behavior</div>
-        </summary>
-
-        <div class="collapsible-body">
-          <label class="toggle-row">
-            <input
-              type="checkbox"
-              checked={state.usePublicRelayFallback}
-              on:change={(event) =>
-                onUpdateSettings({
-                  usePublicRelayFallback: (event.target as HTMLInputElement).checked,
-                })}
-            />
-            <span>Use public relay fallback when direct connection fails</span>
-          </label>
-          <div class="config-path settings-note">{publicRelayFallbackStatusText(state)}</div>
-
-          <label class="toggle-row">
-            <input
-              type="checkbox"
-              checked={state.autoconnect}
-              on:change={(event) =>
-                onUpdateSettings({
-                  autoconnect: (event.currentTarget as HTMLInputElement).checked,
-                })}
-            />
-            <span>Auto-connect session on app start</span>
-          </label>
-
-          <div class="section-meta">Current fallback</div>
-          <div class="config-path settings-note">{relayFallbackSummaryText(activeNetworkView)}</div>
-          {#if relayFallbackParticipants(activeNetworkView).length > 0}
-            <div class="stack rows">
-              {#each relayFallbackParticipants(activeNetworkView) as participant}
-                <div class="item-row">
-                  <div class="item-main">
-                    <div class="item-title">
-                      {participant.magicDnsName || participant.magicDnsAlias || participant.npub}
-                    </div>
-                    <div class="item-sub">
-                      {participant.runtimeEndpoint
-                        ? `relay ${participant.runtimeEndpoint}`
-                        : 'relay fallback active'} | {participantTrafficText(participant)}
-                    </div>
-                  </div>
-                  <div class="participant-badges">
-                    <span class="badge participant-badge warn">Relay fallback</span>
-                  </div>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      </details>
-    {/if}
-
-    <details class="panel collapsible-panel">
-      <summary class="collapsible-summary">
-        <div>
-          <div class="panel-kicker">System</div>
-          <h2>Device & App</h2>
-        </div>
-        <div class="section-meta">
-          {cliInstallSupported || startupSettingsSupported || trayBehaviorSupported
-            ? 'Node, DNS & startup'
-            : 'Node & DNS'}
-        </div>
-      </summary>
-
-      <div class="collapsible-body">
-        <div class="row settings-action-row">
-          <div class="config-path" data-testid="app-version">Version: {state.appVersion}</div>
-        </div>
-        <div class="row settings-action-row">
-          <div class="config-path">Config: {state.configPath}</div>
-        </div>
-        {#if cliInstallSupported}
-          <div class="row spread settings-action-row">
-            <div class="config-path">Terminal CLI</div>
-            <div class="row cli-actions-row">
-              <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>
-                {state.cliInstalled ? 'Reinstall CLI' : 'Install CLI'}
-              </button>
-              <button
-                class="btn ghost"
-                data-testid="uninstall-cli-btn"
-                on:click={onUninstallCli}
-                disabled={!state.cliInstalled}
-              >
-                Uninstall CLI
-              </button>
-            </div>
-          </div>
-          {#if cliActionStatus}
-            <div class="config-path">{cliActionStatus}</div>
-          {/if}
-        {/if}
-        <div class="config-path" data-testid="magic-dns-status">DNS: {state.magicDnsStatus}</div>
-
-        {#if startupSettingsSupported}
-          <label class="toggle-row">
-            <input
-              type="checkbox"
-              data-testid="autostart-toggle"
-              checked={state.launchOnStartup}
-              disabled={!autostartReady || autostartUpdating}
-              on:change={(event) =>
-                onToggleAutostart((event.currentTarget as HTMLInputElement).checked)}
-            />
-            <span>Launch on system startup</span>
-          </label>
-        {/if}
-
-        {#if trayBehaviorSupported}
-          <label class="toggle-row">
-            <input
-              type="checkbox"
-              checked={state.closeToTrayOnClose}
-              on:change={(event) =>
-                onUpdateSettings({
-                  closeToTrayOnClose: (event.currentTarget as HTMLInputElement).checked,
-                })}
-            />
-            <span>Keep running in menu bar when window is closed</span>
-          </label>
-        {/if}
-
-        <div class="field-grid">
-          <label>
-            <span>MagicDNS Suffix (Optional)</span>
-            <input
-              class="text-input"
-              data-testid="magic-dns-suffix-input"
-              bind:value={magicDnsSuffixDraft}
-              on:input={() =>
-                debounce('magicDnsSuffix', () =>
-                  onUpdateSettings({ magicDnsSuffix: magicDnsSuffixDraft }))}
-            />
-          </label>
-
-          <label>
-            <span>Endpoint</span>
-            <input
-              class="text-input"
-              bind:value={endpointDraft}
-              on:input={() => debounce('endpoint', () => onUpdateSettings({ endpoint: endpointDraft }))}
-            />
-          </label>
-
-          <label>
-            <span>Tunnel IP</span>
-            <input
-              class="text-input"
-              bind:value={tunnelIpDraft}
-              on:input={() => debounce('tunnelIp', () => onUpdateSettings({ tunnelIp: tunnelIpDraft }))}
-            />
-          </label>
-
-          <label>
-            <span>Listen Port</span>
-            <input
-              class="text-input"
-              bind:value={listenPortDraft}
-              on:input={() =>
-                debounce('listenPort', async () => {
-                  const parsed = Number.parseInt(listenPortDraft, 10)
-                  if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
-                    await onUpdateSettings({ listenPort: parsed })
-                  }
-                })}
-            />
-          </label>
-        </div>
-      </div>
-    </details>
+    <SystemPanel
+      {state}
+      {cliActionStatus}
+      {autostartReady}
+      {autostartUpdating}
+      {cliInstallSupported}
+      {startupSettingsSupported}
+      {trayBehaviorSupported}
+      {magicDnsSuffixDraft}
+      {endpointDraft}
+      {tunnelIpDraft}
+      {listenPortDraft}
+      {onInstallCli}
+      {onUninstallCli}
+      {onToggleAutostart}
+      {onUpdateSettings}
+      {debounce}
+    />
   {/if}
 </main>

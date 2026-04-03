@@ -1,0 +1,203 @@
+<script lang="ts">
+  import { Trash2 } from 'lucide-svelte'
+
+  import {
+    healthBadgeClass,
+    healthSummaryText,
+    participantTrafficText,
+    publicRelayFallbackStatusText,
+    relayFallbackParticipants,
+    relayFallbackSummaryText,
+  } from './lib/app-view'
+  import type { NetworkView, SettingsPatch, UiState } from './lib/types'
+
+  export let state: UiState
+  export let activeNetworkView: NetworkView
+  export let relayInput = ''
+  export let onAddRelay: () => Promise<void>
+  export let onRemoveRelay: (relayUrl: string) => Promise<void>
+  export let onUpdateSettings: (patch: SettingsPatch) => Promise<void>
+</script>
+
+{#if state.vpnSessionControlSupported}
+  <details class="panel collapsible-panel" open={state.health.length > 0}>
+    <summary class="collapsible-summary">
+      <div>
+        <div class="panel-kicker">Advanced</div>
+        <h2>Diagnostics</h2>
+      </div>
+      <div class="section-meta">{healthSummaryText(state)}</div>
+    </summary>
+
+    <div class="collapsible-body diagnostics-panel">
+      <div class="row status-row diagnostics-badges">
+        <span class="badge muted">IF {state.network.defaultInterface || 'unknown'}</span>
+        <span
+          class={`badge ${
+            state.network.captivePortal === true
+              ? 'bad'
+              : state.network.captivePortal === false
+                ? 'ok'
+                : 'muted'
+          }`}
+        >
+          {state.network.captivePortal === true
+            ? 'Captive portal'
+            : state.network.captivePortal === false
+              ? 'Open internet'
+              : 'Portal unknown'}
+        </span>
+        <span class={`badge ${state.portMapping.activeProtocol ? 'ok' : 'muted'}`}>
+          Mapping {state.portMapping.activeProtocol || 'none'}
+        </span>
+      </div>
+
+      <div class="diagnostics-copy">
+        <div class="config-path">
+          Local addresses:
+          {state.network.primaryIpv4 || 'no IPv4'}
+          {#if state.network.primaryIpv6}
+            | {state.network.primaryIpv6}
+          {/if}
+        </div>
+        <div class="config-path">
+          Gateway:
+          {state.network.gatewayIpv4 || state.network.gatewayIpv6 || 'unknown'}
+        </div>
+        <div class="config-path">
+          External endpoint:
+          {state.portMapping.externalEndpoint || 'stun / direct only'}
+        </div>
+      </div>
+
+      {#if state.health.length === 0}
+        <div class="config-path" data-testid="health-empty">Daemon reports no active health warnings.</div>
+      {:else}
+        <div class="stack rows">
+          {#each state.health as issue}
+            <div class="health-card" data-testid="health-issue">
+              <div class="row spread health-card-header">
+                <div class="item-title">{issue.summary}</div>
+                <span class={`badge ${healthBadgeClass(issue.severity)}`}>{issue.severity}</span>
+              </div>
+              <div class="item-sub">{issue.detail}</div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  </details>
+
+  <details class="panel collapsible-panel">
+    <summary class="collapsible-summary">
+      <div>
+        <div class="panel-kicker">Advanced</div>
+        <h2>Relays</h2>
+      </div>
+      <div class="section-meta relay-health">
+        <span class="ok-text">{state.relaySummary.up}/{state.relays.length} connected</span>
+      </div>
+    </summary>
+
+    <div class="collapsible-body">
+      <div class="row form-row">
+        <input
+          class="text-input"
+          placeholder="Add relay URL"
+          data-testid="relay-input"
+          bind:value={relayInput}
+          on:keydown={(event) => event.key === 'Enter' && onAddRelay()}
+        />
+        <button class="btn" data-testid="relay-add" on:click={() => onAddRelay()}>Add</button>
+      </div>
+
+      <div class="stack rows">
+        {#each state.relays as relay}
+          <div class="item-row" data-testid="relay-row">
+            <div class="item-main">
+              <div class="item-title relay-url">{relay.url}</div>
+              {#if relay.state !== 'unknown' && relay.statusText}
+                <div class="item-sub">{relay.statusText}</div>
+              {/if}
+            </div>
+            <span
+              class={`badge ${relay.state === 'up' ? 'ok' : relay.state === 'down' ? 'bad' : relay.state === 'checking' ? 'warn' : 'muted'}`}
+            >
+              {relay.state}
+            </span>
+            <button
+              class="btn ghost icon-btn"
+              data-testid="relay-remove"
+              title="Delete relay"
+              aria-label="Delete relay"
+              on:click={() => onRemoveRelay(relay.url)}
+            >
+              <Trash2 size={16} strokeWidth={2.2} />
+            </button>
+          </div>
+        {/each}
+      </div>
+    </div>
+  </details>
+
+  <details class="panel collapsible-panel">
+    <summary class="collapsible-summary">
+      <div>
+        <div class="panel-kicker">Connection</div>
+        <h2>Session & Relays</h2>
+      </div>
+      <div class="section-meta">Startup & relay behavior</div>
+    </summary>
+
+    <div class="collapsible-body">
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          checked={state.usePublicRelayFallback}
+          on:change={(event) =>
+            onUpdateSettings({
+              usePublicRelayFallback: (event.target as HTMLInputElement).checked,
+            })}
+        />
+        <span>Use public relay fallback when direct connection fails</span>
+      </label>
+      <div class="config-path settings-note">{publicRelayFallbackStatusText(state)}</div>
+
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          checked={state.autoconnect}
+          on:change={(event) =>
+            onUpdateSettings({
+              autoconnect: (event.currentTarget as HTMLInputElement).checked,
+            })}
+        />
+        <span>Auto-connect session on app start</span>
+      </label>
+
+      <div class="section-meta">Current fallback</div>
+      <div class="config-path settings-note">{relayFallbackSummaryText(activeNetworkView)}</div>
+      {#if relayFallbackParticipants(activeNetworkView).length > 0}
+        <div class="stack rows">
+          {#each relayFallbackParticipants(activeNetworkView) as participant}
+            <div class="item-row">
+              <div class="item-main">
+                <div class="item-title">
+                  {participant.magicDnsName || participant.magicDnsAlias || participant.npub}
+                </div>
+                <div class="item-sub">
+                  {participant.runtimeEndpoint
+                    ? `relay ${participant.runtimeEndpoint}`
+                    : 'relay fallback active'} | {participantTrafficText(participant)}
+                </div>
+              </div>
+              <div class="participant-badges">
+                <span class="badge participant-badge warn">Relay fallback</span>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  </details>
+{/if}
