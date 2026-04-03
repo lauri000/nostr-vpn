@@ -3,6 +3,8 @@
 #[cfg(any(target_os = "android", test))]
 mod android_session;
 #[cfg(any(target_os = "android", test))]
+mod android_session_runtime;
+#[cfg(any(target_os = "android", test))]
 mod android_vpn;
 mod gui_launch;
 #[cfg(any(target_os = "android", target_os = "ios", test))]
@@ -91,15 +93,16 @@ use nostr_vpn_core::config::{
 };
 use nostr_vpn_core::diagnostics::{HealthIssue, NetworkSummary, PortMappingStatus};
 use nostr_vpn_core::join_requests::{MeshJoinRequest, publish_join_request};
+#[cfg(target_os = "windows")]
+use nostr_vpn_core::platform_paths::legacy_config_path_from_dirs_config_dir;
 #[cfg(any(target_os = "windows", test))]
 use nostr_vpn_core::platform_paths::windows_default_config_path_for_state;
 #[cfg(any(target_os = "windows", test))]
 use nostr_vpn_core::platform_paths::windows_machine_config_path_from_program_data_dir;
-#[cfg(any(target_os = "windows", test))]
-use nostr_vpn_core::platform_paths::{
-    legacy_config_path_from_dirs_config_dir, windows_service_binary_path_from_sc_qc_output,
-    windows_service_config_path_from_sc_qc_output,
-};
+#[cfg(target_os = "windows")]
+use nostr_vpn_core::platform_paths::windows_service_binary_path_from_sc_qc_output;
+#[cfg(target_os = "windows")]
+use nostr_vpn_core::platform_paths::windows_service_config_path_from_sc_qc_output;
 use nostr_vpn_core::relay::{
     RelayOperatorState as SharedRelayOperatorState,
     ServiceOperatorState as SharedServiceOperatorState,

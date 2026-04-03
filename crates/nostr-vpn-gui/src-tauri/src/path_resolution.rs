@@ -5,7 +5,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,9 +17,9 @@ use super::legacy_config_path_from_dirs_config_dir;
 use super::windows_default_config_path_for_state;
 #[cfg(any(target_os = "windows", test))]
 use super::windows_machine_config_path_from_program_data_dir;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 use super::windows_service_binary_path_from_sc_qc_output;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 use super::windows_service_config_path_from_sc_qc_output;
 use super::{AppConfig, NVPN_BIN_ENV};
 
