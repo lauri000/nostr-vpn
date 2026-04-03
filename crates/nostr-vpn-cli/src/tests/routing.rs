@@ -15,10 +15,17 @@ mod routing_relays;
 #[test]
 fn utun_candidates_expand_for_default_style_names() {
     let candidates = utun_interface_candidates("utun100");
-    assert_eq!(candidates.len(), 16);
-    assert_eq!(candidates[0], "utun100");
-    assert_eq!(candidates[1], "utun101");
-    assert_eq!(candidates[15], "utun115");
+    if cfg!(target_os = "macos") {
+        assert_eq!(candidates[0], "utun");
+        assert_eq!(candidates[1], "utun100");
+        assert_eq!(candidates[2], "utun101");
+        assert_eq!(candidates[16], "utun115");
+    } else {
+        assert_eq!(candidates.len(), 16);
+        assert_eq!(candidates[0], "utun100");
+        assert_eq!(candidates[1], "utun101");
+        assert_eq!(candidates[15], "utun115");
+    }
 }
 
 #[test]

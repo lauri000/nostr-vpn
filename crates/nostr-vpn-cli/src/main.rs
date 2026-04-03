@@ -2662,6 +2662,18 @@ impl CliTunnelRuntime {
         let mut busy = Vec::new();
 
         for candidate in candidates {
+            #[cfg(target_os = "macos")]
+            let socket_snapshot = if candidate == "utun" {
+                Some(list_wireguard_socket_ifaces())
+            } else {
+                None
+            };
+            #[cfg(target_os = "macos")]
+            let iface_snapshot = if candidate == "utun" {
+                crate::macos_network::macos_current_interface_names().ok()
+            } else {
+                None
+            };
             let handle = DeviceHandle::new(
                 &candidate,
                 DeviceConfig {
@@ -2693,10 +2705,23 @@ impl CliTunnelRuntime {
                 }
             };
 
-            let socket = format!("/var/run/wireguard/{}.sock", candidate);
+            #[cfg(target_os = "macos")]
+            let actual_iface = if candidate == "utun" {
+                detect_macos_actual_tunnel_iface(
+                    socket_snapshot.as_deref(),
+                    iface_snapshot.as_deref(),
+                )
+                .unwrap_or(candidate.clone())
+            } else {
+                candidate.clone()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let actual_iface = candidate.clone();
+
+            let socket = format!("/var/run/wireguard/{}.sock", actual_iface);
             wait_for_socket(&socket)?;
 
-            self.iface = candidate;
+            self.iface = actual_iface;
             self.handle = Some(handle);
             self.uapi_socket_path = Some(socket);
             return Ok(());
@@ -3592,6 +3617,26 @@ impl CliTunnelRuntime {
 
 #[cfg(any(test, not(target_os = "windows")))]
 fn utun_interface_candidates(preferred: &str) -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        let Some(suffix) = preferred.strip_prefix("utun") else {
+            return vec![preferred.to_string()];
+        };
+        let mut candidates = vec!["utun".to_string()];
+        if preferred != "utun" {
+            candidates.push(preferred.to_string());
+        }
+        if !suffix.is_empty()
+            && suffix.chars().all(|ch| ch.is_ascii_digit())
+            && let Ok(base) = suffix.parse::<u16>()
+        {
+            candidates.extend((0u16..16u16).map(|offset| {
+                format!("utun{}", base.saturating_add(offset))
+            }));
+        }
+        candidates.dedup();
+        return candidates;
+    }
+
     let Some(suffix) = preferred.strip_prefix("utun") else {
         return vec![preferred.to_string()];
     };
@@ -3605,6 +3650,73 @@ fn utun_interface_candidates(preferred: &str) -> Vec<String> {
     (0u16..16u16)
         .map(|offset| format!("utun{}", base.saturating_add(offset)))
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn list_wireguard_socket_ifaces() -> Vec<String> {
+    let mut sockets = fs::read_dir("/var/run/wireguard")
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".sock").map(str::to_string))
+        .collect::<Vec<_>>();
+    sockets.sort();
+    sockets.dedup();
+    sockets
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_actual_tunnel_iface(
+    before_sockets: Option<&[String]>,
+    before_ifaces: Option<&[String]>,
+) -> Option<String> {
+    let current_ifaces = crate::macos_network::macos_current_interface_names().ok();
+    let mut candidates = list_wireguard_socket_ifaces()
+        .into_iter()
+        .filter(|iface| iface.starts_with("utun"))
+        .filter(|iface| {
+            before_sockets
+                .is_none_or(|before| !before.iter().any(|existing| existing == iface))
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(current_ifaces) = current_ifaces.as_ref() {
+        candidates.retain(|iface| current_ifaces.iter().any(|current| current == iface));
+        if let Some(before_ifaces) = before_ifaces {
+            candidates.sort_by_key(|iface| {
+                (
+                    before_ifaces.iter().any(|existing| existing == iface),
+                    macos_utun_sort_key(iface),
+                )
+            });
+            candidates.dedup();
+        }
+    }
+
+    if let Some(iface) = candidates.into_iter().next() {
+        return Some(iface);
+    }
+
+    let mut iface_candidates = current_ifaces
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|iface| iface.starts_with("utun"))
+        .filter(|iface| {
+            before_ifaces
+                .is_none_or(|before| !before.iter().any(|existing| existing == iface))
+        })
+        .collect::<Vec<_>>();
+    iface_candidates.sort_by_key(|iface| macos_utun_sort_key(iface));
+    iface_candidates.into_iter().next()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_utun_sort_key(iface: &str) -> u32 {
+    iface
+        .strip_prefix("utun")
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
 }
 
 fn is_resource_busy_message(message: &str) -> bool {

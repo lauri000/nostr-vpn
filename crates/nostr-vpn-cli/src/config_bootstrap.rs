@@ -27,6 +27,8 @@ pub(crate) fn print_version(args: VersionArgs) -> Result<()> {
 pub(crate) fn default_tunnel_iface() -> String {
     if cfg!(target_os = "windows") {
         "nvpn".to_string()
+    } else if cfg!(target_os = "macos") {
+        "utun".to_string()
     } else {
         "utun100".to_string()
     }

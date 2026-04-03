@@ -246,6 +246,25 @@ default            link#26            UCSIg           bridge100      !\n",
 }
 
 #[test]
+fn macos_split_defaults_are_detected_from_netstat() {
+    assert!(crate::macos_network::macos_has_tunnel_split_default_routes(
+        "Routing tables\n\
+Internet:\n\
+Destination        Gateway            Flags               Netif Expire\n\
+0/1                link#13            UCS                 utun5\n\
+128/1              link#13            UCS                 utun5\n\
+"
+    ));
+    assert!(!crate::macos_network::macos_has_tunnel_split_default_routes(
+        "Routing tables\n\
+Internet:\n\
+Destination        Gateway            Flags               Netif Expire\n\
+default            192.168.64.1       UGScg                 en0\n\
+"
+    ));
+}
+
+#[test]
 fn macos_tunnel_default_route_targets_use_split_defaults() {
     assert_eq!(
         crate::macos_network::macos_tunnel_default_route_targets(),
@@ -562,6 +581,8 @@ fn default_tunnel_iface_matches_platform() {
         iface,
         if cfg!(target_os = "windows") {
             "nvpn"
+        } else if cfg!(target_os = "macos") {
+            "utun"
         } else {
             "utun100"
         }

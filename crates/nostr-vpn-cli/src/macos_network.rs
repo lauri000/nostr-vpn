@@ -51,6 +51,28 @@ pub(super) fn macos_default_routes_from_netstat(output: &str) -> Vec<MacosRouteS
     routes
 }
 
+pub(crate) fn macos_has_tunnel_split_default_routes(output: &str) -> bool {
+    output.lines().map(str::trim).any(|line| {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() < 4 {
+            return false;
+        }
+
+        let target = tokens[0];
+        let iface_index = if tokens.last().copied() == Some("!") {
+            tokens.len().saturating_sub(2)
+        } else {
+            tokens.len().saturating_sub(1)
+        };
+        let Some(interface) = tokens.get(iface_index).copied() else {
+            return false;
+        };
+
+        interface.starts_with("utun")
+            && matches!(target, "0/1" | "0.0.0.0/1" | "128/1" | "128.0.0.0/1")
+    })
+}
+
 pub(super) fn macos_underlay_default_route_from_routes(
     routes: &[MacosRouteSpec],
 ) -> Option<MacosRouteSpec> {
@@ -73,6 +95,12 @@ pub(crate) fn macos_interface_names_from_ifconfig_list(output: &str) -> Vec<Stri
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_current_interface_names() -> Result<Vec<String>> {
+    let output = command_stdout_checked(ProcessCommand::new("ifconfig").arg("-l"))?;
+    Ok(macos_interface_names_from_ifconfig_list(&output))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -197,8 +225,16 @@ pub(crate) fn renew_macos_interface_dhcp(iface: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn ensure_macos_underlay_default_route() -> Result<bool> {
-    let default_routes = macos_default_routes()?;
-    if macos_underlay_default_route_from_routes(&default_routes).is_some() {
+    let output = command_stdout_checked(
+        ProcessCommand::new("netstat")
+            .arg("-rn")
+            .arg("-f")
+            .arg("inet"),
+    )?;
+    let default_routes = macos_default_routes_from_netstat(&output);
+    if macos_underlay_default_route_from_routes(&default_routes).is_some()
+        || macos_has_tunnel_split_default_routes(&output)
+    {
         return Ok(false);
     }
 
@@ -207,8 +243,16 @@ pub(crate) fn ensure_macos_underlay_default_route() -> Result<bool> {
     };
 
     let _ = renew_macos_interface_dhcp(&underlay.interface);
-    let refreshed_routes = macos_default_routes()?;
-    if macos_underlay_default_route_from_routes(&refreshed_routes).is_some() {
+    let refreshed_output = command_stdout_checked(
+        ProcessCommand::new("netstat")
+            .arg("-rn")
+            .arg("-f")
+            .arg("inet"),
+    )?;
+    let refreshed_routes = macos_default_routes_from_netstat(&refreshed_output);
+    if macos_underlay_default_route_from_routes(&refreshed_routes).is_some()
+        || macos_has_tunnel_split_default_routes(&refreshed_output)
+    {
         return Ok(true);
     }
 
