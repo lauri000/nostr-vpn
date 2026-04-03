@@ -10,19 +10,30 @@ mod ios_packet_tunnel;
 mod ios_vpn;
 #[cfg(any(target_os = "android", target_os = "ios", test))]
 mod mobile_wg;
+mod tray_runtime;
+
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+pub(crate) use tray_runtime::{
+    build_tray_menu, current_tray_runtime_state, refresh_tray_menu, run_tray_backend_action,
+};
+pub(crate) use tray_runtime::{
+    copy_text_to_clipboard, display_tunnel_ip, tray_exit_node_entries, tray_network_groups,
+    tray_status_text,
+};
+#[cfg(test)]
+pub(crate) use tray_runtime::{tray_menu_spec, tray_vpn_status_menu_text, tray_vpn_toggle_text};
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,10 +66,6 @@ use serde::{Deserialize, Serialize};
 use tauri::WindowEvent;
 #[cfg(target_os = "macos")]
 use tauri::image::Image;
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-use tauri::menu::{
-    CheckMenuItemBuilder, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder,
-};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
@@ -211,6 +218,10 @@ struct CliServiceStatusResponse {
     pid: Option<u32>,
     label: String,
     plist_path: String,
+    #[serde(default)]
+    binary_path: String,
+    #[serde(default)]
+    binary_version: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -225,6 +236,12 @@ struct DaemonRuntimeState {
     updated_at: u64,
     #[serde(default)]
     binary_version: String,
+    #[serde(default)]
+    local_endpoint: String,
+    #[serde(default)]
+    advertised_endpoint: String,
+    #[serde(default)]
+    listen_port: u16,
     session_active: bool,
     relay_connected: bool,
     session_status: String,
@@ -403,6 +420,7 @@ struct UiState {
     session_status: String,
     app_version: String,
     daemon_binary_version: String,
+    service_binary_version: String,
     config_path: String,
     own_npub: String,
     own_pubkey_hex: String,
@@ -645,6 +663,7 @@ struct NvpnBackend {
     service_disabled: bool,
     service_running: bool,
     service_status_detail: String,
+    service_binary_version: String,
     last_service_status_refresh_at: Option<Instant>,
     daemon_state: Option<DaemonRuntimeState>,
     relay_operator_state: Option<SharedServiceOperatorState>,
@@ -756,6 +775,7 @@ impl NvpnBackend {
             service_disabled: false,
             service_running: false,
             service_status_detail: String::new(),
+            service_binary_version: String::new(),
             last_service_status_refresh_at: None,
             daemon_state: None,
             relay_operator_state: None,
@@ -862,13 +882,25 @@ impl NvpnBackend {
         self.sync_daemon_state();
         if self.daemon_running {
             self.resume_daemon_process()?;
-        } else if self.gui_requires_service_install() {
-            self.session_status = gui_service_setup_status_text(false).to_string();
-            return Err(anyhow!(self.session_status.clone()));
-        } else if self.gui_requires_service_enable() {
-            self.session_status = gui_service_enable_status_text(false).to_string();
-            return Err(anyhow!(self.session_status.clone()));
         } else {
+            if self.gui_requires_service_install() {
+                self.install_system_service()?;
+                self.sync_daemon_state();
+            } else if self.gui_requires_service_enable() {
+                self.enable_system_service()?;
+                self.sync_daemon_state();
+            }
+
+            if self.daemon_running {
+                self.resume_daemon_process()?;
+            } else if self.gui_requires_service_install() {
+                self.session_status = gui_service_setup_status_text(false).to_string();
+                return Err(anyhow!(self.session_status.clone()));
+            } else if self.gui_requires_service_enable() {
+                self.session_status = gui_service_enable_status_text(false).to_string();
+                return Err(anyhow!(self.session_status.clone()));
+            }
+
             self.start_daemon_process()?;
         }
         self.sync_daemon_state();
@@ -1031,6 +1063,7 @@ impl NvpnBackend {
     fn import_network_invite(&mut self, invite_code: &str) -> Result<()> {
         let invite = parse_network_invite(invite_code)?;
         apply_network_invite_to_active_network(&mut self.config, &invite)?;
+        let active_network_id = self.config.active_network().id.clone();
         let normalized_inviter = normalize_nostr_pubkey(&invite.inviter_npub)?;
         self.peer_status.entry(normalized_inviter).or_default();
 
@@ -1049,6 +1082,12 @@ impl NvpnBackend {
         } else {
             format!("Invite imported for {}.", invite.network_name)
         };
+        if let Err(error) = self.request_network_join(&active_network_id) {
+            self.session_status = format!(
+                "{} Join request not sent automatically: {error}",
+                self.session_status
+            );
+        }
 
         Ok(())
     }
@@ -2293,6 +2332,8 @@ impl NvpnBackend {
             pid: None,
             label: "android-vpn".to_string(),
             plist_path: String::new(),
+            binary_path: String::new(),
+            binary_version: String::new(),
         })
     }
 
@@ -2307,6 +2348,8 @@ impl NvpnBackend {
             pid: None,
             label: "ios-packet-tunnel".to_string(),
             plist_path: String::new(),
+            binary_path: String::new(),
+            binary_version: String::new(),
         })
     }
 
@@ -2624,6 +2667,7 @@ impl NvpnBackend {
             self.service_running = false;
             self.service_status_detail =
                 "Background service unsupported on this platform".to_string();
+            self.service_binary_version.clear();
             return;
         }
 
@@ -2643,6 +2687,7 @@ impl NvpnBackend {
                 self.service_installed = status.installed;
                 self.service_disabled = status.disabled;
                 self.service_running = status.running;
+                self.service_binary_version = status.binary_version.clone();
                 self.service_status_detail = if !status.supported {
                     "Background service unsupported on this platform".to_string()
                 } else if !status.installed {
@@ -2681,6 +2726,7 @@ impl NvpnBackend {
                 self.service_installed = false;
                 self.service_disabled = false;
                 self.service_running = false;
+                self.service_binary_version.clear();
                 self.service_status_detail = format!("Service status unavailable: {error}");
                 eprintln!("gui: failed to sync service status: {error}");
             }
@@ -3127,14 +3173,6 @@ impl NvpnBackend {
                     return "awaiting WireGuard handshake".to_string();
                 };
 
-                if peer_link_uses_relay_path(link) {
-                    let runtime_endpoint = link.runtime_endpoint.as_deref().unwrap_or_default();
-                    return format!(
-                        "awaiting WireGuard handshake via relay {}",
-                        shorten_middle(runtime_endpoint, 18, 10)
-                    );
-                }
-
                 match link
                     .endpoint
                     .as_deref()
@@ -3520,6 +3558,19 @@ impl NvpnBackend {
             .as_ref()
             .map(|state| state.binary_version.clone())
             .unwrap_or_default();
+        let endpoint = self
+            .daemon_state
+            .as_ref()
+            .and_then(|state| {
+                let endpoint = state.advertised_endpoint.trim();
+                (!endpoint.is_empty()).then(|| endpoint.to_string())
+            })
+            .unwrap_or_else(|| self.config.node.endpoint.clone());
+        let listen_port = self
+            .daemon_state
+            .as_ref()
+            .and_then(|state| (state.listen_port > 0).then_some(state.listen_port))
+            .unwrap_or(self.config.node.listen_port);
 
         UiState {
             platform: runtime_capabilities.platform.to_string(),
@@ -3542,6 +3593,7 @@ impl NvpnBackend {
             session_status: self.session_status.clone(),
             app_version: PRODUCT_VERSION.to_string(),
             daemon_binary_version,
+            service_binary_version: self.service_binary_version.clone(),
             config_path: self.config_path.display().to_string(),
             own_npub,
             own_pubkey_hex,
@@ -3550,9 +3602,9 @@ impl NvpnBackend {
             node_id: self.config.node.id.clone(),
             node_name: self.config.node_name.clone(),
             self_magic_dns_name: self.config.self_magic_dns_name().unwrap_or_default(),
-            endpoint: self.config.node.endpoint.clone(),
+            endpoint,
             tunnel_ip: self.config.node.tunnel_ip.clone(),
-            listen_port: self.config.node.listen_port,
+            listen_port,
             exit_node: self
                 .npub_or_none(&self.config.exit_node)
                 .unwrap_or_default(),
@@ -5201,492 +5253,6 @@ fn show_main_window<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> tauri::Res
     Ok(())
 }
 
-fn short_text(value: &str, leading: usize, trailing: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() <= leading + trailing + 3 {
-        return value.to_string();
-    }
-
-    format!(
-        "{}...{}",
-        chars.iter().take(leading).collect::<String>(),
-        chars[chars.len() - trailing..].iter().collect::<String>()
-    )
-}
-
-fn display_tunnel_ip(tunnel_ip: &str) -> String {
-    let trimmed = tunnel_ip.trim();
-    if trimmed.is_empty() {
-        "-".to_string()
-    } else {
-        trimmed.split('/').next().unwrap_or(trimmed).to_string()
-    }
-}
-
-fn tray_status_text(
-    session_active: bool,
-    service_setup_required: bool,
-    service_enable_required: bool,
-    session_status: &str,
-) -> String {
-    if session_active {
-        "Connected".to_string()
-    } else if service_setup_required {
-        "Install background service".to_string()
-    } else if service_enable_required {
-        "Enable background service".to_string()
-    } else if session_status.trim().is_empty() || session_status == "Disconnected" {
-        "Disconnected".to_string()
-    } else {
-        session_status.to_string()
-    }
-}
-
-fn tray_vpn_status_menu_text(status_text: &str) -> String {
-    format!("VPN Status: {status_text}")
-}
-
-fn tray_vpn_toggle_text(session_active: bool) -> &'static str {
-    if session_active {
-        "Turn VPN Off"
-    } else {
-        "Turn VPN On"
-    }
-}
-
-fn copy_text_to_clipboard(text: &str) -> Result<()> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Err(anyhow!("npub unavailable"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        copy_text_with_command("pbcopy", &[], text)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let candidates: [(&str, &[&str]); 3] = [
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-        ];
-        let mut last_error = None;
-        for (program, args) in candidates {
-            match copy_text_with_command(program, args, text) {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| anyhow!("no clipboard command available")))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        copy_text_with_command("cmd", &["/C", "clip"], text)
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        Err(anyhow!("clipboard copy is unsupported on this platform"))
-    }
-}
-
-fn copy_text_with_command(program: &str, args: &[&str], text: &str) -> Result<()> {
-    let mut command = ProcessCommand::new(program);
-    let mut child = apply_windows_subprocess_flags(&mut command)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start {program}"))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("failed to open stdin for {program}"))?;
-    stdin
-        .write_all(text.as_bytes())
-        .with_context(|| format!("failed to send text to {program}"))?;
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to wait for {program}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            Err(anyhow!("{program} exited with status {}", output.status))
-        } else {
-            Err(anyhow!("{program} failed: {stderr}"))
-        }
-    }
-}
-
-fn tray_participant_display_name(participant: &ParticipantView) -> String {
-    let alias = participant.magic_dns_alias.trim();
-    if !alias.is_empty() {
-        return alias.to_string();
-    }
-
-    if let Some(label) = participant
-        .magic_dns_name
-        .split('.')
-        .find(|segment| !segment.is_empty())
-    {
-        return label.to_string();
-    }
-
-    short_text(&participant.npub, 16, 8)
-}
-
-fn tray_network_groups(networks: &[NetworkView]) -> Vec<TrayNetworkGroup> {
-    let mut groups = Vec::new();
-
-    for network in networks.iter().filter(|network| network.enabled) {
-        let devices = network
-            .participants
-            .iter()
-            .filter(|participant| participant.state != "local")
-            .map(|participant| {
-                format!(
-                    "{} ({})",
-                    tray_participant_display_name(participant),
-                    participant.state
-                )
-            })
-            .collect::<Vec<_>>();
-
-        if devices.is_empty() {
-            continue;
-        }
-
-        groups.push(TrayNetworkGroup {
-            title: format!(
-                "{} ({}/{} online)",
-                network.name, network.online_count, network.expected_count
-            ),
-            devices,
-        });
-    }
-
-    groups
-}
-
-fn tray_exit_node_entries(
-    networks: &[NetworkView],
-    selected_exit_node: &str,
-) -> Vec<TrayExitNodeEntry> {
-    let mut seen = HashSet::new();
-    let mut entries = Vec::new();
-
-    for network in networks.iter().filter(|network| network.enabled) {
-        for participant in &network.participants {
-            if participant.state == "local"
-                || !participant.offers_exit_node
-                || !seen.insert(participant.pubkey_hex.clone())
-            {
-                continue;
-            }
-
-            entries.push(TrayExitNodeEntry {
-                pubkey_hex: participant.pubkey_hex.clone(),
-                title: tray_participant_display_name(participant),
-                selected: participant.pubkey_hex == selected_exit_node,
-            });
-        }
-    }
-
-    entries.sort_by(|left, right| {
-        left.title
-            .cmp(&right.title)
-            .then(left.pubkey_hex.cmp(&right.pubkey_hex))
-    });
-    entries
-}
-
-fn tray_menu_spec(runtime_state: &TrayRuntimeState) -> Vec<TrayMenuItemSpec> {
-    let mut network_items = Vec::new();
-    if runtime_state.network_groups.is_empty() {
-        network_items.push(TrayMenuItemSpec::Text {
-            id: None,
-            text: "No network devices configured".to_string(),
-            enabled: false,
-        });
-    } else {
-        for group in &runtime_state.network_groups {
-            network_items.push(TrayMenuItemSpec::Submenu {
-                text: group.title.clone(),
-                enabled: true,
-                items: group
-                    .devices
-                    .iter()
-                    .map(|device| TrayMenuItemSpec::Text {
-                        id: None,
-                        text: device.clone(),
-                        enabled: false,
-                    })
-                    .collect(),
-            });
-        }
-    }
-
-    let mut exit_node_items = vec![
-        TrayMenuItemSpec::Check {
-            id: TRAY_EXIT_NODE_NONE_MENU_ID.to_string(),
-            text: "None".to_string(),
-            enabled: true,
-            checked: !runtime_state.advertise_exit_node
-                && !runtime_state.exit_nodes.iter().any(|entry| entry.selected),
-        },
-        TrayMenuItemSpec::Check {
-            id: TRAY_RUN_EXIT_NODE_MENU_ID.to_string(),
-            text: "Offer Private Exit Node".to_string(),
-            enabled: true,
-            checked: runtime_state.advertise_exit_node,
-        },
-    ];
-    exit_node_items.push(TrayMenuItemSpec::Separator);
-    if runtime_state.exit_nodes.is_empty() {
-        exit_node_items.push(TrayMenuItemSpec::Text {
-            id: None,
-            text: "No exit nodes available".to_string(),
-            enabled: false,
-        });
-    } else {
-        exit_node_items.extend(runtime_state.exit_nodes.iter().map(|entry| {
-            TrayMenuItemSpec::Check {
-                id: format!("{TRAY_EXIT_NODE_MENU_ID_PREFIX}{}", entry.pubkey_hex),
-                text: entry.title.clone(),
-                enabled: true,
-                checked: entry.selected,
-            }
-        }));
-    }
-
-    vec![
-        TrayMenuItemSpec::Text {
-            id: None,
-            text: tray_vpn_status_menu_text(&runtime_state.status_text),
-            enabled: false,
-        },
-        TrayMenuItemSpec::Text {
-            id: Some(TRAY_VPN_TOGGLE_MENU_ID.to_string()),
-            text: tray_vpn_toggle_text(runtime_state.session_active).to_string(),
-            enabled: true,
-        },
-        TrayMenuItemSpec::Separator,
-        TrayMenuItemSpec::Text {
-            id: Some(TRAY_THIS_DEVICE_MENU_ID.to_string()),
-            text: runtime_state.this_device_text.clone(),
-            enabled: !runtime_state.this_device_copy_value.trim().is_empty(),
-        },
-        TrayMenuItemSpec::Submenu {
-            text: "Network Devices".to_string(),
-            enabled: true,
-            items: network_items,
-        },
-        TrayMenuItemSpec::Submenu {
-            text: "Exit Nodes".to_string(),
-            enabled: true,
-            items: exit_node_items,
-        },
-        TrayMenuItemSpec::Separator,
-        TrayMenuItemSpec::Text {
-            id: Some(TRAY_OPEN_MENU_ID.to_string()),
-            text: "Settings...".to_string(),
-            enabled: true,
-        },
-        TrayMenuItemSpec::Text {
-            id: Some(TRAY_QUIT_UI_MENU_ID.to_string()),
-            text: "Quit".to_string(),
-            enabled: true,
-        },
-    ]
-}
-
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-fn current_tray_runtime_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> TrayRuntimeState {
-    let Some(state) = app.try_state::<AppState>() else {
-        return TrayRuntimeState::default();
-    };
-    let Ok(backend) = state.backend.lock() else {
-        return TrayRuntimeState::default();
-    };
-    backend.tray_runtime_state()
-}
-
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-fn append_tray_spec_to_menu<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    menu: &Menu<R>,
-    spec: &TrayMenuItemSpec,
-) -> tauri::Result<()> {
-    match spec {
-        TrayMenuItemSpec::Check {
-            id,
-            text,
-            enabled,
-            checked,
-        } => {
-            let item = CheckMenuItemBuilder::with_id(id.clone(), text)
-                .enabled(*enabled)
-                .checked(*checked)
-                .build(app)?;
-            menu.append(&item)?;
-        }
-        TrayMenuItemSpec::Text { id, text, enabled } => {
-            let item = if let Some(id) = id {
-                MenuItemBuilder::with_id(id.clone(), text)
-                    .enabled(*enabled)
-                    .build(app)?
-            } else {
-                MenuItemBuilder::new(text).enabled(*enabled).build(app)?
-            };
-            menu.append(&item)?;
-        }
-        TrayMenuItemSpec::Submenu {
-            text,
-            enabled,
-            items,
-        } => {
-            let submenu = build_tray_submenu_from_spec(app, text, *enabled, items)?;
-            menu.append(&submenu)?;
-        }
-        TrayMenuItemSpec::Separator => {
-            let separator = PredefinedMenuItem::separator(app)?;
-            menu.append(&separator)?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-fn append_tray_spec_to_submenu<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    submenu: &Submenu<R>,
-    spec: &TrayMenuItemSpec,
-) -> tauri::Result<()> {
-    match spec {
-        TrayMenuItemSpec::Check {
-            id,
-            text,
-            enabled,
-            checked,
-        } => {
-            let item = CheckMenuItemBuilder::with_id(id.clone(), text)
-                .enabled(*enabled)
-                .checked(*checked)
-                .build(app)?;
-            submenu.append(&item)?;
-        }
-        TrayMenuItemSpec::Text { id, text, enabled } => {
-            let item = if let Some(id) = id {
-                MenuItemBuilder::with_id(id.clone(), text)
-                    .enabled(*enabled)
-                    .build(app)?
-            } else {
-                MenuItemBuilder::new(text).enabled(*enabled).build(app)?
-            };
-            submenu.append(&item)?;
-        }
-        TrayMenuItemSpec::Submenu {
-            text,
-            enabled,
-            items,
-        } => {
-            let child = build_tray_submenu_from_spec(app, text, *enabled, items)?;
-            submenu.append(&child)?;
-        }
-        TrayMenuItemSpec::Separator => {
-            let separator = PredefinedMenuItem::separator(app)?;
-            submenu.append(&separator)?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-fn build_tray_submenu_from_spec<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    text: &str,
-    enabled: bool,
-    items: &[TrayMenuItemSpec],
-) -> tauri::Result<Submenu<R>> {
-    let submenu = SubmenuBuilder::new(app, text).enabled(enabled).build()?;
-    for item in items {
-        append_tray_spec_to_submenu(app, &submenu, item)?;
-    }
-    Ok(submenu)
-}
-
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-fn build_tray_menu<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    runtime_state: &TrayRuntimeState,
-) -> tauri::Result<Menu<R>> {
-    let menu = Menu::new(app)?;
-    for item in tray_menu_spec(runtime_state) {
-        append_tray_spec_to_menu(app, &menu, &item)?;
-    }
-    Ok(menu)
-}
-
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    let Some(tray) = app.tray_by_id(TRAY_ICON_ID) else {
-        return;
-    };
-
-    let runtime_state = current_tray_runtime_state(app);
-    let Some(state) = app.try_state::<AppState>() else {
-        if let Ok(menu) = build_tray_menu(app, &runtime_state) {
-            let _ = tray.set_menu(Some(menu));
-        }
-        return;
-    };
-    let Ok(mut last_tray_runtime_state) = state.last_tray_runtime_state.lock() else {
-        return;
-    };
-
-    if *last_tray_runtime_state == runtime_state {
-        return;
-    }
-
-    if let Ok(menu) = build_tray_menu(app, &runtime_state)
-        && tray.set_menu(Some(menu)).is_ok()
-    {
-        *last_tray_runtime_state = runtime_state;
-    }
-}
-
-#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
-fn refresh_tray_menu<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) {}
-
-fn run_tray_backend_action<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    action: impl FnOnce(&mut NvpnBackend) -> Result<()>,
-) {
-    let Some(state) = app.try_state::<AppState>() else {
-        return;
-    };
-    let Ok(mut backend) = state.backend.lock() else {
-        return;
-    };
-
-    if let Err(error) = action(&mut backend) {
-        backend.session_status = format!("Tray action failed: {error}");
-    }
-    backend.tick();
-}
-
 #[tauri::command]
 async fn tick(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<UiState, String> {
     let ui = with_backend_async(state, |backend| {
@@ -6600,6 +6166,7 @@ mod tests {
             service_disabled: false,
             service_running: false,
             service_status_detail: String::new(),
+            service_binary_version: String::new(),
             last_service_status_refresh_at: None,
             daemon_state: None,
             relay_operator_state: None,
@@ -6661,6 +6228,9 @@ mod tests {
         DaemonRuntimeState {
             updated_at: epoch_secs_ago(0),
             binary_version: env!("CARGO_PKG_VERSION").to_string(),
+            local_endpoint: "192.168.1.20:51820".to_string(),
+            advertised_endpoint: "198.51.100.20:53083".to_string(),
+            listen_port: 53083,
             session_active,
             relay_connected: false,
             session_status: if session_active {
@@ -8081,6 +7651,26 @@ mod tests {
     }
 
     #[test]
+    fn ui_state_reports_service_binary_version() {
+        let mut backend = test_backend(&"44".repeat(32));
+        backend.service_binary_version = "0.3.4".to_string();
+        let state = backend.ui_state();
+
+        assert_eq!(state.service_binary_version, "0.3.4");
+    }
+
+    #[test]
+    fn ui_state_prefers_live_daemon_endpoint_and_listen_port() {
+        let mut backend = test_backend(&"44".repeat(32));
+        backend.daemon_state = Some(daemon_state_with_peer(None, true));
+
+        let state = backend.ui_state();
+
+        assert_eq!(state.endpoint, "198.51.100.20:53083");
+        assert_eq!(state.listen_port, 53083);
+    }
+
+    #[test]
     fn ui_state_reports_assigned_self_magic_dns_name() {
         let own = nostr_sdk::prelude::Keys::generate();
         let peer = nostr_sdk::prelude::Keys::generate();
@@ -8238,30 +7828,6 @@ mod tests {
         assert_eq!(view.runtime_endpoint, "198.51.100.9:45000");
         assert_eq!(view.tx_bytes, 4_096);
         assert_eq!(view.rx_bytes, 8_192);
-    }
-
-    #[test]
-    fn pending_peer_status_line_reports_when_runtime_waits_on_relay_endpoint() {
-        let participant = "44".repeat(32);
-        let mut backend = test_backend(&participant);
-        let mut peer = daemon_peer(
-            &participant,
-            false,
-            Some(3),
-            Some("awaiting handshake"),
-            "203.0.113.10:51820",
-        );
-        peer.runtime_endpoint = Some("198.51.100.9:45000".to_string());
-        backend.daemon_state = Some(daemon_state_with_peer(Some(peer), true));
-        backend.session_active = true;
-        backend.refresh_peer_runtime_status();
-
-        let view = backend.participant_view(&participant, "mesh-test", None, false);
-        assert!(
-            view.status_text
-                .contains("awaiting WireGuard handshake via relay")
-        );
-        assert!(view.status_text.contains("198.51.100.9:45000"));
     }
 
     #[test]

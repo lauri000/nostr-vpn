@@ -4,14 +4,17 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::relay_runtime::{
+    NatAssistRuntimeState, RelayRuntimeState, RelayServiceLimits, SessionForwardingState,
+    load_runtime_state, relay_runtime_state_from_snapshot,
+};
 use super::{
     DEFAULT_LEASE_SECS, DEFAULT_MAX_ACTIVE_RELAY_SESSIONS, DEFAULT_MAX_BYTES_PER_SESSION,
     DEFAULT_MAX_SESSIONS_PER_REQUESTER, DEFAULT_NAT_ASSIST_PORT, DEFAULT_PUBLISH_INTERVAL_SECS,
-    NatAssistRuntimeState, RelayPortAllocator, RelayPortRange, RelayRuntimeState,
-    RelayServiceLimits, SessionForwardingState, bind_relay_leg_pair, relay_port_range,
-    unix_timestamp,
+    RelayPortAllocator, RelayPortRange, bind_relay_leg_pair, relay_port_range, unix_timestamp,
 };
 use nostr_vpn_core::relay::{
     NatAssistOperatorState, RelayAllocationRejectReason, RelayOperatorSessionState,
@@ -19,10 +22,13 @@ use nostr_vpn_core::relay::{
 };
 use tokio::time::Instant;
 
+static UNIQUE_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn unique_state_path() -> PathBuf {
     env::temp_dir().join(format!(
-        "nvpn-relay-state-{}-{}.json",
+        "nvpn-relay-state-{}-{}-{}.json",
         std::process::id(),
+        UNIQUE_STATE_COUNTER.fetch_add(1, Ordering::Relaxed),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("epoch")
@@ -248,7 +254,7 @@ fn runtime_state_seeded_from_snapshot_keeps_cumulative_totals() {
         }],
     };
 
-    let state = super::relay_runtime_state_from_snapshot(
+    let state = relay_runtime_state_from_snapshot(
         snapshot,
         "relay-now".to_string(),
         "203.0.113.7:0".to_string(),
@@ -497,7 +503,7 @@ fn load_runtime_state_upgrades_legacy_relay_snapshot() {
     )
     .expect("write state");
 
-    let state = super::load_runtime_state(
+    let state = load_runtime_state(
         &path,
         "relay-now".to_string(),
         Some("203.0.113.7:0".to_string()),
@@ -557,7 +563,7 @@ fn load_runtime_state_restores_service_snapshot() {
     )
     .expect("write state");
 
-    let state = super::load_runtime_state(
+    let state = load_runtime_state(
         &path,
         "service-now".to_string(),
         Some("203.0.113.7:0".to_string()),

@@ -3,6 +3,7 @@ mod diagnostics;
 mod macos_network;
 #[cfg(any(target_os = "macos", test))]
 mod macos_service;
+mod network_signaling;
 #[cfg(any(target_os = "windows", test))]
 mod userspace_wg;
 #[cfg(any(target_os = "windows", test))]
@@ -33,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 #[cfg(unix)]
 use boringtun::device::{DeviceConfig, DeviceHandle};
 use clap::{Args, Parser, Subcommand};
@@ -41,6 +42,7 @@ use hex::encode as encode_hex;
 use netdev::get_interfaces;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use netdev::interface::interface::Interface as NetworkInterface;
+#[cfg(test)]
 use nostr_sdk::prelude::ToBech32;
 use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, maybe_autoconfigure_node, normalize_advertised_route,
@@ -92,6 +94,14 @@ use windows_service::service_dispatcher;
 use crate::diagnostics::{
     PortMappingRuntime, build_health_issues, capture_network_snapshot, detect_captive_portal,
     run_netcheck_report, write_doctor_bundle,
+};
+#[cfg(test)]
+use crate::network_signaling::NETWORK_INVITE_PREFIX;
+use crate::network_signaling::{
+    AnnounceRequest, RosterEditAction, active_network_invite_code,
+    apply_network_invite_to_active_network, discover_peers, maybe_reload_running_daemon,
+    parse_network_invite, publish_active_network_roster, publish_announcement,
+    update_active_network_roster,
 };
 #[cfg(target_os = "windows")]
 use crate::windows_tunnel::WindowsTunnelBackend;
@@ -1187,7 +1197,7 @@ async fn run_command(command: Command) -> Result<()> {
             } else {
                 println!("saved {}", config_path.display());
                 println!("network_id={}", app.effective_network_id());
-                println!("invite_imported={}", invite.network_name);
+                println!("invite_imported={}", invite.network_name());
             }
         }
         Command::AddParticipant(args) => {
@@ -1553,372 +1563,6 @@ fn is_default_exit_node_route(route: &str) -> bool {
     matches!(route, "0.0.0.0/0" | "::/0")
 }
 
-const NETWORK_INVITE_PREFIX: &str = "nvpn://invite/";
-const NETWORK_INVITE_VERSION: u8 = 2;
-
-fn parse_network_invite(value: &str) -> Result<NetworkInvite> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("invite code is empty"));
-    }
-
-    let mut invite = if trimmed.starts_with('{') {
-        serde_json::from_str::<NetworkInvite>(trimmed)
-            .context("failed to parse network invite JSON")?
-    } else {
-        let payload = trimmed
-            .strip_prefix(NETWORK_INVITE_PREFIX)
-            .unwrap_or(trimmed);
-        let decoded = URL_SAFE_NO_PAD
-            .decode(payload)
-            .context("failed to decode network invite payload")?;
-        serde_json::from_slice::<NetworkInvite>(&decoded)
-            .context("failed to parse network invite payload")?
-    };
-
-    if invite.v != 1 && invite.v != NETWORK_INVITE_VERSION {
-        return Err(anyhow!(
-            "unsupported invite version {}; expected 1 or {}",
-            invite.v,
-            NETWORK_INVITE_VERSION
-        ));
-    }
-
-    invite.network_name = invite.network_name.trim().to_string();
-    if invite.network_name.is_empty() {
-        return Err(anyhow!("invite network name is empty"));
-    }
-
-    invite.network_id = invite.network_id.trim().to_string();
-    if invite.network_id.is_empty() {
-        return Err(anyhow!("invite network id is empty"));
-    }
-
-    invite.inviter_npub = normalize_nostr_pubkey(&invite.inviter_npub)?;
-    invite.inviter_node_name = invite.inviter_node_name.trim().to_string();
-    invite.admins = normalized_invite_pubkeys(&invite.admins)?;
-    if !invite
-        .admins
-        .iter()
-        .any(|admin| admin == &invite.inviter_npub)
-    {
-        invite.admins.push(invite.inviter_npub.clone());
-        invite.admins.sort();
-        invite.admins.dedup();
-    }
-    invite.participants = normalized_invite_pubkeys(&invite.participants)?;
-    if invite.participants.is_empty() {
-        invite.participants.push(invite.inviter_npub.clone());
-    }
-    invite.relays = normalized_invite_relays(&invite.relays)?;
-
-    Ok(invite)
-}
-
-fn apply_network_invite_to_active_network(
-    config: &mut AppConfig,
-    invite: &NetworkInvite,
-) -> Result<()> {
-    let normalized_invite_network_id = normalize_runtime_network_id(&invite.network_id);
-    let normalized_inviter_pubkey = normalize_nostr_pubkey(&invite.inviter_npub)?;
-    let own_pubkey = config.own_nostr_pubkey_hex().ok();
-    let invite_admins = invite
-        .admins
-        .iter()
-        .map(|admin| normalize_nostr_pubkey(admin))
-        .collect::<Result<Vec<_>>>()?;
-    let invite_participants = invite
-        .participants
-        .iter()
-        .map(|participant| normalize_nostr_pubkey(participant))
-        .collect::<Result<Vec<_>>>()?;
-
-    if let Some(existing_id) = config
-        .networks
-        .iter()
-        .find(|network| {
-            normalize_runtime_network_id(&network.network_id) == normalized_invite_network_id
-        })
-        .map(|network| network.id.clone())
-    {
-        config.set_network_enabled(&existing_id, true)?;
-    } else {
-        let network_id = config.active_network().id.clone();
-        config.set_network_enabled(&network_id, true)?;
-        config.set_network_mesh_id(&network_id, &invite.network_id)?;
-    }
-
-    let network = config.active_network_mut();
-    if network.participants.is_empty() {
-        network.name = invite.network_name.trim().to_string();
-    }
-    network.network_id = invite.network_id.clone();
-    network.participants.clear();
-    for participant in &invite_participants {
-        if own_pubkey.as_deref() == Some(participant.as_str()) {
-            continue;
-        }
-        network.participants.push(participant.clone());
-    }
-    network.participants.sort();
-    network.participants.dedup();
-
-    network.admins = invite_admins;
-    if !network
-        .admins
-        .iter()
-        .any(|admin| admin == &normalized_inviter_pubkey)
-    {
-        network.admins.push(normalized_inviter_pubkey.clone());
-    }
-    network.admins.sort();
-    network.admins.dedup();
-    network.invite_inviter = normalized_inviter_pubkey;
-
-    for relay in &invite.relays {
-        if !config.nostr.relays.iter().any(|existing| existing == relay) {
-            config.nostr.relays.push(relay.clone());
-        }
-    }
-
-    Ok(())
-}
-
-fn normalized_invite_pubkeys(pubkeys: &[String]) -> Result<Vec<String>> {
-    let mut normalized = pubkeys
-        .iter()
-        .map(|pubkey| normalize_nostr_pubkey(pubkey))
-        .collect::<Result<Vec<_>>>()?;
-    normalized.sort();
-    normalized.dedup();
-    Ok(normalized)
-}
-
-fn normalized_invite_relays(relays: &[String]) -> Result<Vec<String>> {
-    let mut normalized = Vec::new();
-    for relay in relays {
-        let relay = relay.trim();
-        if relay.is_empty() {
-            continue;
-        }
-        if !is_valid_relay_url(relay) {
-            return Err(anyhow!("invalid invite relay '{relay}'"));
-        }
-        if !normalized.iter().any(|existing| existing == relay) {
-            normalized.push(relay.to_string());
-        }
-    }
-    Ok(normalized)
-}
-
-fn is_valid_relay_url(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.starts_with("wss://") || trimmed.starts_with("ws://")
-}
-
-fn maybe_reload_running_daemon(config_path: &Path) {
-    let status = match daemon_status(config_path) {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!("config: failed to inspect daemon status after save: {error}");
-            return;
-        }
-    };
-    if !status.running {
-        return;
-    }
-    clear_daemon_control_result(config_path);
-    if let Err(error) = request_daemon_reload(config_path) {
-        eprintln!("config: failed to request daemon reload after save: {error}");
-        return;
-    }
-    if let Err(error) = wait_for_daemon_control_ack(config_path, Duration::from_secs(2)) {
-        eprintln!("config: daemon did not acknowledge reload after save: {error}");
-        return;
-    }
-    if let Err(error) = wait_for_daemon_control_result(
-        config_path,
-        DaemonControlRequest::Reload,
-        Duration::from_secs(2),
-    ) {
-        eprintln!("config: daemon reload after save failed: {error}");
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum RosterEditAction {
-    AddParticipant,
-    RemoveParticipant,
-    AddAdmin,
-    RemoveAdmin,
-}
-
-fn to_npub(pubkey_hex: &str) -> String {
-    nostr_sdk::PublicKey::from_hex(pubkey_hex)
-        .ok()
-        .and_then(|pubkey| pubkey.to_bech32().ok())
-        .unwrap_or_else(|| pubkey_hex.to_string())
-}
-
-fn active_network_invite_code(config: &AppConfig) -> Result<String> {
-    let active_network = config.active_network();
-    let roster = config.shared_network_roster(&active_network.id)?;
-    let own_pubkey = config.own_nostr_pubkey_hex().ok();
-    let inviter_pubkey = own_pubkey
-        .as_deref()
-        .filter(|pubkey| config.is_network_admin(&active_network.id, pubkey))
-        .map(str::to_string)
-        .or_else(|| {
-            if !active_network.invite_inviter.is_empty()
-                && active_network
-                    .admins
-                    .iter()
-                    .any(|admin| admin == &active_network.invite_inviter)
-            {
-                Some(active_network.invite_inviter.clone())
-            } else {
-                active_network.admins.first().cloned()
-            }
-        })
-        .ok_or_else(|| anyhow!("active network has no admin configured"))?;
-    let invite = NetworkInvite {
-        v: NETWORK_INVITE_VERSION,
-        network_name: active_network.name.trim().to_string(),
-        network_id: roster.network_id,
-        inviter_npub: to_npub(&inviter_pubkey),
-        inviter_node_name: if own_pubkey.as_deref() == Some(inviter_pubkey.as_str()) {
-            config.node_name.trim().to_string()
-        } else {
-            config.peer_alias(&inviter_pubkey).unwrap_or_default()
-        },
-        admins: roster.admins.iter().map(|admin| to_npub(admin)).collect(),
-        participants: roster
-            .participants
-            .iter()
-            .map(|participant| to_npub(participant))
-            .collect(),
-        relays: normalized_invite_relays(&config.nostr.relays)?,
-    };
-    let encoded = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&invite).context("failed to encode network invite JSON")?);
-    Ok(format!("{NETWORK_INVITE_PREFIX}{encoded}"))
-}
-
-async fn update_active_network_roster(
-    args: UpdateRosterArgs,
-    action: RosterEditAction,
-) -> Result<()> {
-    let config_path = args.config.unwrap_or_else(default_config_path);
-    let mut app = load_or_default_config(&config_path)?;
-    if let Some(network_id) = args.network_id {
-        app.set_active_network_id(&network_id)?;
-    }
-    let active_network_id = app.active_network().id.clone();
-
-    let mut changed = Vec::new();
-    for participant in &args.participants {
-        let normalized = match action {
-            RosterEditAction::AddParticipant => {
-                app.add_participant_to_network(&active_network_id, participant)?
-            }
-            RosterEditAction::RemoveParticipant => {
-                let normalized = normalize_nostr_pubkey(participant)?;
-                app.remove_participant_from_network(&active_network_id, participant)?;
-                normalized
-            }
-            RosterEditAction::AddAdmin => {
-                app.add_admin_to_network(&active_network_id, participant)?
-            }
-            RosterEditAction::RemoveAdmin => {
-                let normalized = normalize_nostr_pubkey(participant)?;
-                app.remove_admin_from_network(&active_network_id, participant)?;
-                normalized
-            }
-        };
-        changed.push(normalized);
-    }
-
-    app.ensure_defaults();
-    maybe_autoconfigure_node(&mut app);
-    app.save(&config_path)?;
-    maybe_reload_running_daemon(&config_path);
-
-    let mut published = 0usize;
-    let relays = resolve_relays(&args.relays, &app);
-    if args.publish {
-        let client = NostrSignalingClient::from_secret_key_with_networks(
-            &app.nostr.secret_key,
-            signaling_networks_for_app(&app),
-        )?;
-        client
-            .connect(&relays)
-            .await
-            .context("failed to connect signaling client")?;
-        published = publish_active_network_roster(&client, &app, None).await?;
-        client.disconnect().await;
-    }
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "network_id": app.effective_network_id(),
-                "participants": app.active_network().participants,
-                "admins": app.active_network().admins,
-                "changed": changed,
-                "published_recipients": published,
-                "published": args.publish,
-                "relays": if args.publish { relays } else { Vec::<String>::new() },
-            }))?
-        );
-    } else {
-        println!("saved {}", config_path.display());
-        println!("network_id={}", app.effective_network_id());
-        println!("changed={}", changed.join(","));
-        if args.publish {
-            println!("published_recipients={published}");
-        }
-    }
-
-    Ok(())
-}
-
-#[derive(Debug)]
-struct AnnounceRequest {
-    config: Option<PathBuf>,
-    network_id: Option<String>,
-    participants: Vec<String>,
-    node_id: Option<String>,
-    endpoint: Option<String>,
-    tunnel_ip: Option<String>,
-    public_key: Option<String>,
-    relay: Vec<String>,
-}
-
-#[derive(Debug)]
-struct PublishedAnnouncement {
-    app: AppConfig,
-    network_id: String,
-    relays: Vec<String>,
-    announcement: PeerAnnouncement,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NetworkInvite {
-    v: u8,
-    network_name: String,
-    network_id: String,
-    inviter_npub: String,
-    #[serde(default)]
-    inviter_node_name: String,
-    #[serde(default)]
-    admins: Vec<String>,
-    #[serde(default)]
-    participants: Vec<String>,
-    #[serde(default)]
-    relays: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonPidRecord {
     pid: u32,
@@ -2158,169 +1802,6 @@ fn build_daemon_reload_config(
         own_pubkey,
         relays,
     }
-}
-
-async fn publish_active_network_roster(
-    client: &NostrSignalingClient,
-    app: &AppConfig,
-    recipients: Option<&[String]>,
-) -> Result<usize> {
-    let network = app.active_network();
-    let own_pubkey = match app.own_nostr_pubkey_hex() {
-        Ok(pubkey) => pubkey,
-        Err(_) => return Ok(0),
-    };
-    if !app.is_network_admin(&network.id, &own_pubkey) {
-        return Ok(0);
-    }
-
-    let roster = app.shared_network_roster(&network.id)?;
-    let allowed = app.active_network_signal_pubkeys_hex();
-    let allowed_set = allowed.iter().cloned().collect::<HashSet<_>>();
-    let mut recipients = recipients
-        .map(|recipients| {
-            recipients
-                .iter()
-                .filter(|recipient| allowed_set.contains(recipient.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or(allowed);
-    recipients.retain(|recipient| recipient != &own_pubkey);
-    recipients.sort();
-    recipients.dedup();
-    if recipients.is_empty() {
-        return Ok(0);
-    }
-
-    let payload = SignalPayload::Roster(NetworkRoster {
-        network_name: roster.name,
-        participants: roster.participants,
-        admins: roster.admins,
-        signed_at: if roster.updated_at > 0 {
-            roster.updated_at
-        } else {
-            unix_timestamp()
-        },
-    });
-    client.publish_to(payload, &recipients).await?;
-    Ok(recipients.len())
-}
-
-async fn publish_announcement(request: AnnounceRequest) -> Result<PublishedAnnouncement> {
-    let config_path = request.config.unwrap_or_else(default_config_path);
-    let (app, network_id) =
-        load_config_with_overrides(&config_path, request.network_id, request.participants)?;
-    let node_id = request.node_id.unwrap_or_else(|| app.node.id.clone());
-    let endpoint = request
-        .endpoint
-        .unwrap_or_else(|| app.node.endpoint.clone());
-    let tunnel_ip = request
-        .tunnel_ip
-        .unwrap_or_else(|| app.node.tunnel_ip.clone());
-    let public_key = request
-        .public_key
-        .unwrap_or_else(|| app.node.public_key.clone());
-    let relays = resolve_relays(&request.relay, &app);
-
-    let client = NostrSignalingClient::from_secret_key_with_networks(
-        &app.nostr.secret_key,
-        signaling_networks_for_app(&app),
-    )?;
-    client.connect(&relays).await?;
-
-    let listen_port = endpoint
-        .parse::<SocketAddr>()
-        .map(|addr| addr.port())
-        .unwrap_or(app.node.listen_port);
-    let local_endpoint = if endpoint_is_local_only(&endpoint) {
-        endpoint.clone()
-    } else {
-        local_signal_endpoint(&app, listen_port)
-    };
-    let announcement = build_explicit_peer_announcement(
-        node_id,
-        public_key,
-        endpoint,
-        local_endpoint,
-        tunnel_ip,
-        runtime_effective_advertised_routes(&app),
-    );
-
-    client
-        .publish(SignalPayload::Announce(announcement.clone()))
-        .await
-        .context("failed to publish presence signal")?;
-
-    client.disconnect().await;
-
-    Ok(PublishedAnnouncement {
-        app,
-        network_id,
-        relays,
-        announcement,
-    })
-}
-
-async fn discover_peers(
-    app: &AppConfig,
-    _network_id: &str,
-    relays: &[String],
-    discover_secs: u64,
-) -> Result<Vec<PeerAnnouncement>> {
-    if discover_secs == 0 {
-        return Ok(Vec::new());
-    }
-
-    let client = NostrSignalingClient::from_secret_key_with_networks(
-        &app.nostr.secret_key,
-        signaling_networks_for_app(app),
-    )?;
-    client.connect(relays).await?;
-    let _ = client.publish(SignalPayload::Hello).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(discover_secs);
-    let mut peers: std::collections::HashMap<String, PeerAnnouncement> =
-        std::collections::HashMap::new();
-
-    loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-
-        let wait_for = std::cmp::min(
-            deadline.saturating_duration_since(now),
-            Duration::from_millis(250),
-        );
-
-        match tokio::time::timeout(wait_for, client.recv()).await {
-            Ok(Some(message)) => match message.payload {
-                SignalPayload::Hello => {}
-                SignalPayload::Announce(announcement) => {
-                    let should_insert = peers
-                        .get(&announcement.node_id)
-                        .is_none_or(|existing| existing.timestamp <= announcement.timestamp);
-                    if should_insert {
-                        peers.insert(announcement.node_id.clone(), announcement);
-                    }
-                }
-                SignalPayload::Disconnect { node_id } => {
-                    peers.remove(&node_id);
-                }
-                SignalPayload::Roster(_) => {}
-                SignalPayload::JoinRequest { .. } => {}
-            },
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-
-    client.disconnect().await;
-
-    let mut values: Vec<PeerAnnouncement> = peers.into_values().collect();
-    values.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    Ok(values)
 }
 
 #[derive(Debug, Clone)]
@@ -13172,12 +12653,12 @@ mod tests {
 
     use crate::{Cli, PeerAnnouncement};
 
-    mod config_cache_split;
-    mod daemon_control_split;
-    mod peer_runtime_split;
-    mod routing_split;
-    mod runtime_misc_split;
-    mod service_split;
+    mod config_cache;
+    mod daemon_control;
+    mod peer_runtime;
+    mod routing;
+    mod runtime_misc;
+    mod service_cli;
 
     fn sample_peer_announcement(public_key: String) -> PeerAnnouncement {
         PeerAnnouncement {

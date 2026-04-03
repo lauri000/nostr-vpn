@@ -20,7 +20,8 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
-use crate::config::{AppConfig, derive_mesh_tunnel_ip};
+use crate::config::AppConfig;
+use crate::network_routes::derive_mesh_tunnel_ip;
 
 const DNS_TTL_SECS: u32 = 30;
 const DNS_READ_TIMEOUT: Duration = Duration::from_millis(350);

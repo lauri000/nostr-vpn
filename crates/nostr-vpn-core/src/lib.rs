@@ -6,6 +6,8 @@ pub mod diagnostics;
 pub mod join_requests;
 pub mod magic_dns;
 pub mod nat;
+mod network_roster;
+mod network_routes;
 pub mod node_record;
 pub mod paths;
 pub mod platform_paths;

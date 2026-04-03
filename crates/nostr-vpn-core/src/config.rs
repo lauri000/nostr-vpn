@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{IpAddr, UdpSocket};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -12,12 +12,22 @@ pub use crate::config_magic_dns::{
     default_node_name_for_pubkey, default_node_name_from_hostname, normalize_magic_dns_label,
     normalize_magic_dns_suffix,
 };
+pub use crate::network_routes::{
+    derive_mesh_tunnel_ip, effective_advertised_routes, exit_node_default_routes,
+    normalize_advertised_route, normalize_advertised_routes,
+};
 
 use crate::config_magic_dns::{
     default_magic_dns_suffix, default_network_entry_id, default_network_name, default_node_name,
     default_peer_aliases, detected_hostname, normalize_network_entry_id, uniquify_magic_dns_label,
     uniquify_network_entry_id, uses_default_node_name,
 };
+use crate::network_roster::{
+    canonical_npub_key, canonicalize_inbound_join_requests, canonicalize_outbound_join_request,
+    normalize_inbound_join_requests, normalize_network_admins, normalize_npub_key,
+    normalize_outbound_join_request, normalize_shared_roster_participants,
+};
+use crate::network_routes::is_exit_node_route;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1301,104 +1311,6 @@ pub fn maybe_autoconfigure_node(config: &mut AppConfig) {
     }
 }
 
-pub fn derive_mesh_tunnel_ip(network_id: &str, own_pubkey_hex: &str) -> Option<String> {
-    let network_id = normalize_runtime_network_id(network_id);
-    let network_id = network_id.trim();
-    let own_pubkey_hex = own_pubkey_hex.trim();
-    if network_id.is_empty() || own_pubkey_hex.is_empty() {
-        return None;
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(network_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(own_pubkey_hex.as_bytes());
-    let digest = hasher.finalize();
-
-    let third_octet = (digest[0] % 254) + 1;
-    let fourth_octet = (digest[1] % 254) + 1;
-    Some(format!("10.44.{third_octet}.{fourth_octet}/32"))
-}
-
-pub fn normalize_advertised_route(value: &str) -> Option<String> {
-    let value = value.trim();
-    let (addr, bits) = value.split_once('/')?;
-    let addr: IpAddr = addr.trim().parse().ok()?;
-    let bits: u8 = bits.trim().parse().ok()?;
-
-    let max_bits = match addr {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    if bits > max_bits {
-        return None;
-    }
-
-    let network = match addr {
-        IpAddr::V4(ip) => IpAddr::V4(mask_ipv4(ip, bits)),
-        IpAddr::V6(ip) => IpAddr::V6(mask_ipv6(ip, bits)),
-    };
-
-    Some(format!("{network}/{bits}"))
-}
-
-pub fn normalize_advertised_routes(routes: &[String]) -> Vec<String> {
-    let mut normalized = Vec::new();
-    let mut seen = HashSet::new();
-
-    for route in routes {
-        let Some(route) = normalize_advertised_route(route) else {
-            continue;
-        };
-        if seen.insert(route.clone()) {
-            normalized.push(route);
-        }
-    }
-
-    normalized
-}
-
-pub fn effective_advertised_routes(routes: &[String], advertise_exit_node: bool) -> Vec<String> {
-    let mut effective = normalize_advertised_routes(routes);
-    let mut seen = effective.iter().cloned().collect::<HashSet<_>>();
-
-    if advertise_exit_node {
-        for route in exit_node_default_routes() {
-            if seen.insert(route.clone()) {
-                effective.push(route);
-            }
-        }
-    }
-
-    effective
-}
-
-pub fn exit_node_default_routes() -> Vec<String> {
-    vec!["0.0.0.0/0".to_string(), "::/0".to_string()]
-}
-
-fn is_exit_node_route(route: &str) -> bool {
-    matches!(route, "0.0.0.0/0" | "::/0")
-}
-
-fn mask_ipv4(ip: Ipv4Addr, bits: u8) -> Ipv4Addr {
-    let mask = if bits == 0 {
-        0
-    } else {
-        u32::MAX << (32 - bits)
-    };
-    Ipv4Addr::from(u32::from(ip) & mask)
-}
-
-fn mask_ipv6(ip: Ipv6Addr, bits: u8) -> Ipv6Addr {
-    let mask = if bits == 0 {
-        0
-    } else {
-        u128::MAX << (128 - bits)
-    };
-    Ipv6Addr::from(u128::from_be_bytes(ip.octets()) & mask)
-}
-
 pub fn needs_endpoint_autoconfig(endpoint: &str) -> bool {
     let value = endpoint.trim();
     if value.is_empty() {
@@ -1525,136 +1437,4 @@ fn current_unix_timestamp() -> u64 {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
-}
-
-fn normalize_network_admins(
-    admins: Vec<String>,
-    own_pubkey_hex: Option<&str>,
-    invite_inviter: &str,
-) -> Vec<String> {
-    let mut normalized = admins
-        .into_iter()
-        .filter_map(|admin| normalize_nostr_pubkey(&admin).ok())
-        .collect::<Vec<_>>();
-    normalized.sort();
-    normalized.dedup();
-    if !normalized.is_empty() {
-        return normalized;
-    }
-
-    if let Ok(inviter) = normalize_nostr_pubkey(invite_inviter) {
-        return vec![inviter];
-    }
-
-    own_pubkey_hex
-        .map(|pubkey| vec![pubkey.to_string()])
-        .unwrap_or_default()
-}
-
-fn normalize_shared_roster_participants(
-    participants: Vec<String>,
-    own_pubkey_hex: Option<&str>,
-) -> Result<Vec<String>> {
-    let mut normalized = participants
-        .into_iter()
-        .map(|participant| normalize_nostr_pubkey(&participant))
-        .collect::<Result<Vec<_>>>()?;
-    if let Some(own_pubkey_hex) = own_pubkey_hex {
-        normalized.retain(|participant| participant != own_pubkey_hex);
-    }
-    normalized.sort();
-    normalized.dedup();
-    Ok(normalized)
-}
-
-fn canonical_npub_key(value: &str) -> Option<String> {
-    let normalized = normalize_nostr_pubkey(value).ok()?;
-    Some(npub_for_pubkey_hex(&normalized))
-}
-
-fn normalize_outbound_join_request(
-    request: Option<PendingOutboundJoinRequest>,
-    _participants: &[String],
-) -> Option<PendingOutboundJoinRequest> {
-    let request = request?;
-    let recipient = normalize_nostr_pubkey(&request.recipient).ok()?;
-    Some(PendingOutboundJoinRequest {
-        recipient,
-        requested_at: request.requested_at,
-    })
-}
-
-fn canonicalize_outbound_join_request(
-    request: Option<PendingOutboundJoinRequest>,
-) -> Option<PendingOutboundJoinRequest> {
-    let request = request?;
-    let recipient = canonical_npub_key(&request.recipient)?;
-    Some(PendingOutboundJoinRequest {
-        recipient,
-        requested_at: request.requested_at,
-    })
-}
-
-fn normalize_inbound_join_requests(
-    requests: Vec<PendingInboundJoinRequest>,
-    participants: &[String],
-) -> Vec<PendingInboundJoinRequest> {
-    let mut deduped = HashMap::new();
-
-    for request in requests {
-        let Ok(requester) = normalize_nostr_pubkey(&request.requester) else {
-            continue;
-        };
-        if participants
-            .iter()
-            .any(|participant| participant == &requester)
-        {
-            continue;
-        }
-
-        let normalized = PendingInboundJoinRequest {
-            requester: requester.clone(),
-            requester_node_name: request.requester_node_name.trim().to_string(),
-            requested_at: request.requested_at,
-        };
-        if deduped
-            .get(&requester)
-            .map(|existing: &PendingInboundJoinRequest| {
-                existing.requested_at >= normalized.requested_at
-            })
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        deduped.insert(requester, normalized);
-    }
-
-    let mut normalized = deduped.into_values().collect::<Vec<_>>();
-    normalized.sort_by(|left, right| left.requester.cmp(&right.requester));
-    normalized
-}
-
-fn canonicalize_inbound_join_requests(
-    requests: Vec<PendingInboundJoinRequest>,
-) -> Vec<PendingInboundJoinRequest> {
-    requests
-        .into_iter()
-        .filter_map(|request| {
-            let requester = canonical_npub_key(&request.requester)?;
-            Some(PendingInboundJoinRequest {
-                requester,
-                requester_node_name: request.requester_node_name,
-                requested_at: request.requested_at,
-            })
-        })
-        .collect()
-}
-
-fn normalize_npub_key(value: &str) -> Option<String> {
-    let candidate = value.trim();
-    if !candidate.starts_with("npub1") {
-        return None;
-    }
-
-    canonical_npub_key(candidate)
 }
