@@ -2813,6 +2813,7 @@ impl CliTunnelRuntime {
                 own_pubkey,
                 peer_announcements,
                 &planned_peers,
+                runtime_peers.as_ref(),
             );
             #[cfg(target_os = "macos")]
             eprintln!(
@@ -5187,6 +5188,7 @@ fn route_targets_for_planned_tunnel_peers(
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     planned_peers: &[PlannedTunnelPeer],
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
 ) -> Vec<String> {
     let mut route_targets = route_targets_for_tunnel_peers(
         &planned_peers
@@ -5196,20 +5198,49 @@ fn route_targets_for_planned_tunnel_peers(
     );
 
     #[cfg(any(target_os = "macos", test))]
-    if selected_exit_node_participant(app, own_pubkey, peer_announcements)
-        .as_deref()
-        .is_some_and(|participant| {
-            planned_peers
-                .iter()
-                .any(|planned| planned.participant == participant)
-        })
-        && !route_targets.iter().any(|route| route == "0.0.0.0/0")
-    {
+    let exit_node_ready = selected_exit_node_ready_for_default_route(
+        app,
+        own_pubkey,
+        peer_announcements,
+        planned_peers,
+        runtime_peers,
+    );
+    #[cfg(any(target_os = "macos", test))]
+    if !exit_node_ready {
+        route_targets.retain(|route| route != "0.0.0.0/0");
+    }
+    #[cfg(any(target_os = "macos", test))]
+    if exit_node_ready && !route_targets.iter().any(|route| route == "0.0.0.0/0") {
         route_targets.push("0.0.0.0/0".to_string());
         route_targets.sort();
     }
 
     route_targets
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn selected_exit_node_ready_for_default_route(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    planned_peers: &[PlannedTunnelPeer],
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+) -> bool {
+    let Some(participant) = selected_exit_node_participant(app, own_pubkey, peer_announcements)
+    else {
+        return false;
+    };
+
+    let Some(planned) = planned_peers
+        .iter()
+        .find(|planned| planned.participant == participant)
+    else {
+        return false;
+    };
+
+    runtime_peers
+        .and_then(|peers| peers.get(&planned.peer.pubkey_hex))
+        .is_some_and(peer_has_recent_handshake)
 }
 
 fn local_interface_address_for_tunnel(tunnel_ip: &str) -> String {

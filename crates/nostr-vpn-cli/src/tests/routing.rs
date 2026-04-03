@@ -127,9 +127,67 @@ fn macos_route_targets_add_default_route_for_selected_exit_peer() {
     )
     .expect("planned tunnel peers");
 
-    let routes = route_targets_for_planned_tunnel_peers(&config, None, &announcements, &planned);
+    let routes = route_targets_for_planned_tunnel_peers(&config, None, &announcements, &planned, None);
 
-    #[cfg(any(target_os = "macos", test))]
+    assert_eq!(
+        routes,
+        vec!["10.44.0.2/32".to_string(), "10.60.0.0/24".to_string()]
+    );
+}
+
+#[test]
+fn macos_route_targets_add_default_route_for_selected_exit_peer_after_handshake() {
+    let mut config = AppConfig::generated();
+    let exit_participant = Keys::generate().public_key().to_hex();
+    config.networks[0].participants = vec![exit_participant.clone()];
+    config.exit_node = exit_participant.clone();
+    config.ensure_defaults();
+
+    let public_key = generate_keypair().public_key;
+    let public_key_hex = crate::key_b64_to_hex(&public_key).expect("peer public key hex");
+    let announcements = HashMap::from([(
+        exit_participant.clone(),
+        PeerAnnouncement {
+            node_id: "exit-node".to_string(),
+            public_key,
+            endpoint: "203.0.113.20:51820".to_string(),
+            local_endpoint: None,
+            public_endpoint: Some("203.0.113.20:51820".to_string()),
+            relay_endpoint: None,
+            relay_pubkey: None,
+            relay_expires_at: None,
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            advertised_routes: vec!["0.0.0.0/0".to_string(), "10.60.0.0/24".to_string()],
+            timestamp: 1,
+        },
+    )]);
+
+    let planned = planned_tunnel_peers(
+        &config,
+        None,
+        &announcements,
+        &mut PeerPathBook::default(),
+        Some("192.0.2.10:51820"),
+        10,
+    )
+    .expect("planned tunnel peers");
+
+    let runtime_peers = HashMap::from([(
+        public_key_hex,
+        WireGuardPeerStatus {
+            last_handshake_sec: Some(1),
+            ..Default::default()
+        },
+    )]);
+
+    let routes = route_targets_for_planned_tunnel_peers(
+        &config,
+        None,
+        &announcements,
+        &planned,
+        Some(&runtime_peers),
+    );
+
     assert_eq!(
         routes,
         vec![
@@ -137,12 +195,6 @@ fn macos_route_targets_add_default_route_for_selected_exit_peer() {
             "10.44.0.2/32".to_string(),
             "10.60.0.0/24".to_string(),
         ]
-    );
-
-    #[cfg(not(any(target_os = "macos", test)))]
-    assert_eq!(
-        routes,
-        vec!["10.44.0.2/32".to_string(), "10.60.0.0/24".to_string()]
     );
 }
 
