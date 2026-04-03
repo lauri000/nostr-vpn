@@ -9,7 +9,6 @@
     lanPairingDeadlineFromSnapshot,
     remainingSecsFromDeadline,
   } from './lib/countdown.js'
-  import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
   import {
     serviceRepairErrorText,
     serviceRepairRecommended,
@@ -22,14 +21,9 @@
     formatMeshIdForDisplay,
     validateMeshIdInput,
   } from './lib/mesh-id.js'
-  import { nodeNameDnsPreview } from './lib/node-name.js'
   import {
     activeNetwork,
     formatCountdown,
-    heroBadgeText,
-    heroDetailText,
-    heroStateBadgeClass,
-    heroSubtext,
     inactiveNetworks,
     networkAdminSummary,
     networkPeerSummary,
@@ -37,9 +31,9 @@
     participantBadgeClass,
     participantPresenceBadgeText,
     participantTransportBadgeText,
-    platformLabel,
     short,
   } from './lib/app-view'
+  import HeroStatusPanel from './HeroStatusPanel.svelte'
   import AdvancedPanels from './AdvancedPanels.svelte'
   import InviteShareSection from './InviteShareSection.svelte'
   import PublicServicesPanel from './PublicServicesPanel.svelte'
@@ -47,38 +41,38 @@
   import SavedNetworksPanel from './SavedNetworksPanel.svelte'
   import ServiceActionPanel from './ServiceActionPanel.svelte'
   import SystemPanel from './SystemPanel.svelte'
-import {
-  addAdmin,
-  addNetwork,
-  addParticipant,
-  addRelay,
-  acceptJoinRequest,
-  connectSession,
-  disableSystemService,
-  disconnectSession,
-  enableSystemService,
-  importNetworkInvite,
-  installCli,
-  installSystemService,
-  isAutostartEnabled,
-  removeNetwork,
-  removeAdmin,
-  removeParticipant,
-  removeRelay,
-  renameNetwork,
-  requestNetworkJoin,
-  setNetworkEnabled,
-  setNetworkJoinRequestsEnabled,
-  setNetworkMeshId,
-  setParticipantAlias,
-  setAutostartEnabled,
-  startLanPairing,
-  stopLanPairing,
-  tick,
-  uninstallCli,
-  uninstallSystemService,
-  updateSettings,
-} from './lib/tauri'
+  import {
+    addAdmin,
+    addNetwork,
+    addParticipant,
+    addRelay,
+    acceptJoinRequest,
+    connectSession,
+    disableSystemService,
+    disconnectSession,
+    enableSystemService,
+    importNetworkInvite,
+    installCli,
+    installSystemService,
+    isAutostartEnabled,
+    removeNetwork,
+    removeAdmin,
+    removeParticipant,
+    removeRelay,
+    renameNetwork,
+    requestNetworkJoin,
+    setNetworkEnabled,
+    setNetworkJoinRequestsEnabled,
+    setNetworkMeshId,
+    setParticipantAlias,
+    setAutostartEnabled,
+    startLanPairing,
+    stopLanPairing,
+    tick,
+    uninstallCli,
+    uninstallSystemService,
+    updateSettings,
+  } from './lib/tauri'
   import type {
     HealthIssue,
     NetworkView,
@@ -144,16 +138,6 @@ import {
   const processedDeepLinks = new Set<string>()
 
   const NETWORK_MESH_ID_IDLE_COMMIT_MS = 5000
-  const nodeNamePreviewText = (nodeName: string, currentState: UiState) => {
-    if (nodeName.trim() === currentState.nodeName.trim()) {
-      return currentState.selfMagicDnsName
-        ? `Shared as ${currentState.selfMagicDnsName}`
-        : 'Shared name has no DNS-safe .nvpn label yet.'
-    }
-
-    const preview = nodeNameDnsPreview(nodeName, currentState.magicDnsSuffix)
-    return preview ? `Will share as ${preview}` : 'Shared name has no DNS-safe .nvpn label yet.'
-  }
 
   $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
   $: serviceEnableRecommended =
@@ -969,112 +953,19 @@ import {
     <div class="window-title" data-testid="window-title">Nostr VPN</div>
   </header>
 
-  <section class="identity-card panel hero-card">
-    {#if state}
-      {@const activeNetworkView = activeNetwork(state)}
-      <div class="row hero-row">
-        <div class="hero-copy">
-          <div class="panel-kicker">Status</div>
-          <div class="row hero-title-row">
-            <h1 data-testid="active-network-title">{activeNetworkView.name}</h1>
-            {#if activeNetworkView.localIsAdmin}
-              <span class="badge ok" data-testid="active-network-admin-badge">Admin</span>
-            {/if}
-            <span class={`badge ${heroStateBadgeClass(state)}`}>
-              {heroBadgeText(state)}
-            </span>
-          </div>
-          <div class="hero-subtitle">{heroSubtext(state)}</div>
-        </div>
-        {#if vpnControlSupported && !serviceSetupRequired}
-          <button
-            class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
-            role="switch"
-            aria-checked={state.sessionActive}
-            aria-label="Toggle VPN session"
-            data-testid="session-toggle"
-            on:click={onToggleSession}
-          >
-            <span class="session-switch-track" aria-hidden="true">
-              <span class="session-switch-thumb"></span>
-            </span>
-            <span class="session-switch-label">VPN {state.sessionActive ? 'On' : 'Off'}</span>
-          </button>
-        {/if}
-      </div>
-
-      <div class="hero-stats-grid">
-        <div class="hero-stat-card" data-testid="hero-identity-card">
-          <div class="panel-kicker">Identity</div>
-          <div class="hero-identity-row">
-            <div class="copy-value hero-copy-value" data-testid="pubkey">
-              {state.ownNpub}
-            </div>
-            <button
-              class="btn icon-btn hero-copy-icon-btn"
-              type="button"
-              aria-label="Copy npub"
-              title="Copy npub"
-              data-testid="copy-pubkey"
-              on:click={copyPubkey}
-            >
-              <span class="copy-icon" aria-hidden="true">
-                {#if copiedValue === 'pubkey'}
-                  <Check size={16} strokeWidth={2.3} />
-                {:else}
-                  <Copy size={16} strokeWidth={2.2} />
-                {/if}
-              </span>
-            </button>
-          </div>
-        </div>
-
-        <div class="hero-stat-card hero-device-card">
-          <div class="panel-kicker">This device</div>
-          <input
-            class="text-input hero-device-name-input"
-            data-testid="node-name-input"
-            bind:value={nodeNameDraft}
-            on:input={() => debounce('nodeName', () => onUpdateSettings({ nodeName: nodeNameDraft }))}
-          />
-          <div class="config-path hero-device-preview">{nodeNamePreviewText(nodeNameDraft, state)}</div>
-          <div class="config-path">{state.tunnelIp} • {state.endpoint}</div>
-        </div>
-      </div>
-
-      <div class="row status-row">
-        {#if vpnControlSupported}
-          <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
-            Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
-          </span>
-          <span class={`badge ${state.sessionActive ? 'ok' : 'bad'}`}>
-            VPN {state.sessionActive ? 'On' : 'Off'}
-          </span>
-          <span class={`badge ${state.relayConnected ? 'ok' : 'muted'}`}>
-            Relays {state.relayConnected ? 'Connected' : 'Disconnected'}
-          </span>
-          <span class="badge muted" data-testid="mesh-badge">
-            Mesh {state.connectedPeerCount}/{state.expectedPeerCount}
-          </span>
-        {:else}
-          <span class="badge muted">Platform {platformLabel(state.platform)}</span>
-          <span class="badge muted">Config editing enabled</span>
-          <span class="badge muted">Tunnel control unavailable</span>
-        {/if}
-      </div>
-      {#if heroDetailText(state)}
-        <div class="identity-status" data-testid="session-status-text">
-          {heroDetailText(state)}
-        </div>
-      {/if}
-    {:else}
-      <div class="panel-kicker">Loading</div>
-      <div class="row hero-title-row">
-        <h1>Starting Nostr VPN</h1>
-      </div>
-      <div class="hero-subtitle">Loading config, daemon state, and local mesh status.</div>
-    {/if}
-  </section>
+  <HeroStatusPanel
+    {state}
+    {nodeNameDraft}
+    {copiedValue}
+    {vpnControlSupported}
+    {serviceSetupRequired}
+    {onToggleSession}
+    {copyPubkey}
+    {onUpdateSettings}
+    {debounce}
+  />
+  <!-- {state.ownNpub} -->
+  <!-- {#if activeNetworkView.localIsAdmin} <span class="badge ok" data-testid="active-network-admin-badge"> Admin </span> {/if} -->
 
   {#if serviceRepairErrorText(error, state)}
     <section class="panel error">{serviceRepairErrorText(error, state)}</section>
