@@ -2,9 +2,7 @@
   import { onDestroy, onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
-  import jsQR from 'jsqr'
   import { Check, Copy, Trash2 } from 'lucide-svelte'
-  import QRCode from 'qrcode'
 
   import { dispatchBootReady, waitForNextPaint } from './lib/boot.js'
   import {
@@ -13,16 +11,11 @@
   } from './lib/countdown.js'
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
   import {
-    buildInviteScanConstraintCandidates,
-    openInviteScanStream,
-  } from './lib/invite-scan.js'
-  import {
     serviceRepairErrorText,
     serviceRepairRecommended,
     serviceRepairRetryRecommended,
   } from './lib/service-repair.js'
   import { parseAppDeepLink } from './lib/deep-link-actions.js'
-  import { decodeInvitePayload, determineInviteImportTarget } from './lib/invite-code.js'
   import {
     canonicalizeMeshIdInput,
     formatMeshIdDraftForDisplay,
@@ -53,8 +46,9 @@
     serviceMetaText,
     short,
   } from './lib/app-view'
-  import PublicServicesPanel from './PublicServicesPanel.svelte'
+  import InviteShareSection from './InviteShareSection.svelte'
   import RoutingPanel from './RoutingPanel.svelte'
+  import PublicServicesPanel from './PublicServicesPanel.svelte'
   import SavedNetworksPanel from './SavedNetworksPanel.svelte'
   import ServiceActionPanel from './ServiceActionPanel.svelte'
   import {
@@ -89,7 +83,6 @@
     uninstallSystemService,
     updateSettings,
   } from './lib/tauri'
-  import InviteSharePanel from './InviteSharePanel.svelte'
   import type {
     HealthIssue,
     NetworkView,
@@ -107,25 +100,8 @@
   let serviceActionStatus = ''
   let copiedValue: 'pubkey' | 'meshId' | 'invite' | 'peerNpub' | null = null
   let copiedPeerNpub: string | null = null
-  let inviteQrDataUrl = ''
-  let inviteQrError = ''
-  let inviteQrSource = ''
-  let inviteQrSequence = 0
 
   let newNetworkName = ''
-  let inviteInputDraft = ''
-  let inviteImportHandle: number | null = null
-  let inviteImportPendingValue = ''
-  let inviteImportLastAttemptedValue = ''
-  let inviteScanInput: HTMLInputElement | null = null
-  let inviteScanVideo: HTMLVideoElement | null = null
-  let inviteScanCanvas: HTMLCanvasElement | null = null
-  let inviteScanStream: MediaStream | null = null
-  let inviteScanOpen = false
-  let inviteScanBusy = false
-  let inviteScanStatus = ''
-  let inviteScanError = ''
-  let inviteScanFrameHandle: number | null = null
   let nodeNameDraft = ''
   let endpointDraft = ''
   let tunnelIpDraft = ''
@@ -194,399 +170,15 @@
   $: startupSettingsSupported = !!state?.startupSettingsSupported
   $: trayBehaviorSupported = !!state?.trayBehaviorSupported
   $: {
-    const invite = state?.activeNetworkInvite ?? ''
-    if (invite !== inviteQrSource) {
-      inviteQrSource = invite
-      void refreshInviteQr(invite)
-    }
-  }
-  $: if (
-    state &&
-    serviceRepairPromptRecommended &&
-    !actionInFlight &&
-    !refreshInFlight &&
-    !serviceRepairPromptInFlight &&
-    !appDisposed
-  ) {
-    void maybePromptForServiceRepair()
-  }
-
-  async function refreshInviteQr(invite: string) {
-    const sequence = ++inviteQrSequence
-    if (!invite) {
-      inviteQrDataUrl = ''
-      inviteQrError = ''
-      return
-    }
-
-    try {
-      const dataUrl = await QRCode.toDataURL(invite, {
-        errorCorrectionLevel: 'M',
-        margin: 1,
-        scale: 8,
-        color: {
-          dark: '#121926',
-          light: '#ffffff',
-        },
-      })
-      if (sequence === inviteQrSequence) {
-        inviteQrDataUrl = dataUrl
-        inviteQrError = ''
-      }
-    } catch {
-      if (sequence === inviteQrSequence) {
-        inviteQrDataUrl = ''
-        inviteQrError = 'Invite QR unavailable'
-      }
-    }
-  }
-
-  const describeInviteScanError = (err: unknown) => {
-    const name =
-      err && typeof err === 'object' && 'name' in err ? String((err as { name?: unknown }).name) : ''
-    switch (name) {
-      case 'NotAllowedError':
-      case 'PermissionDeniedError':
-        return 'Camera access was denied. You can still scan a saved QR image.'
-      case 'NotFoundError':
-      case 'DevicesNotFoundError':
-        return 'No camera was found. You can still scan a saved QR image.'
-      case 'NotReadableError':
-      case 'TrackStartError':
-        return 'The camera is busy in another app. Close it there or scan a saved QR image.'
-      default:
-        return `Live QR scanning failed: ${String(err)}`
-    }
-  }
-
-  const ensureInviteScanCanvas = () => {
-    if (!inviteScanCanvas) {
-      inviteScanCanvas = document.createElement('canvas')
-    }
-    return inviteScanCanvas
-  }
-
-  const decodeInviteFromImageSource = (
-    source: CanvasImageSource,
-    width: number,
-    height: number,
-  ) => {
-    if (!width || !height) {
-      return null
-    }
-
-    const canvas = ensureInviteScanCanvas()
-    canvas.width = width
-    canvas.height = height
-    const context = canvas.getContext('2d', { willReadFrequently: true })
-    if (!context) {
-      throw new Error('QR scanner could not read image pixels')
-    }
-
-    context.drawImage(source, 0, 0, width, height)
-    const imageData = context.getImageData(0, 0, width, height)
-    return jsQR(imageData.data, width, height, {
-      inversionAttempts: 'attemptBoth',
-    })?.data?.trim() || null
-  }
-
-  const decodeInviteFromFile = async (file: File) => {
-    const objectUrl = URL.createObjectURL(file)
-    try {
-      const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-        const next = new Image()
-        next.onload = () => resolve(next)
-        next.onerror = () => reject(new Error('Could not read the selected image'))
-        next.src = objectUrl
-      })
-      const invite = decodeInviteFromImageSource(
-        image,
-        image.naturalWidth || image.width,
-        image.naturalHeight || image.height,
-      )
-      if (!invite) {
-        throw new Error('No QR code was found in the selected image')
-      }
-      return invite
-    } finally {
-      URL.revokeObjectURL(objectUrl)
-    }
-  }
-
-  const stopInviteScan = () => {
-    if (inviteScanFrameHandle !== null) {
-      window.cancelAnimationFrame(inviteScanFrameHandle)
-      inviteScanFrameHandle = null
-    }
-    if (inviteScanStream) {
-      for (const track of inviteScanStream.getTracks()) {
-        track.stop()
-      }
-      inviteScanStream = null
-    }
-    if (inviteScanVideo) {
-      inviteScanVideo.pause()
-      inviteScanVideo.srcObject = null
-    }
-    inviteScanBusy = false
-    inviteScanOpen = false
-  }
-
-  const queueInviteScanFrame = () => {
-    if (!inviteScanOpen) {
-      return
-    }
-
-    inviteScanFrameHandle = window.requestAnimationFrame(() => {
-      inviteScanFrameHandle = null
-      void scanInviteVideoFrame()
-    })
-  }
-
-  const buildInviteImportPrompt = (invite: {
-    networkName: string
-    networkId: string
-    inviterNpub: string
-  }) => {
-    const lines = [
-      `Import invite for "${invite.networkName}" from ${short(invite.inviterNpub, 18, 12)}?`,
-    ]
-
-    if (state) {
-      const importTarget = determineInviteImportTarget(
-        state.networks,
-        activeNetwork(state).id,
-        invite.networkId,
-      )
-      switch (importTarget.mode) {
-        case 'existing':
-          lines.push('This adds the scanned device to the matching network you already have.')
-          break
-        case 'reuse-active':
-          lines.push('This reuses your current empty network slot and fills it from the invite.')
-          break
-        case 'create':
-        default:
-          lines.push('This creates a new network entry so your current network stays untouched.')
-          break
-      }
-    }
-
-    lines.push('Press Cancel to fill the invite field instead of importing right away.')
-    return lines.join('\n\n')
-  }
-
-  type InviteImportOptions = {
-    updateDraft?: boolean
-    clearDraftOnSuccess?: boolean
-    autoConnectOnSuccess?: boolean
-  }
-
-  const importInviteCode = async (invite: string, options: InviteImportOptions = {}) => {
-    const normalized = invite.trim()
-    if (!normalized) {
-      return false
-    }
-
-    if (options.updateDraft) {
-      inviteInputDraft = normalized
-    }
-
-    await runAction(() => importNetworkInvite(normalized))
-    const succeeded = !error
-    if (succeeded && options.autoConnectOnSuccess) {
-      await ensureSessionActiveAfterInviteImport()
-    }
-    if (succeeded && options.clearDraftOnSuccess) {
-      inviteInputDraft = ''
-      inviteImportLastAttemptedValue = ''
-    }
-    return succeeded
-  }
-
-  const clearInviteImportDebounce = () => {
-    if (inviteImportHandle !== null) {
-      window.clearTimeout(inviteImportHandle)
-      inviteImportHandle = null
-    }
-  }
-
-  const scheduleInviteImportAttempt = (invite: string) => {
-    const normalized = invite.trim()
-    inviteImportPendingValue = normalized
-    clearInviteImportDebounce()
-
-    if (!normalized) {
-      inviteImportLastAttemptedValue = ''
-      return
-    }
-
-    inviteImportHandle = window.setTimeout(async () => {
-      inviteImportHandle = null
-      if (actionInFlight) {
-        scheduleInviteImportAttempt(inviteImportPendingValue)
-        return
-      }
-
-      const pending = inviteImportPendingValue.trim()
-      if (!pending || pending === inviteImportLastAttemptedValue) {
-        return
-      }
-
-      inviteImportLastAttemptedValue = pending
-      await importInviteCode(pending, {
-        updateDraft: true,
-        clearDraftOnSuccess: true,
-        autoConnectOnSuccess: true,
-      })
-    }, 250)
-  }
-
-  async function ensureSessionActiveAfterInviteImport() {
-    if (!state || !state.vpnSessionControlSupported || state.sessionActive) {
-      return
-    }
-
-    if (serviceSetupRequired) {
-      await onInstallSystemService(true)
-      return
-    }
-
-    if (serviceEnableRecommended) {
-      await onEnableSystemService(true)
-      return
-    }
-
-    await runAction(connectSession)
-  }
-
-  const handleScannedInvite = async (invite: string) => {
-    const normalized = invite.trim()
-    let parsed
-    try {
-      parsed = decodeInvitePayload(normalized)
-    } catch (err) {
-      throw new Error(`Scanned QR is not a valid Nostr VPN invite: ${String(err)}`)
-    }
-
-    inviteScanError = ''
-    inviteScanStatus = ''
-
-    if (typeof window.confirm === 'function' && !window.confirm(buildInviteImportPrompt(parsed))) {
-      inviteInputDraft = normalized
-      inviteScanStatus = 'Invite loaded into the field.'
-      return
-    }
-
-    const imported = await importInviteCode(normalized, {
-      updateDraft: true,
-      clearDraftOnSuccess: true,
-      autoConnectOnSuccess: true,
-    })
-    if (imported) {
-      inviteScanStatus = `Imported ${parsed.networkName}.`
-    }
-  }
-
-  async function scanInviteVideoFrame() {
-    if (!inviteScanOpen || !inviteScanVideo) {
-      return
-    }
-
     if (
-      inviteScanVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
-      inviteScanVideo.videoWidth === 0 ||
-      inviteScanVideo.videoHeight === 0
+      state &&
+      serviceRepairPromptRecommended &&
+      !actionInFlight &&
+      !refreshInFlight &&
+      !serviceRepairPromptInFlight &&
+      !appDisposed
     ) {
-      queueInviteScanFrame()
-      return
-    }
-
-    const invite = decodeInviteFromImageSource(
-      inviteScanVideo,
-      inviteScanVideo.videoWidth,
-      inviteScanVideo.videoHeight,
-    )
-    if (!invite) {
-      queueInviteScanFrame()
-      return
-    }
-
-    stopInviteScan()
-    try {
-      await handleScannedInvite(invite)
-    } catch (err) {
-      inviteScanError = String(err)
-    }
-  }
-
-  async function onStartInviteScan() {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      inviteScanError = 'Live QR scanning is unavailable here. Use Choose Image instead.'
-      return
-    }
-
-    stopInviteScan()
-    inviteScanError = ''
-    inviteScanStatus = 'Requesting camera access...'
-    inviteScanOpen = true
-    await waitForNextPaint(window)
-
-    if (!inviteScanVideo) {
-      inviteScanOpen = false
-      inviteScanStatus = ''
-      inviteScanError = 'Scanner preview could not open'
-      return
-    }
-
-    try {
-      const cameraCandidates = buildInviteScanConstraintCandidates({
-        mobile: Boolean(state?.mobile),
-      })
-      inviteScanStream = await openInviteScanStream(
-        navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices),
-        cameraCandidates,
-      )
-      inviteScanVideo.srcObject = inviteScanStream
-      await inviteScanVideo.play()
-      inviteScanBusy = true
-      inviteScanStatus = 'Point the camera at an invite QR code.'
-      queueInviteScanFrame()
-    } catch (err) {
-      stopInviteScan()
-      inviteScanStatus = ''
-      inviteScanError = describeInviteScanError(err)
-    }
-  }
-
-  function onCloseInviteScan() {
-    stopInviteScan()
-    inviteScanStatus = ''
-  }
-
-  function onChooseInviteQrImage() {
-    stopInviteScan()
-    inviteScanError = ''
-    inviteScanStatus = ''
-    inviteScanInput?.click()
-  }
-
-  async function onInviteScanFileSelected(event: Event) {
-    const input = event.currentTarget as HTMLInputElement
-    const file = input.files?.[0]
-    input.value = ''
-    if (!file) {
-      return
-    }
-
-    inviteScanError = ''
-    inviteScanStatus = 'Scanning QR image...'
-    try {
-      const invite = await decodeInviteFromFile(file)
-      await handleScannedInvite(invite)
-    } catch (err) {
-      inviteScanStatus = ''
-      inviteScanError = String(err)
+      void maybePromptForServiceRepair()
     }
   }
 
@@ -1120,6 +712,44 @@
     await importInviteCode(invite)
   }
 
+  type InviteImportOptions = {
+    autoConnectOnSuccess?: boolean
+  }
+
+  async function ensureSessionActiveAfterInviteImport() {
+    if (!state || !state.vpnSessionControlSupported || state.sessionActive) {
+      return
+    }
+
+    if (serviceSetupRequired) {
+      await onInstallSystemService(true)
+      return
+    }
+
+    if (serviceEnableRecommended) {
+      await onEnableSystemService(true)
+      return
+    }
+
+    await runAction(connectSession)
+  }
+
+  async function importInviteCode(
+    invite: string,
+    options: InviteImportOptions = {},
+  ) {
+    const normalized = invite.trim()
+    if (!normalized) {
+      return false
+    }
+
+    await runAction(() => importNetworkInvite(normalized))
+    if (!error && options.autoConnectOnSuccess) {
+      await ensureSessionActiveAfterInviteImport()
+    }
+    return !error
+  }
+
   async function onRequestNetworkJoin(networkId: string) {
     await runAction(() => requestNetworkJoin(networkId))
   }
@@ -1138,33 +768,6 @@
 
   async function onStopLanPairing() {
     await runAction(() => stopLanPairing())
-  }
-
-  async function onImportInvite() {
-    await importInviteCode(inviteInputDraft, {
-      updateDraft: true,
-      clearDraftOnSuccess: true,
-      autoConnectOnSuccess: true,
-    })
-  }
-
-  function onInviteInput(event: Event) {
-    const value = (event.currentTarget as HTMLInputElement).value
-    inviteInputDraft = value
-    error = ''
-    scheduleInviteImportAttempt(value)
-  }
-
-  function onInvitePaste(event: ClipboardEvent) {
-    const pasted = event.clipboardData?.getData('text/plain') ?? ''
-    if (!pasted) {
-      return
-    }
-
-    event.preventDefault()
-    inviteInputDraft = pasted.trim()
-    error = ''
-    scheduleInviteImportAttempt(inviteInputDraft)
   }
 
   async function onAddRelay() {
@@ -1342,8 +945,6 @@
 
   onDestroy(() => {
     appDisposed = true
-    clearInviteImportDebounce()
-    stopInviteScan()
     if (pollHandle) {
       window.clearInterval(pollHandle)
     }
@@ -1633,15 +1234,9 @@
               {/each}
             </div>
           {/if}
-          <InviteSharePanel
+          <InviteShareSection
             {state}
             {activeNetworkView}
-            {inviteQrDataUrl}
-            {inviteQrError}
-            {inviteInputDraft}
-            {inviteScanOpen}
-            {inviteScanStatus}
-            {inviteScanError}
             {participantInputDrafts}
             {participantAddAliasDrafts}
             {copiedValue}
@@ -1654,17 +1249,9 @@
             {onStopLanPairing}
             {onJoinLanPeer}
             {onRequestNetworkJoin}
-            {onInviteInput}
-            {onInvitePaste}
-            {onImportInvite}
-            {onStartInviteScan}
-            {onChooseInviteQrImage}
-            {onCloseInviteScan}
-            {onInviteScanFileSelected}
-            bind:inviteScanInput
-            bind:inviteScanVideo
             {onAddParticipant}
             {lanPairingHelpText}
+            onImportInviteCode={importInviteCode}
           />
         </div>
       </div>
