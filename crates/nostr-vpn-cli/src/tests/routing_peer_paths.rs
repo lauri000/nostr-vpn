@@ -10,6 +10,7 @@ use super::super::local_endpoints;
 
 #[test]
 fn runtime_handshake_updates_path_cache() {
+    let now = unix_timestamp();
     let mut config = AppConfig::generated();
     let participant = "11".repeat(32);
     config.networks[0].participants = vec![participant.clone()];
@@ -47,7 +48,7 @@ fn runtime_handshake_updates_path_cache() {
         key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
         WireGuardPeerStatus {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(1),
+            last_handshake_sec: Some(now - 1),
             last_handshake_nsec: Some(0),
             ..WireGuardPeerStatus::default()
         },
@@ -195,6 +196,7 @@ fn runtime_endpoint_refresh_skips_same_subnet_gateway_translation_for_public_pee
 
 #[test]
 fn record_successful_runtime_paths_ignores_cross_subnet_local_runtime_endpoint() {
+    let now = unix_timestamp();
     let participant = "11".repeat(32);
     let peer_keys = generate_keypair();
     let announcements = HashMap::from([(
@@ -217,7 +219,7 @@ fn record_successful_runtime_paths_ignores_cross_subnet_local_runtime_endpoint()
         key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
         WireGuardPeerStatus {
             endpoint: Some("198.19.241.3:51820".to_string()),
-            last_handshake_sec: Some(1),
+            last_handshake_sec: Some(now - 1),
             last_handshake_nsec: Some(0),
             ..WireGuardPeerStatus::default()
         },
@@ -279,6 +281,7 @@ fn runtime_peer_endpoint_refresh_waits_for_handshake() {
 
 #[test]
 fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expires() {
+    let now = unix_timestamp();
     let mut config = AppConfig::generated();
     let participant = "11".repeat(32);
     config.nat.enabled = false;
@@ -296,13 +299,13 @@ fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expire
         relay_expires_at: None,
         tunnel_ip: "10.44.0.2/32".to_string(),
         advertised_routes: Vec::new(),
-        timestamp: 10,
+        timestamp: now + 10,
     };
     let flapped = PeerAnnouncement {
         public_endpoint: None,
         endpoint: "192.168.1.20:51820".to_string(),
         local_endpoint: Some("192.168.1.20:51820".to_string()),
-        timestamp: 20,
+        timestamp: now + 20,
         ..original.clone()
     };
 
@@ -312,7 +315,7 @@ fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expire
         key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
         WireGuardPeerStatus {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(1),
+            last_handshake_sec: Some(now - 1),
             last_handshake_nsec: Some(0),
             ..WireGuardPeerStatus::default()
         },
@@ -322,7 +325,7 @@ fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expire
         Some(&runtime_peers),
         &mut paths,
         &["10.0.0.33:51820".to_string()],
-        12,
+        now + 12,
     ));
 
     let flapped_announcements = HashMap::from([(participant.clone(), flapped.clone())]);
@@ -332,12 +335,12 @@ fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expire
         &flapped_announcements,
         &mut paths,
         Some("10.0.0.33:51820"),
-        21,
+        now + 21,
     )
     .expect("cached tunnel peers");
     assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
 
-    paths.prune_stale(200, peer_path_cache_timeout_secs(5));
+    paths.prune_stale(now + 200, peer_path_cache_timeout_secs(5));
 
     let selected = planned_tunnel_peers(
         &config,
@@ -345,7 +348,7 @@ fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expire
         &flapped_announcements,
         &mut paths,
         Some("10.0.0.33:51820"),
-        200,
+        now + 200,
     )
     .expect("fallback tunnel peers");
     assert_eq!(selected[0].endpoint, "192.168.1.20:51820");
@@ -432,6 +435,7 @@ fn nat_same_subnet_peer_can_use_local_endpoint_without_public_signal() {
 
 #[test]
 fn nat_punch_targets_keep_stale_exit_peer_even_when_another_peer_is_online() {
+    let now = unix_timestamp();
     let mut config = AppConfig::generated();
     let online = "11".repeat(32);
     let stale = "22".repeat(32);
@@ -480,7 +484,7 @@ fn nat_punch_targets_keep_stale_exit_peer_even_when_another_peer_is_online() {
             key_b64_to_hex(&online_keys.public_key).expect("online peer pubkey hex"),
             WireGuardPeerStatus {
                 endpoint: Some("203.0.113.20:51820".to_string()),
-                last_handshake_sec: Some(1),
+                last_handshake_sec: Some(now - 1),
                 last_handshake_nsec: Some(0),
                 ..WireGuardPeerStatus::default()
             },
@@ -489,7 +493,7 @@ fn nat_punch_targets_keep_stale_exit_peer_even_when_another_peer_is_online() {
             key_b64_to_hex(&stale_keys.public_key).expect("stale peer pubkey hex"),
             WireGuardPeerStatus {
                 endpoint: Some("203.0.113.21:51820".to_string()),
-                last_handshake_sec: Some(PEER_ONLINE_GRACE_SECS + 1),
+                last_handshake_sec: Some(now - PEER_ONLINE_GRACE_SECS - 1),
                 last_handshake_nsec: Some(0),
                 ..WireGuardPeerStatus::default()
             },

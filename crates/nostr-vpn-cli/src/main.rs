@@ -2429,20 +2429,17 @@ impl WireGuardPeerStatus {
         self.last_handshake_sec.unwrap_or(0) > 0 || self.last_handshake_nsec.unwrap_or(0) > 0
     }
 
-    fn last_handshake_age(&self) -> Option<Duration> {
+    fn last_handshake_at(&self, _now: u64) -> Option<u64> {
         if !self.has_handshake() {
             return None;
         }
 
-        Some(Duration::new(
-            self.last_handshake_sec.unwrap_or(0),
-            self.last_handshake_nsec.unwrap_or(0).min(u32::MAX as u64) as u32,
-        ))
+        self.last_handshake_sec.filter(|value| *value > 0)
     }
 
-    fn last_handshake_at(&self, now: u64) -> Option<u64> {
-        self.last_handshake_age()
-            .map(|age| now.saturating_sub(age.as_secs()))
+    fn last_handshake_age(&self, now: u64) -> Option<Duration> {
+        self.last_handshake_at(now)
+            .map(|at| Duration::from_secs(now.saturating_sub(at)))
     }
 }
 
@@ -4401,8 +4398,9 @@ fn peer_runtime_lookup<'a>(
 }
 
 fn peer_has_recent_handshake(runtime_peer: &WireGuardPeerStatus) -> bool {
+    let now = unix_timestamp();
     runtime_peer
-        .last_handshake_age()
+        .last_handshake_age(now)
         .is_some_and(|age| age <= Duration::from_secs(PEER_ONLINE_GRACE_SECS))
 }
 

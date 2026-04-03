@@ -144,6 +144,7 @@ fn macos_route_targets_add_default_route_for_selected_exit_peer() {
 
 #[test]
 fn macos_route_targets_add_default_route_for_selected_exit_peer_after_handshake() {
+    let now = unix_timestamp();
     let mut config = AppConfig::generated();
     let exit_participant = Keys::generate().public_key().to_hex();
     config.networks[0].participants = vec![exit_participant.clone()];
@@ -183,7 +184,7 @@ fn macos_route_targets_add_default_route_for_selected_exit_peer_after_handshake(
         public_key_hex,
         WireGuardPeerStatus {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(1),
+            last_handshake_sec: Some(now - 1),
             ..Default::default()
         },
     )]);
@@ -208,6 +209,7 @@ fn macos_route_targets_add_default_route_for_selected_exit_peer_after_handshake(
 
 #[test]
 fn macos_route_targets_skip_default_route_when_exit_handshake_is_on_stale_endpoint() {
+    let now = unix_timestamp();
     let mut config = AppConfig::generated();
     let exit_participant = Keys::generate().public_key().to_hex();
     config.networks[0].participants = vec![exit_participant.clone()];
@@ -247,7 +249,7 @@ fn macos_route_targets_skip_default_route_when_exit_handshake_is_on_stale_endpoi
         public_key_hex,
         WireGuardPeerStatus {
             endpoint: Some("198.51.100.40:51820".to_string()),
-            last_handshake_sec: Some(1),
+            last_handshake_sec: Some(now - 1),
             ..Default::default()
         },
     )]);
@@ -867,6 +869,7 @@ fn reuses_running_listen_port_without_rebind() {
 
 #[test]
 fn tunnel_heartbeat_targets_only_include_peers_without_handshake() {
+    let now = unix_timestamp();
     let mut config = AppConfig::generated();
     let participant = "11".repeat(32);
     config.networks[0].participants = vec![participant.clone()];
@@ -894,7 +897,7 @@ fn tunnel_heartbeat_targets_only_include_peers_without_handshake() {
         key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
         WireGuardPeerStatus {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(1),
+            last_handshake_sec: Some(now - 1),
             last_handshake_nsec: Some(0),
             ..WireGuardPeerStatus::default()
         },
@@ -905,6 +908,7 @@ fn tunnel_heartbeat_targets_only_include_peers_without_handshake() {
 
 #[test]
 fn tunnel_heartbeat_targets_include_peers_with_stale_handshakes() {
+    let now = unix_timestamp();
     let mut config = AppConfig::generated();
     let participant = "11".repeat(32);
     config.networks[0].participants = vec![participant.clone()];
@@ -928,7 +932,7 @@ fn tunnel_heartbeat_targets_include_peers_with_stale_handshakes() {
         key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
         WireGuardPeerStatus {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(PEER_ONLINE_GRACE_SECS + 1),
+            last_handshake_sec: Some(now - PEER_ONLINE_GRACE_SECS - 1),
             last_handshake_nsec: Some(0),
             ..WireGuardPeerStatus::default()
         },

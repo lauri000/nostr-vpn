@@ -37,12 +37,12 @@ fn cached_peerbook_keeps_connected_peer_count_after_presence_expires() {
     assert!(presence.active().is_empty());
     assert!(presence.announcement_for(&participant).is_some());
 
-    let now = 1_700_000_000;
+    let now = unix_timestamp();
     let runtime_peers = HashMap::from([(
         key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
         WireGuardPeerStatus {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(5),
+            last_handshake_sec: Some(now - 5),
             last_handshake_nsec: Some(0),
             ..WireGuardPeerStatus::default()
         },
@@ -100,9 +100,10 @@ fn known_private_announce_participants_include_cached_inactive_peers() {
 
 #[test]
 fn idle_handshake_within_wireguard_session_window_counts_mesh_as_ready() {
+    let now = unix_timestamp();
     let runtime_peer = WireGuardPeerStatus {
         endpoint: Some("203.0.113.20:51820".to_string()),
-        last_handshake_sec: Some(120),
+        last_handshake_sec: Some(now - 120),
         last_handshake_nsec: Some(0),
         ..WireGuardPeerStatus::default()
     };
@@ -112,9 +113,10 @@ fn idle_handshake_within_wireguard_session_window_counts_mesh_as_ready() {
 
 #[test]
 fn stale_handshake_does_not_count_mesh_as_ready() {
+    let now = unix_timestamp();
     let runtime_peer = WireGuardPeerStatus {
         endpoint: Some("203.0.113.20:51820".to_string()),
-        last_handshake_sec: Some(181),
+        last_handshake_sec: Some(now - 181),
         last_handshake_nsec: Some(0),
         ..WireGuardPeerStatus::default()
     };
@@ -186,17 +188,15 @@ fn daemon_peer_transport_state_reports_awaiting_handshake_when_runtime_peer_is_i
 
 #[test]
 fn handshake_age_converts_to_observed_epoch() {
+    let now = 1_700_000_000;
     let runtime_peer = WireGuardPeerStatus {
         endpoint: Some("203.0.113.20:51820".to_string()),
-        last_handshake_sec: Some(5),
+        last_handshake_sec: Some(now - 5),
         last_handshake_nsec: Some(0),
         ..WireGuardPeerStatus::default()
     };
 
-    assert_eq!(
-        runtime_peer.last_handshake_at(1_700_000_000),
-        Some(1_699_999_995)
-    );
+    assert_eq!(runtime_peer.last_handshake_at(now), Some(now - 5));
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn parse_wg_peer_status_extracts_transfer_counters() {
     let response = "\
 public_key=peer-a\n\
 endpoint=203.0.113.20:51820\n\
-last_handshake_time_sec=5\n\
+last_handshake_time_sec=1700000005\n\
 last_handshake_time_nsec=0\n\
 tx_bytes=1234\n\
 rx_bytes=5678\n\
@@ -214,6 +214,7 @@ errno=0\n";
     let peer = peers.get("peer-a").expect("peer should parse");
 
     assert_eq!(peer.endpoint.as_deref(), Some("203.0.113.20:51820"));
+    assert_eq!(peer.last_handshake_at(1_700_000_010), Some(1_700_000_005));
     assert_eq!(peer.tx_bytes, 1234);
     assert_eq!(peer.rx_bytes, 5678);
 }
