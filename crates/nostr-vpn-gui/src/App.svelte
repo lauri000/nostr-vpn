@@ -1,5 +1,7 @@
-  <script lang="ts">
+<script lang="ts">
   import { onDestroy, onMount } from 'svelte'
+  import { invoke } from '@tauri-apps/api/core'
+  import { listen } from '@tauri-apps/api/event'
   import jsQR from 'jsqr'
   import { Check, Copy, Trash2 } from 'lucide-svelte'
   import QRCode from 'qrcode'
@@ -28,7 +30,7 @@
     validateMeshIdInput,
   } from './lib/mesh-id.js'
   import { nodeNameDnsPreview } from './lib/node-name.js'
-  import { sessionToggleVisualState } from './lib/session-toggle.js'
+  import SavedNetworksPanel from './SavedNetworksPanel.svelte'
   import {
     addAdmin,
     addNetwork,
@@ -85,6 +87,9 @@
 
   let newNetworkName = ''
   let inviteInputDraft = ''
+  let inviteImportHandle: number | null = null
+  let inviteImportPendingValue = ''
+  let inviteImportLastAttemptedValue = ''
   let inviteScanInput: HTMLInputElement | null = null
   let inviteScanVideo: HTMLVideoElement | null = null
   let inviteScanCanvas: HTMLCanvasElement | null = null
@@ -120,8 +125,6 @@
   let lanPairingTickHandle: number | null = null
   let copiedHandle: number | null = null
   let deepLinkUnlisten: (() => void) | null = null
-  let sessionTogglePendingTarget: boolean | null = null
-  let sessionToggleState = sessionToggleVisualState(false)
   let refreshInFlight = false
   let actionInFlight = false
   let serviceInstallRecommended = false
@@ -163,10 +166,6 @@
   $: cliInstallSupported = !!state?.cliInstallSupported
   $: startupSettingsSupported = !!state?.startupSettingsSupported
   $: trayBehaviorSupported = !!state?.trayBehaviorSupported
-  $: sessionToggleState = sessionToggleVisualState(
-    state?.sessionActive ?? false,
-    sessionTogglePendingTarget,
-  )
   $: {
     const invite = state?.activeNetworkInvite ?? ''
     if (invite !== inviteQrSource) {
@@ -507,6 +506,7 @@
   type InviteImportOptions = {
     updateDraft?: boolean
     clearDraftOnSuccess?: boolean
+    autoConnectOnSuccess?: boolean
   }
 
   const importInviteCode = async (invite: string, options: InviteImportOptions = {}) => {
@@ -521,10 +521,70 @@
 
     await runAction(() => importNetworkInvite(normalized))
     const succeeded = !error
+    if (succeeded && options.autoConnectOnSuccess) {
+      await ensureSessionActiveAfterInviteImport()
+    }
     if (succeeded && options.clearDraftOnSuccess) {
       inviteInputDraft = ''
+      inviteImportLastAttemptedValue = ''
     }
     return succeeded
+  }
+
+  const clearInviteImportDebounce = () => {
+    if (inviteImportHandle !== null) {
+      window.clearTimeout(inviteImportHandle)
+      inviteImportHandle = null
+    }
+  }
+
+  const scheduleInviteImportAttempt = (invite: string) => {
+    const normalized = invite.trim()
+    inviteImportPendingValue = normalized
+    clearInviteImportDebounce()
+
+    if (!normalized) {
+      inviteImportLastAttemptedValue = ''
+      return
+    }
+
+    inviteImportHandle = window.setTimeout(async () => {
+      inviteImportHandle = null
+      if (actionInFlight) {
+        scheduleInviteImportAttempt(inviteImportPendingValue)
+        return
+      }
+
+      const pending = inviteImportPendingValue.trim()
+      if (!pending || pending === inviteImportLastAttemptedValue) {
+        return
+      }
+
+      inviteImportLastAttemptedValue = pending
+      await importInviteCode(pending, {
+        updateDraft: true,
+        clearDraftOnSuccess: true,
+        autoConnectOnSuccess: true,
+      })
+    }, 250)
+  }
+
+  async function ensureSessionActiveAfterInviteImport() {
+    if (!state || !state.vpnSessionControlSupported || state.sessionActive) {
+      return
+    }
+
+    if (serviceSetupRequired) {
+      await onInstallSystemService(true)
+      return
+    }
+
+    if (serviceEnableRecommended) {
+      await onEnableSystemService(true)
+      return
+    }
+
+    await runAction(connectSession)
   }
 
   const handleScannedInvite = async (invite: string) => {
@@ -541,13 +601,14 @@
 
     if (typeof window.confirm === 'function' && !window.confirm(buildInviteImportPrompt(parsed))) {
       inviteInputDraft = normalized
-      inviteScanStatus = 'Invite loaded into the field. Press Import when ready.'
+      inviteScanStatus = 'Invite loaded into the field.'
       return
     }
 
     const imported = await importInviteCode(normalized, {
       updateDraft: true,
       clearDraftOnSuccess: true,
+      autoConnectOnSuccess: true,
     })
     if (imported) {
       inviteScanStatus = `Imported ${parsed.networkName}.`
@@ -886,7 +947,7 @@
 
   const publicRelayFallbackStatusText = (state: UiState) => {
     if (state.usePublicRelayFallback) {
-      return 'If direct UDP does not establish a handshake, nostr-vpn may route peer traffic through discoverable relay endpoints.'
+      return 'If a peer cannot be reached directly, nostr-vpn will try discoverable public relays before giving up.'
     }
 
     return 'Only direct peer paths will be used. Devices on restrictive networks may stay offline until a direct path works.'
@@ -1000,7 +1061,9 @@
   }
 
   function currentServiceRepairPromptKey(currentState: UiState) {
-    return `${currentState.appVersion}:${currentState.daemonBinaryVersion || 'unknown'}`
+    return `${currentState.appVersion}:${
+      currentState.serviceBinaryVersion || currentState.daemonBinaryVersion || 'unknown'
+    }`
   }
 
   async function maybePromptForServiceRepair() {
@@ -1087,10 +1150,6 @@
     }
 
     try {
-      const [{ listen }, { invoke }] = await Promise.all([
-        import('@tauri-apps/api/event'),
-        import('@tauri-apps/api/core'),
-      ])
       deepLinkUnlisten = await listen('deep-link://new-url', async (event) => {
         const urls = Array.isArray(event.payload) ? event.payload : []
         for (const url of urls) {
@@ -1320,23 +1379,17 @@
       return
     }
 
-    const targetActive = !state.sessionActive
-    sessionTogglePendingTarget = targetActive
-    try {
-      if (serviceSetupRequired && !state.sessionActive) {
-        await onInstallSystemService(true)
-        return
-      }
-
-      if (serviceEnableRecommended && !state.sessionActive) {
-        await onEnableSystemService(true)
-        return
-      }
-
-      await runAction(state.sessionActive ? disconnectSession : connectSession)
-    } finally {
-      sessionTogglePendingTarget = null
+    if (serviceSetupRequired && !state.sessionActive) {
+      await onInstallSystemService(true)
+      return
     }
+
+    if (serviceEnableRecommended && !state.sessionActive) {
+      await onEnableSystemService(true)
+      return
+    }
+
+    await runAction(state.sessionActive ? disconnectSession : connectSession)
   }
 
   async function onInstallCli() {
@@ -1523,7 +1576,27 @@
     await importInviteCode(inviteInputDraft, {
       updateDraft: true,
       clearDraftOnSuccess: true,
+      autoConnectOnSuccess: true,
     })
+  }
+
+  function onInviteInput(event: Event) {
+    const value = (event.currentTarget as HTMLInputElement).value
+    inviteInputDraft = value
+    error = ''
+    scheduleInviteImportAttempt(value)
+  }
+
+  function onInvitePaste(event: ClipboardEvent) {
+    const pasted = event.clipboardData?.getData('text/plain') ?? ''
+    if (!pasted) {
+      return
+    }
+
+    event.preventDefault()
+    inviteInputDraft = pasted.trim()
+    error = ''
+    scheduleInviteImportAttempt(inviteInputDraft)
   }
 
   async function onAddRelay() {
@@ -1696,6 +1769,7 @@
 
   onDestroy(() => {
     appDisposed = true
+    clearInviteImportDebounce()
     stopInviteScan()
     if (pollHandle) {
       window.clearInterval(pollHandle)
@@ -1744,21 +1818,17 @@
         </div>
         {#if vpnControlSupported && !serviceSetupRequired}
           <button
-            class={`session-switch ${sessionToggleState.className} ${
-              sessionTogglePendingTarget !== null ? 'pending' : ''
-            }`}
+            class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
             role="switch"
-            aria-checked={sessionToggleState.active}
+            aria-checked={state.sessionActive}
             aria-label="Toggle VPN session"
-            aria-busy={sessionTogglePendingTarget !== null}
             data-testid="session-toggle"
-            disabled={actionInFlight}
             on:click={onToggleSession}
           >
             <span class="session-switch-track" aria-hidden="true">
               <span class="session-switch-thumb"></span>
             </span>
-            <span class="session-switch-label">{sessionToggleState.label}</span>
+            <span class="session-switch-label">VPN {state.sessionActive ? 'On' : 'Off'}</span>
           </button>
         {/if}
       </div>
@@ -1807,8 +1877,8 @@
           <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
             Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
           </span>
-          <span class={`badge ${sessionToggleState.active ? 'ok' : 'bad'}`}>
-            {sessionToggleState.label}
+          <span class={`badge ${state.sessionActive ? 'ok' : 'bad'}`}>
+            VPN {state.sessionActive ? 'On' : 'Off'}
           </span>
           <span class={`badge ${state.relayConnected ? 'ok' : 'muted'}`}>
             Relays {state.relayConnected ? 'Connected' : 'Disconnected'}
@@ -2182,11 +2252,10 @@
             placeholder="nvpn://invite/..."
             data-testid="invite-input"
             bind:value={inviteInputDraft}
+            on:input={onInviteInput}
+            on:paste={onInvitePaste}
             on:keydown={(event) => event.key === 'Enter' && onImportInvite()}
           />
-          <button class="btn participant-add-btn" data-testid="invite-import" on:click={onImportInvite}>
-            Import
-          </button>
         </div>
         <div class="invite-scan-actions">
           <button class="btn" data-testid="invite-scan-start" on:click={onStartInviteScan}>
@@ -2400,21 +2469,6 @@
           <label class="toggle-row">
             <input
               type="checkbox"
-              checked={state.usePublicRelayFallback}
-              on:change={(event) =>
-                onUpdateSettings({
-                  usePublicRelayFallback: (event.currentTarget as HTMLInputElement).checked,
-                })}
-            />
-            <div>Enable routing over relay when direct path fails</div>
-          </label>
-          <div class="config-path settings-note">{publicRelayFallbackStatusText(state)}</div>
-        </div>
-
-        <div class="field-panel">
-          <label class="toggle-row">
-            <input
-              type="checkbox"
               checked={state.advertiseExitNode}
               on:change={(event) =>
                 onUpdateSettings({
@@ -2492,307 +2546,43 @@
       </div>
     </section>
 
-    <details class="panel collapsible-panel network-directory-panel">
-      <summary class="collapsible-summary">
-        <div>
-          <div class="panel-kicker">Saved networks</div>
-          <h2 data-testid="saved-networks-title">Other networks</h2>
-        </div>
-        <div class="section-meta">{inactiveNetworks(state).length} saved</div>
-      </summary>
-
-      <div class="collapsible-body">
-        <div class="config-path">
-          Keep alternate network profiles here. Activate one when you want to switch the current mesh.
-        </div>
-
-        <div class="row form-row network-create-row">
-          <input
-            class="text-input"
-            placeholder="Add network name (optional)"
-            data-testid="network-add-input"
-            bind:value={newNetworkName}
-            on:keydown={(event) => event.key === 'Enter' && onAddNetwork()}
-          />
-          <button class="btn" data-testid="network-add" on:click={onAddNetwork}>
-            Add network
-          </button>
-        </div>
-
-        {#if inactiveNetworks(state).length === 0}
-          <div class="item-row network-empty-state">
-            <div class="item-main">
-              <div class="item-title">No saved networks yet</div>
-              <div class="item-sub">Add another network if you want a separate mesh profile.</div>
-            </div>
-          </div>
-        {:else}
-          <div class="stack rows network-stack">
-            {#each inactiveNetworks(state) as network}
-              <section class="network-card" data-testid="network-card">
-                <div class="row spread network-header">
-                  <div class="network-directory-main">
-                    <div class="row network-directory-title-row">
-                      <div class="item-title">{network.name}</div>
-                      <span class="badge muted">Saved</span>
-                      {#if network.localIsAdmin}
-                        <span class="badge ok" data-testid="saved-network-admin-badge">Admin</span>
-                      {/if}
-                      {#if network.inboundJoinRequests.length > 0}
-                        <span class="badge warn">
-                          {network.inboundJoinRequests.length} request{network.inboundJoinRequests.length === 1 ? '' : 's'}
-                        </span>
-                      {/if}
-                    </div>
-                    <div class="config-path" data-testid="network-mesh-id">
-                      Mesh ID: {formatMeshIdForDisplay(network.networkId)}
-                    </div>
-                    <div class="config-path">{networkPeerSummary(network)}</div>
-                  </div>
-
-                  <div class="row network-actions">
-                    <button
-                      class="btn ghost"
-                      data-testid="network-enabled-toggle"
-                      on:click={() => runAction(() => setNetworkEnabled(network.id, true))}
-                    >
-                      Activate
-                    </button>
-                    <button
-                      class="btn ghost icon-btn"
-                      data-testid="network-remove"
-                      title="Delete network"
-                      aria-label="Delete network"
-                      disabled={state.networks.length <= 1}
-                      on:click={() => runAction(() => removeNetwork(network.id))}
-                    >
-                      <Trash2 size={16} strokeWidth={2.2} />
-                    </button>
-                  </div>
-                </div>
-
-                <details class="network-editor">
-                  <summary class="network-editor-summary">Edit saved network</summary>
-                  <div class="participant-add-panel network-profile-editor">
-                    <div class="participant-add-label">Profile</div>
-                    <div class="spotlight-profile-fields">
-                      <label class="field-label" for={`saved-network-name-${network.id}`}>Name</label>
-                      <input
-                        id={`saved-network-name-${network.id}`}
-                        class="text-input active-network-name-input"
-                        data-testid="network-name-input"
-                        value={networkNameDrafts[network.id] ?? network.name}
-                        on:input={(event) =>
-                          onNetworkNameInput(network.id, (event.currentTarget as HTMLInputElement).value)}
-                      />
-                      <label class="field-label" for={`saved-network-mesh-${network.id}`}>Mesh ID</label>
-                      <input
-                        id={`saved-network-mesh-${network.id}`}
-                        class={`text-input network-mesh-id-input ${meshIdDraftError(network.id) ? 'text-input-invalid' : ''}`}
-                        data-testid="saved-network-mesh-id-input"
-                        value={formatMeshIdDraftForDisplay(
-                          networkIdDrafts[network.id] ?? '',
-                          network.networkId,
-                        )}
-                        on:input={(event) =>
-                          onNetworkMeshIdInput(network.id, (event.currentTarget as HTMLInputElement).value)}
-                        on:blur={(event) =>
-                          commitNetworkMeshId(network.id, (event.currentTarget as HTMLInputElement).value)}
-                        on:keydown={(event) =>
-                          event.key === 'Enter' &&
-                          commitNetworkMeshId(network.id, (event.currentTarget as HTMLInputElement).value)}
-                      />
-                    </div>
-                    <div class={`config-path ${meshIdDraftError(network.id) ? 'mesh-id-note-error' : ''}`}>
-                      {meshIdHelperText(network.id, network.networkId)}
-                    </div>
-                    <div class="config-path saved-network-note">
-                      Activate this saved network when you want to switch the current mesh to it.
-                    </div>
-                    <div class="config-path" data-testid="network-admin-summary">
-                      {networkAdminSummary(network)}
-                    </div>
-                  </div>
-
-                  <div class="participant-add-panel">
-                    <div class="participant-add-label">Join requests</div>
-                    <label class="toggle-row">
-                      <input
-                        type="checkbox"
-                        checked={network.joinRequestsEnabled}
-                        disabled={!network.localIsAdmin}
-                        on:change={(event) =>
-                          onToggleJoinRequests(
-                            network.id,
-                            (event.currentTarget as HTMLInputElement).checked,
-                          )}
-                      />
-                      <div>Listen for join requests</div>
-                    </label>
-                    <div class="config-path">
-                      Join requests from invite holders will appear here, even when this mesh is not active.
-                    </div>
-                    {#if network.inboundJoinRequests.length > 0}
-                      <div class="stack rows">
-                        {#each network.inboundJoinRequests as request}
-                          <div class="item-row">
-                            <div class="item-main">
-                              <div class="item-title">
-                                {request.requesterNodeName || 'Pending device'}
-                              </div>
-                              <div class="peer-npub-row">
-                                <div class="peer-npub-text">{request.requesterNpub}</div>
-                                <button
-                                  class="btn ghost icon-btn peer-npub-copy-btn"
-                                  type="button"
-                                  aria-label="Copy peer npub"
-                                  title="Copy peer npub"
-                                  data-testid="copy-peer-npub"
-                                  on:click={() => copyPeerNpub(request.requesterNpub)}
-                                >
-                                  <span class="copy-icon" aria-hidden="true">
-                                    {#if copiedValue === 'peerNpub' && copiedPeerNpub === request.requesterNpub}
-                                      <Check size={16} strokeWidth={2.3} />
-                                    {:else}
-                                      <Copy size={16} strokeWidth={2.2} />
-                                    {/if}
-                                  </span>
-                                </button>
-                              </div>
-                              <div class="item-sub">
-                                requested {request.requestedAtText}
-                              </div>
-                            </div>
-                            <button
-                              class="btn"
-                              disabled={!network.localIsAdmin}
-                              on:click={() => onAcceptJoinRequest(network.id, request.requesterNpub)}
-                            >
-                              Accept
-                            </button>
-                          </div>
-                        {/each}
-                      </div>
-                    {/if}
-                  </div>
-
-                  <div class="participant-add-panel">
-                    <div class="participant-add-label">Add device to {network.name}</div>
-                    <div class="participant-add-fields">
-                      <input
-                        class="text-input participant-add-npub"
-                        placeholder="Participant npub"
-                        data-testid="participant-input"
-                        disabled={!network.localIsAdmin}
-                        value={participantInputDrafts[network.id] ?? ''}
-                        on:input={(event) =>
-                          (participantInputDrafts = {
-                            ...participantInputDrafts,
-                            [network.id]: (event.currentTarget as HTMLInputElement).value,
-                          })}
-                        on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-                      />
-                      <input
-                        class="text-input participant-add-alias"
-                        placeholder="Alias (optional)"
-                        data-testid="participant-add-alias-input"
-                        disabled={!network.localIsAdmin}
-                        value={participantAddAliasDrafts[network.id] ?? ''}
-                        on:input={(event) =>
-                          (participantAddAliasDrafts = {
-                            ...participantAddAliasDrafts,
-                            [network.id]: (event.currentTarget as HTMLInputElement).value,
-                          })}
-                        on:keydown={(event) => event.key === 'Enter' && onAddParticipant(network.id)}
-                      />
-                      <button
-                        class="btn participant-add-btn"
-                        data-testid="participant-add"
-                        disabled={!network.localIsAdmin}
-                        on:click={() => onAddParticipant(network.id)}
-                      >
-                        Add
-                      </button>
-                    </div>
-                  </div>
-
-                  {#if network.participants.length === 0}
-                    <div class="item-row network-empty-state">
-                      <div class="item-main">
-                        <div class="item-title">No saved devices yet</div>
-                        <div class="item-sub">Add npubs now and activate this network later when you want it live.</div>
-                      </div>
-                    </div>
-                  {:else}
-                    <div class="stack rows">
-                      {#each network.participants as participant}
-                        <div class="item-row saved-participant-row">
-                          <div class="item-main">
-                            <div class="peer-npub-row">
-                              <div class="peer-npub-text" data-testid="participant-npub">{participant.npub}</div>
-                              <button
-                                class="btn ghost icon-btn peer-npub-copy-btn"
-                                type="button"
-                                aria-label="Copy peer npub"
-                                title="Copy peer npub"
-                                data-testid="copy-peer-npub"
-                                on:click={() => copyPeerNpub(participant.npub)}
-                              >
-                                <span class="copy-icon" aria-hidden="true">
-                                  {#if copiedValue === 'peerNpub' && copiedPeerNpub === participant.npub}
-                                    <Check size={16} strokeWidth={2.3} />
-                                  {:else}
-                                    <Copy size={16} strokeWidth={2.2} />
-                                  {/if}
-                                </span>
-                              </button>
-                            </div>
-                            <div class="row alias-row">
-                              <input
-                                class="text-input alias-input"
-                                value={participantAliasDrafts[participant.pubkeyHex] ?? participant.magicDnsAlias}
-                                on:input={(event) =>
-                                  onParticipantAliasInput(
-                                    participant.npub,
-                                    participant.pubkeyHex,
-                                    (event.currentTarget as HTMLInputElement).value,
-                                  )}
-                              />
-                              {#if state.magicDnsSuffix}
-                                <span class="alias-suffix">.{state.magicDnsSuffix}</span>
-                              {/if}
-                            </div>
-                            <div class="item-sub">
-                              {participant.magicDnsName || participant.magicDnsAlias || 'No alias'} | {participant.tunnelIp}
-                              {#if participant.isAdmin}
-                                | admin
-                              {/if}
-                              {#if participant.offersExitNode}
-                                | exit routes advertised
-                              {/if}
-                            </div>
-                          </div>
-                          <button
-                            class="btn ghost icon-btn"
-                            title="Delete participant"
-                            aria-label="Delete participant"
-                            disabled={!network.localIsAdmin}
-                            on:click={() => runAction(() => removeParticipant(network.id, participant.npub))}
-                          >
-                            <Trash2 size={16} strokeWidth={2.2} />
-                          </button>
-                        </div>
-                      {/each}
-                    </div>
-                  {/if}
-
-                </details>
-              </section>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    </details>
+    <SavedNetworksPanel
+      bind:newNetworkName
+      {state}
+      inactiveNetworks={inactiveNetworks(state)}
+      {networkNameDrafts}
+      {networkIdDrafts}
+      {participantInputDrafts}
+      {participantAddAliasDrafts}
+      {participantAliasDrafts}
+      {copiedValue}
+      {copiedPeerNpub}
+      formatMeshIdForDisplay={formatMeshIdForDisplay}
+      formatMeshIdDraftForDisplay={formatMeshIdDraftForDisplay}
+      networkPeerSummary={networkPeerSummary}
+      networkAdminSummary={networkAdminSummary}
+      meshIdDraftError={meshIdDraftError}
+      meshIdHelperText={meshIdHelperText}
+      onNetworkNameInput={onNetworkNameInput}
+      onNetworkMeshIdInput={onNetworkMeshIdInput}
+      commitNetworkMeshId={commitNetworkMeshId}
+      onToggleJoinRequests={onToggleJoinRequests}
+      copyPeerNpub={copyPeerNpub}
+      onAcceptJoinRequest={onAcceptJoinRequest}
+      onAddParticipant={onAddParticipant}
+      onAddNetwork={onAddNetwork}
+      onRequestNetworkJoin={onRequestNetworkJoin}
+      onRemoveParticipant={(networkId, npub) => runAction(() => removeParticipant(networkId, npub))}
+      onParticipantAliasInput={onParticipantAliasInput}
+      runAction={runAction}
+      removeNetwork={removeNetwork}
+      setNetworkEnabled={setNetworkEnabled}
+    />
+    <!-- {#if network.localIsAdmin}
+    <span class="badge ok" data-testid="saved-network-admin-badge">
+      Admin
+    </span>
+    -->
 
     {#if state.vpnSessionControlSupported}
       <details class="panel collapsible-panel" open={state.health.length > 0}>
@@ -3116,7 +2906,7 @@
                   usePublicRelayFallback: (event.target as HTMLInputElement).checked,
                 })}
             />
-            <span>Enable routing over relay when direct path fails</span>
+            <span>Use public relay fallback when direct connection fails</span>
           </label>
           <div class="config-path settings-note">{publicRelayFallbackStatusText(state)}</div>
 
