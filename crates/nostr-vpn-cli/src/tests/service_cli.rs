@@ -106,6 +106,32 @@ fn macos_service_label_scopes_non_default_configs() {
 }
 
 #[test]
+fn macos_service_activation_enables_before_bootstrap() {
+    let config_path = crate::default_config_path();
+    let plist_path = crate::macos_service::macos_service_plist_path(&config_path);
+    let commands =
+        crate::macos_service::macos_service_activation_commands(&config_path, &plist_path);
+
+    assert_eq!(
+        commands,
+        vec![
+            vec!["enable".to_string(), "system/to.nostrvpn.nvpn".to_string()],
+            vec!["bootout".to_string(), "system/to.nostrvpn.nvpn".to_string()],
+            vec![
+                "bootstrap".to_string(),
+                "system".to_string(),
+                plist_path.display().to_string()
+            ],
+            vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                "system/to.nostrvpn.nvpn".to_string()
+            ],
+        ]
+    );
+}
+
+#[test]
 fn linux_service_unit_runs_service_supervised_daemon() {
     let unit = crate::linux_service_unit_content(
         Path::new("/usr/local/bin/nvpn"),

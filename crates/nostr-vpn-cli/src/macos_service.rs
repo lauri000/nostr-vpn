@@ -109,9 +109,7 @@ pub(super) fn macos_install_service(
         )
     })?;
 
-    macos_service_bootstrap(config_path, &plist_path)?;
-    macos_service_enable(config_path)?;
-    macos_service_kickstart(config_path)?;
+    macos_activate_service(config_path, &plist_path)?;
     println!("installed system service: {}", plist_path.display());
     println!("label: {service_label}");
     Ok(())
@@ -143,10 +141,7 @@ pub(super) fn macos_enable_service(config_path: &Path) -> Result<()> {
         ));
     }
 
-    macos_service_enable(config_path)?;
-    macos_service_bootout(config_path, true)?;
-    macos_service_bootstrap(config_path, &plist_path)?;
-    macos_service_kickstart(config_path)?;
+    macos_activate_service(config_path, &plist_path)?;
     println!("enabled system service: {}", plist_path.display());
     println!("label: {service_label}");
     Ok(())
@@ -226,6 +221,35 @@ fn macos_service_bootstrap(_config_path: &Path, plist_path: &Path) -> Result<()>
         .to_str()
         .ok_or_else(|| anyhow!("plist path is not valid UTF-8"))?;
     run_launchctl_checked(&["bootstrap", "system", plist], "bootstrap service")
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn macos_service_activation_commands(
+    config_path: &Path,
+    plist_path: &Path,
+) -> Vec<Vec<String>> {
+    let target = format!("system/{}", macos_service_label(config_path));
+    let plist = plist_path.display().to_string();
+    vec![
+        vec!["enable".to_string(), target.clone()],
+        vec!["bootout".to_string(), target.clone()],
+        vec!["bootstrap".to_string(), "system".to_string(), plist],
+        vec!["kickstart".to_string(), "-k".to_string(), target],
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn macos_activate_service(config_path: &Path, plist_path: &Path) -> Result<()> {
+    for args in macos_service_activation_commands(config_path, plist_path) {
+        match args.first().map(String::as_str) {
+            Some("enable") => macos_service_enable(config_path)?,
+            Some("bootout") => macos_service_bootout(config_path, true)?,
+            Some("bootstrap") => macos_service_bootstrap(config_path, plist_path)?,
+            Some("kickstart") => macos_service_kickstart(config_path)?,
+            _ => return Err(anyhow!("unsupported launchctl activation command")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

@@ -5559,6 +5559,17 @@ fn selected_exit_node_ready_for_default_route(
         return false;
     };
 
+    if announcement
+        .relay_endpoint
+        .as_deref()
+        .is_some_and(|relay_endpoint| relay_endpoint == planned.endpoint)
+        && announcement
+            .relay_expires_at
+            .is_none_or(|expires_at| expires_at > now)
+    {
+        return true;
+    }
+
     let Some(runtime_peer) = runtime_peers.and_then(|peers| peers.get(&planned.peer.pubkey_hex))
     else {
         let own_local_endpoints = runtime_local_signal_endpoints(app, app.node.listen_port);
