@@ -1,6 +1,6 @@
-use std::net::Ipv4Addr;
-
 use anyhow::{Context, Result, anyhow};
+#[cfg(any(target_os = "windows", test))]
+use netdev::interface::interface::Interface as NetworkInterface;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowsInterfaceAddress {
@@ -82,8 +82,10 @@ fn ipv4_netmask(prefix_len: u8) -> Ipv4Addr {
 #[cfg(target_os = "windows")]
 use std::collections::HashMap;
 #[cfg(target_os = "windows")]
-use std::net::{SocketAddr, UdpSocket};
-#[cfg(target_os = "windows")]
+use std::net::UdpSocket;
+#[cfg(any(target_os = "windows", test))]
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(any(target_os = "windows", test))]
 use std::process::Command as ProcessCommand;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,13 +96,15 @@ use std::thread::{self, JoinHandle};
 #[cfg(target_os = "windows")]
 use std::time::Duration;
 
+#[cfg(any(target_os = "windows", test))]
+use crate::TunnelPeer;
+#[cfg(target_os = "windows")]
+use crate::WireGuardPeerStatus;
 #[cfg(target_os = "windows")]
 use crate::userspace_wg::{
     DatagramProcessingResult, OutgoingDatagram, UserspaceWireGuardPeerConfig,
     UserspaceWireGuardRuntime,
 };
-#[cfg(target_os = "windows")]
-use crate::{TunnelPeer, WireGuardPeerStatus};
 #[cfg(target_os = "windows")]
 use base64::Engine;
 #[cfg(target_os = "windows")]
@@ -122,7 +126,16 @@ pub(crate) struct WindowsTunnelBackend {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     interface_index: u32,
+    endpoint_bypass_routes: Vec<WindowsEndpointBypassRoute>,
     route_targets: Vec<String>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WindowsEndpointBypassRoute {
+    pub target: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub interface_index: u32,
 }
 
 #[cfg(target_os = "windows")]
@@ -157,6 +170,10 @@ impl WindowsTunnelBackend {
             .iter()
             .flat_map(|peer| peer.allowed_ips.iter().cloned())
             .collect::<Vec<_>>();
+        let endpoint_bypass_routes =
+            windows_endpoint_bypass_routes_from_interfaces(peers, &netdev::get_interfaces())?;
+        let applied_endpoint_bypass_routes =
+            apply_windows_endpoint_bypass_routes(&endpoint_bypass_routes)?;
         let applied_routes = apply_windows_routes(interface_index, &route_targets)?;
 
         let session = Arc::new(
@@ -217,6 +234,7 @@ impl WindowsTunnelBackend {
             stop,
             threads,
             interface_index,
+            endpoint_bypass_routes: applied_endpoint_bypass_routes,
             route_targets: applied_routes,
         })
     }
@@ -251,6 +269,9 @@ impl WindowsTunnelBackend {
         let _ = self.session.shutdown();
         for handle in self.threads.drain(..) {
             let _ = handle.join();
+        }
+        if let Err(error) = remove_windows_endpoint_bypass_routes(&self.endpoint_bypass_routes) {
+            eprintln!("tunnel: failed to remove Windows endpoint bypass routes: {error}");
         }
         if let Err(error) = remove_windows_routes(self.interface_index, &self.route_targets) {
             eprintln!("tunnel: failed to remove Windows routes: {error}");
@@ -455,6 +476,140 @@ fn remove_windows_routes(interface_index: u32, route_targets: &[String]) -> Resu
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_endpoint_bypass_routes_from_interfaces(
+    peers: &[TunnelPeer],
+    interfaces: &[NetworkInterface],
+) -> Result<Vec<WindowsEndpointBypassRoute>> {
+    let (interface_index, gateway) =
+        windows_default_underlay_interface_from_interfaces(interfaces)?;
+    let mut targets = peers
+        .iter()
+        .filter_map(|peer| peer.endpoint.parse::<SocketAddr>().ok())
+        .filter_map(|endpoint| match endpoint.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+
+    Ok(targets
+        .into_iter()
+        .map(|target| WindowsEndpointBypassRoute {
+            target,
+            gateway,
+            interface_index,
+        })
+        .collect())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_default_underlay_interface_from_interfaces(
+    interfaces: &[NetworkInterface],
+) -> Result<(u32, Ipv4Addr)> {
+    let interface = interfaces
+        .iter()
+        .find(|interface| {
+            interface.default
+                && interface.is_up()
+                && !interface.is_loopback()
+                && !interface.is_tun()
+        })
+        .ok_or_else(|| anyhow!("failed to resolve Windows underlay interface"))?;
+    let gateway = interface
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.ipv4.first().copied())
+        .ok_or_else(|| {
+            anyhow!(
+                "failed to resolve Windows underlay gateway for {}",
+                interface.name
+            )
+        })?;
+
+    Ok((interface.index, gateway))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_add_endpoint_bypass_route_args(route: &WindowsEndpointBypassRoute) -> Vec<String> {
+    vec![
+        "add".to_string(),
+        route.target.to_string(),
+        "mask".to_string(),
+        "255.255.255.255".to_string(),
+        route.gateway.to_string(),
+        "if".to_string(),
+        route.interface_index.to_string(),
+    ]
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_delete_endpoint_bypass_route_args(route: &WindowsEndpointBypassRoute) -> Vec<String> {
+    vec!["delete".to_string(), route.target.to_string()]
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn apply_windows_endpoint_bypass_routes(
+    routes: &[WindowsEndpointBypassRoute],
+) -> Result<Vec<WindowsEndpointBypassRoute>> {
+    let mut applied = Vec::new();
+    for route in routes {
+        let add_args = windows_add_endpoint_bypass_route_args(route);
+        if let Err(_add_error) = run_windows_route(&add_args) {
+            let mut change_args = add_args.clone();
+            change_args[0] = "change".to_string();
+            if let Err(change_error) = run_windows_route(&change_args) {
+                let _ = remove_windows_endpoint_bypass_routes(&applied);
+                return Err(change_error.context(format!(
+                    "failed to install Windows endpoint bypass route {}",
+                    route.target
+                )));
+            }
+        }
+        applied.push(route.clone());
+    }
+    Ok(applied)
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn remove_windows_endpoint_bypass_routes(routes: &[WindowsEndpointBypassRoute]) -> Result<()> {
+    let mut first_error = None;
+    for route in routes {
+        if let Err(error) = run_windows_route(&windows_delete_endpoint_bypass_route_args(route))
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn run_windows_route(args: &[String]) -> Result<()> {
+    let display = format!("route {}", args.join(" "));
+    let output = ProcessCommand::new("route")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute {display}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "command failed: {display}\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 fn run_windows_netsh(args: &[String]) -> Result<()> {
     let display = format!("netsh {}", args.join(" "));
@@ -479,9 +634,15 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        WindowsInterfaceAddress, windows_add_route_args, windows_delete_route_args,
-        windows_interface_address,
+        WindowsEndpointBypassRoute, WindowsInterfaceAddress,
+        windows_add_endpoint_bypass_route_args, windows_add_route_args,
+        windows_default_underlay_interface_from_interfaces,
+        windows_delete_endpoint_bypass_route_args, windows_delete_route_args,
+        windows_endpoint_bypass_routes_from_interfaces, windows_interface_address,
     };
+    use netdev::interface::flags::{IFF_BROADCAST, IFF_MULTICAST, IFF_UP};
+    use netdev::interface::interface::Interface as NetworkInterface;
+    use netdev::net::device::NetworkDevice;
 
     #[test]
     fn parses_windows_interface_address_from_cidr() {
@@ -536,6 +697,99 @@ mod tests {
                 "interface=7".to_string(),
                 "store=active".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn builds_windows_endpoint_bypass_route_arguments() {
+        let route = WindowsEndpointBypassRoute {
+            target: Ipv4Addr::new(203, 0, 113, 20),
+            gateway: Ipv4Addr::new(192, 168, 64, 1),
+            interface_index: 12,
+        };
+
+        assert_eq!(
+            windows_add_endpoint_bypass_route_args(&route),
+            vec![
+                "add".to_string(),
+                "203.0.113.20".to_string(),
+                "mask".to_string(),
+                "255.255.255.255".to_string(),
+                "192.168.64.1".to_string(),
+                "if".to_string(),
+                "12".to_string(),
+            ]
+        );
+        assert_eq!(
+            windows_delete_endpoint_bypass_route_args(&route),
+            vec!["delete".to_string(), "203.0.113.20".to_string()]
+        );
+    }
+
+    #[test]
+    fn windows_default_underlay_interface_uses_default_up_non_tun_interface() {
+        let mut physical = NetworkInterface::dummy();
+        physical.index = 42;
+        physical.name = "Ethernet".to_string();
+        physical.flags = (IFF_UP | IFF_BROADCAST | IFF_MULTICAST) as u32;
+        physical.default = true;
+        let mut gateway = NetworkDevice::new();
+        gateway.ipv4.push(Ipv4Addr::new(192, 168, 64, 1));
+        physical.gateway = Some(gateway);
+
+        let mut tunnel = NetworkInterface::dummy();
+        tunnel.index = 7;
+        tunnel.name = "utun100".to_string();
+        tunnel.flags = IFF_UP as u32;
+        tunnel.default = false;
+
+        assert_eq!(
+            windows_default_underlay_interface_from_interfaces(&[tunnel, physical])
+                .expect("underlay interface"),
+            (42, Ipv4Addr::new(192, 168, 64, 1))
+        );
+    }
+
+    #[test]
+    fn windows_endpoint_bypass_routes_dedup_peer_endpoints() {
+        let mut physical = NetworkInterface::dummy();
+        physical.index = 42;
+        physical.name = "Ethernet".to_string();
+        physical.flags = (IFF_UP | IFF_BROADCAST | IFF_MULTICAST) as u32;
+        physical.default = true;
+        let mut gateway = NetworkDevice::new();
+        gateway.ipv4.push(Ipv4Addr::new(192, 168, 64, 1));
+        physical.gateway = Some(gateway);
+
+        let routes = windows_endpoint_bypass_routes_from_interfaces(
+            &[
+                crate::TunnelPeer {
+                    pubkey_hex: "a".repeat(64),
+                    endpoint: "203.0.113.20:51820".to_string(),
+                    allowed_ips: vec!["10.44.0.2/32".to_string()],
+                },
+                crate::TunnelPeer {
+                    pubkey_hex: "b".repeat(64),
+                    endpoint: "203.0.113.20:51820".to_string(),
+                    allowed_ips: vec!["10.44.0.3/32".to_string()],
+                },
+                crate::TunnelPeer {
+                    pubkey_hex: "c".repeat(64),
+                    endpoint: "[2001:db8::1]:51820".to_string(),
+                    allowed_ips: vec!["10.44.0.4/32".to_string()],
+                },
+            ],
+            &[physical],
+        )
+        .expect("endpoint bypass routes");
+
+        assert_eq!(
+            routes,
+            vec![WindowsEndpointBypassRoute {
+                target: Ipv4Addr::new(203, 0, 113, 20),
+                gateway: Ipv4Addr::new(192, 168, 64, 1),
+                interface_index: 42,
+            }]
         );
     }
 }
