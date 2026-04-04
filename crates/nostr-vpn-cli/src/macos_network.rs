@@ -241,6 +241,18 @@ pub(crate) fn ensure_macos_underlay_default_route() -> Result<bool> {
         return Ok(false);
     };
 
+    if restore_macos_default_route(&underlay).is_ok() {
+        let refreshed_output = command_stdout_checked(
+            ProcessCommand::new("netstat")
+                .arg("-rn")
+                .arg("-f")
+                .arg("inet"),
+        )?;
+        if macos_has_underlay_default_route(&refreshed_output) {
+            return Ok(true);
+        }
+    }
+
     let _ = renew_macos_interface_dhcp(&underlay.interface);
     let refreshed_output = command_stdout_checked(
         ProcessCommand::new("netstat")
