@@ -779,14 +779,58 @@ pub(crate) fn macos_route_delete_error_is_absent(message: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_cleanup_managed_routes(state: &MacosNetworkCleanupState) -> Vec<MacosManagedRoute> {
+    let mut routes = state.managed_routes.clone();
+    if routes.is_empty() {
+        routes.extend(state.endpoint_bypass_routes.iter().cloned().map(|target| {
+            MacosManagedRoute {
+                target,
+                gateway: None,
+                interface: None,
+            }
+        }));
+        if state.original_default_route.is_some() && !state.iface.trim().is_empty() {
+            routes.extend(
+                crate::macos_network::macos_tunnel_default_route_targets()
+                    .iter()
+                    .map(|target| MacosManagedRoute {
+                        target: (*target).to_string(),
+                        gateway: None,
+                        interface: Some(state.iface.clone()),
+                    }),
+            );
+        }
+    }
+
+    routes.sort_by(|left, right| {
+        (
+            left.target.as_str(),
+            left.gateway.as_deref().unwrap_or(""),
+            left.interface.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                right.target.as_str(),
+                right.gateway.as_deref().unwrap_or(""),
+                right.interface.as_deref().unwrap_or(""),
+            ))
+    });
+    routes.dedup();
+    routes
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn repair_legacy_macos_network_state(config_path: &Path) -> Result<bool> {
     let app = load_or_default_config(config_path)?;
     let mut repaired = false;
 
     if let Ok(tunnel_ip) = strip_cidr(&app.node.tunnel_ip).parse::<Ipv4Addr>() {
         let default_routes = macos_default_routes()?;
-        let underlay_default = macos_underlay_default_route_from_routes(&default_routes)
-            .or_else(|| crate::macos_network::macos_underlay_default_route_from_system().ok().flatten());
+        let underlay_default =
+            macos_underlay_default_route_from_routes(&default_routes).or_else(|| {
+                crate::macos_network::macos_underlay_default_route_from_system()
+                    .ok()
+                    .flatten()
+            });
         let mut tunnel_default_ifaces = Vec::new();
 
         for route in &default_routes {
@@ -807,7 +851,8 @@ pub(crate) fn repair_legacy_macos_network_state(config_path: &Path) -> Result<bo
         }
 
         if tunnel_default_ifaces.is_empty() {
-            tunnel_default_ifaces = crate::macos_network::macos_tunnel_interfaces_with_ipv4(tunnel_ip)?;
+            tunnel_default_ifaces =
+                crate::macos_network::macos_tunnel_interfaces_with_ipv4(tunnel_ip)?;
         }
         tunnel_default_ifaces.sort();
         tunnel_default_ifaces.dedup();
@@ -869,37 +914,25 @@ pub(crate) fn repair_saved_network_state(config_path: &Path) -> Result<bool> {
         let Some(state) = read_daemon_network_cleanup_state(&path)? else {
             return repair_legacy_macos_network_state(config_path);
         };
+        let managed_routes = macos_cleanup_managed_routes(&state);
+        let using_legacy_route_cleanup = state.managed_routes.is_empty();
 
         let mut failures = Vec::new();
-        for route in &state.endpoint_bypass_routes {
-            if let Err(error) = delete_macos_endpoint_bypass_route(route)
-                && !macos_route_delete_error_is_absent(&error.to_string())
+        for route in &managed_routes {
+            if let Err(error) = delete_macos_managed_route(
+                &route.target,
+                route.gateway.as_deref(),
+                route.interface.as_deref(),
+            ) && !macos_route_delete_error_is_absent(&error.to_string())
             {
-                failures.push(format!("remove bypass route {route}: {error}"));
+                failures.push(format!("remove managed route {}: {error}", route.target));
             }
         }
 
         if let Some(route) = state.original_default_route.as_ref() {
-            if route.interface != state.iface
-                && let Err(error) = delete_macos_default_route_for_interface(&state.iface)
-                && !macos_route_delete_error_is_absent(&error.to_string())
-            {
-                failures.push(format!(
-                    "remove default route on {}: {}",
-                    state.iface, error
-                ));
-            }
             if let Err(error) = restore_macos_default_route(route) {
                 failures.push(format!("restore default route: {error}"));
             }
-        } else if !state.iface.trim().is_empty()
-            && let Err(error) = delete_macos_default_route_for_interface(&state.iface)
-            && !macos_route_delete_error_is_absent(&error.to_string())
-        {
-            failures.push(format!(
-                "remove default route on {}: {}",
-                state.iface, error
-            ));
         }
 
         if state.pf_was_enabled.is_some() {
@@ -917,6 +950,12 @@ pub(crate) fn repair_saved_network_state(config_path: &Path) -> Result<bool> {
             && let Err(error) = write_macos_ip_forward(previous)
         {
             failures.push(format!("restore IPv4 forwarding: {error}"));
+        }
+
+        if using_legacy_route_cleanup
+            && let Err(error) = repair_legacy_macos_network_state(config_path)
+        {
+            failures.push(format!("repair legacy macOS routes: {error}"));
         }
 
         if !failures.is_empty() {

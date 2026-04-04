@@ -51,6 +51,11 @@ pub(super) fn macos_default_routes_from_netstat(output: &str) -> Vec<MacosRouteS
     routes
 }
 
+pub(crate) fn macos_has_underlay_default_route(output: &str) -> bool {
+    macos_underlay_default_route_from_routes(&macos_default_routes_from_netstat(output)).is_some()
+}
+
+#[cfg(test)]
 pub(crate) fn macos_has_tunnel_split_default_routes(output: &str) -> bool {
     output.lines().map(str::trim).any(|line| {
         let tokens = line.split_whitespace().collect::<Vec<_>>();
@@ -228,10 +233,7 @@ pub(crate) fn ensure_macos_underlay_default_route() -> Result<bool> {
             .arg("-f")
             .arg("inet"),
     )?;
-    let default_routes = macos_default_routes_from_netstat(&output);
-    if macos_underlay_default_route_from_routes(&default_routes).is_some()
-        || macos_has_tunnel_split_default_routes(&output)
-    {
+    if macos_has_underlay_default_route(&output) {
         return Ok(false);
     }
 
@@ -246,10 +248,7 @@ pub(crate) fn ensure_macos_underlay_default_route() -> Result<bool> {
             .arg("-f")
             .arg("inet"),
     )?;
-    let refreshed_routes = macos_default_routes_from_netstat(&refreshed_output);
-    if macos_underlay_default_route_from_routes(&refreshed_routes).is_some()
-        || macos_has_tunnel_split_default_routes(&refreshed_output)
-    {
+    if macos_has_underlay_default_route(&refreshed_output) {
         return Ok(true);
     }
 
@@ -329,13 +328,26 @@ pub(super) fn apply_macos_endpoint_bypass_route(route: &MacosEndpointBypassRoute
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn delete_macos_endpoint_bypass_route(target: &str) -> Result<()> {
-    run_checked(
-        ProcessCommand::new("route")
-            .arg("-n")
-            .arg("delete")
-            .arg("-host")
-            .arg(strip_cidr(target)),
+pub(super) fn delete_macos_managed_route(
+    target: &str,
+    gateway: Option<&str>,
+    interface: Option<&str>,
+) -> Result<()> {
+    if gateway.is_none()
+        && let Some(iface) = interface
+    {
+        return delete_macos_route_spec(target, Some(iface));
+    }
+
+    delete_macos_route_spec(target, None)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn delete_macos_endpoint_bypass_route(route: &MacosEndpointBypassRoute) -> Result<()> {
+    delete_macos_managed_route(
+        &route.target,
+        route.gateway.as_deref(),
+        Some(route.interface.as_str()),
     )
 }
 

@@ -1680,6 +1680,8 @@ struct MacosNetworkCleanupState {
     iface: String,
     #[serde(default)]
     endpoint_bypass_routes: Vec<String>,
+    #[serde(default)]
+    managed_routes: Vec<MacosManagedRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_default_route: Option<MacosRouteSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2593,7 +2595,7 @@ struct CliTunnelRuntime {
     #[cfg(target_os = "linux")]
     original_default_route: Option<String>,
     #[cfg(target_os = "macos")]
-    endpoint_bypass_routes: Vec<String>,
+    endpoint_bypass_routes: Vec<MacosEndpointBypassRoute>,
     #[cfg(target_os = "macos")]
     exit_node_runtime: MacosExitNodeRuntime,
     #[cfg(target_os = "macos")]
@@ -2615,6 +2617,16 @@ struct LinuxExitNodeRuntime {
 struct MacosRouteSpec {
     gateway: Option<String>,
     interface: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+struct MacosManagedRoute {
+    target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interface: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2874,6 +2886,7 @@ impl CliTunnelRuntime {
             #[cfg(target_os = "macos")]
             if route_targets.iter().any(|route| route == "0.0.0.0/0") {
                 self.capture_macos_original_default_route();
+                self.refresh_macos_original_default_route();
             } else {
                 self.restore_macos_original_default_route();
             }
@@ -3082,18 +3095,60 @@ impl CliTunnelRuntime {
 
     #[cfg(target_os = "macos")]
     fn macos_network_cleanup_state(&self) -> Option<MacosNetworkCleanupState> {
+        let mut managed_routes = self
+            .endpoint_bypass_routes
+            .iter()
+            .map(|route| MacosManagedRoute {
+                target: route.target.clone(),
+                gateway: route.gateway.clone(),
+                interface: Some(route.interface.clone()),
+            })
+            .collect::<Vec<_>>();
+        if self.original_default_route.is_some() && !self.iface.trim().is_empty() {
+            managed_routes.extend(
+                crate::macos_network::macos_tunnel_default_route_targets()
+                    .iter()
+                    .map(|target| MacosManagedRoute {
+                        target: (*target).to_string(),
+                        gateway: None,
+                        interface: Some(self.iface.clone()),
+                    }),
+            );
+        }
+        managed_routes.sort_by(|left, right| {
+            (
+                left.target.as_str(),
+                left.gateway.as_deref().unwrap_or(""),
+                left.interface.as_deref().unwrap_or(""),
+            )
+                .cmp(&(
+                    right.target.as_str(),
+                    right.gateway.as_deref().unwrap_or(""),
+                    right.interface.as_deref().unwrap_or(""),
+                ))
+        });
+        managed_routes.dedup();
+
         let has_exit_node_state = self.exit_node_runtime.ipv4_forward_was_enabled.is_some()
             || self.exit_node_runtime.pf_was_enabled.is_some();
         if self.original_default_route.is_none()
-            && self.endpoint_bypass_routes.is_empty()
+            && managed_routes.is_empty()
             && !has_exit_node_state
         {
             return None;
         }
 
+        let mut endpoint_bypass_routes = self
+            .endpoint_bypass_routes
+            .iter()
+            .map(|route| route.target.clone())
+            .collect::<Vec<_>>();
+        endpoint_bypass_routes.sort();
+
         Some(MacosNetworkCleanupState {
             iface: self.iface.clone(),
-            endpoint_bypass_routes: self.endpoint_bypass_routes.clone(),
+            endpoint_bypass_routes,
+            managed_routes,
             original_default_route: self.original_default_route.clone(),
             ipv4_forward_was_enabled: self.exit_node_runtime.ipv4_forward_was_enabled,
             pf_was_enabled: self.exit_node_runtime.pf_was_enabled,
@@ -3225,6 +3280,17 @@ impl CliTunnelRuntime {
             return;
         }
 
+        match crate::macos_network::macos_underlay_default_route_from_system() {
+            Ok(Some(route)) if route.interface != self.iface => {
+                self.original_default_route = Some(route);
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("exit-node: failed to snapshot macOS underlay route: {error}");
+            }
+        }
+
         match macos_default_route() {
             Ok(route) if route.interface != self.iface => {
                 self.original_default_route = Some(route);
@@ -3261,6 +3327,25 @@ impl CliTunnelRuntime {
             return;
         }
         self.original_default_route = None;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn refresh_macos_original_default_route(&mut self) {
+        let Some(current) = self.original_default_route.as_ref() else {
+            return;
+        };
+
+        match crate::macos_network::macos_underlay_default_route_from_system() {
+            Ok(Some(route)) if route.interface != self.iface => {
+                if current != &route {
+                    self.original_default_route = Some(route);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("exit-node: failed to refresh macOS underlay route: {error}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3301,31 +3386,44 @@ impl CliTunnelRuntime {
             .endpoint_bypass_routes
             .iter()
             .cloned()
-            .collect::<HashSet<_>>();
+            .map(|route| (route.target.clone(), route))
+            .collect::<HashMap<_, _>>();
         let desired = routes
             .iter()
             .map(|route| route.target.clone())
             .collect::<HashSet<_>>();
-        let mut applied = desired
-            .intersection(&existing)
-            .cloned()
-            .collect::<HashSet<_>>();
+        let mut applied = Vec::with_capacity(routes.len());
 
         let stale = self
             .endpoint_bypass_routes
             .iter()
-            .filter(|route| !desired.contains(*route))
+            .filter(|route| !desired.contains(&route.target))
             .cloned()
             .collect::<Vec<_>>();
         for route in stale {
             if let Err(error) = delete_macos_endpoint_bypass_route(&route) {
-                eprintln!("tunnel: failed to remove macOS endpoint bypass route {route}: {error}");
+                eprintln!(
+                    "tunnel: failed to remove macOS endpoint bypass route {} via {}: {}",
+                    route.target, route.interface, error
+                );
             }
         }
 
         for route in routes {
-            if existing.contains(&route.target) {
-                continue;
+            match existing.get(&route.target) {
+                Some(existing_route) if existing_route == route => {
+                    applied.push(existing_route.clone());
+                    continue;
+                }
+                Some(existing_route) => {
+                    if let Err(error) = delete_macos_endpoint_bypass_route(existing_route) {
+                        eprintln!(
+                            "tunnel: failed to replace macOS endpoint bypass route {}: {}",
+                            route.target, error
+                        );
+                    }
+                }
+                None => {}
             }
             if let Err(error) = apply_macos_endpoint_bypass_route(route) {
                 eprintln!(
@@ -3334,11 +3432,22 @@ impl CliTunnelRuntime {
                 );
                 continue;
             }
-            applied.insert(route.target.clone());
+            applied.push(route.clone());
         }
 
-        self.endpoint_bypass_routes = applied.into_iter().collect();
-        self.endpoint_bypass_routes.sort();
+        self.endpoint_bypass_routes = applied;
+        self.endpoint_bypass_routes.sort_by(|left, right| {
+            (
+                left.target.as_str(),
+                left.gateway.as_deref().unwrap_or(""),
+                left.interface.as_str(),
+            )
+                .cmp(&(
+                    right.target.as_str(),
+                    right.gateway.as_deref().unwrap_or(""),
+                    right.interface.as_str(),
+                ))
+        });
     }
 
     #[cfg(target_os = "linux")]

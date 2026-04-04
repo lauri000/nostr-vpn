@@ -484,8 +484,17 @@ pub(crate) fn apply_macos_endpoint_bypass_route(route: &MacosEndpointBypassRoute
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn delete_macos_endpoint_bypass_route(target: &str) -> Result<()> {
-    crate::macos_network::delete_macos_endpoint_bypass_route(target)
+pub(crate) fn delete_macos_endpoint_bypass_route(route: &MacosEndpointBypassRoute) -> Result<()> {
+    crate::macos_network::delete_macos_endpoint_bypass_route(route)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn delete_macos_managed_route(
+    target: &str,
+    gateway: Option<&str>,
+    interface: Option<&str>,
+) -> Result<()> {
+    crate::macos_network::delete_macos_managed_route(target, gateway, interface)
 }
 
 #[cfg(target_os = "macos")]

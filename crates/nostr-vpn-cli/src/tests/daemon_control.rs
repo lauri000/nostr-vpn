@@ -156,8 +156,18 @@ fn persist_daemon_network_cleanup_state_writes_and_clears_macos_state() {
     fs::write(&config_path, "").expect("write config placeholder");
 
     let mut tunnel_runtime = crate::CliTunnelRuntime::new("utun100");
-    tunnel_runtime.endpoint_bypass_routes =
-        vec!["203.0.113.10/32".to_string(), "198.51.100.9/32".to_string()];
+    tunnel_runtime.endpoint_bypass_routes = vec![
+        crate::MacosEndpointBypassRoute {
+            target: "203.0.113.10/32".to_string(),
+            gateway: Some("192.168.64.1".to_string()),
+            interface: "en0".to_string(),
+        },
+        crate::MacosEndpointBypassRoute {
+            target: "198.51.100.9/32".to_string(),
+            gateway: Some("192.168.64.1".to_string()),
+            interface: "en0".to_string(),
+        },
+    ];
     tunnel_runtime.original_default_route = Some(crate::MacosRouteSpec {
         gateway: Some("192.168.64.1".to_string()),
         interface: "en0".to_string(),
@@ -175,7 +185,32 @@ fn persist_daemon_network_cleanup_state_writes_and_clears_macos_state() {
     assert_eq!(cleanup.iface, "utun100");
     assert_eq!(
         cleanup.endpoint_bypass_routes,
-        tunnel_runtime.endpoint_bypass_routes
+        vec!["198.51.100.9/32".to_string(), "203.0.113.10/32".to_string()]
+    );
+    assert_eq!(
+        cleanup.managed_routes,
+        vec![
+            crate::MacosManagedRoute {
+                target: "0.0.0.0/1".to_string(),
+                gateway: None,
+                interface: Some("utun100".to_string()),
+            },
+            crate::MacosManagedRoute {
+                target: "128.0.0.0/1".to_string(),
+                gateway: None,
+                interface: Some("utun100".to_string()),
+            },
+            crate::MacosManagedRoute {
+                target: "198.51.100.9/32".to_string(),
+                gateway: Some("192.168.64.1".to_string()),
+                interface: Some("en0".to_string()),
+            },
+            crate::MacosManagedRoute {
+                target: "203.0.113.10/32".to_string(),
+                gateway: Some("192.168.64.1".to_string()),
+                interface: Some("en0".to_string()),
+            },
+        ]
     );
     assert_eq!(
         cleanup.original_default_route,
@@ -264,6 +299,27 @@ default            192.168.64.1       UGScg                 en0\n\
 "
         )
     );
+}
+
+#[test]
+fn macos_underlay_default_route_detection_requires_real_underlay_route() {
+    assert!(crate::macos_network::macos_has_underlay_default_route(
+        "Routing tables\n\
+Internet:\n\
+Destination        Gateway            Flags               Netif Expire\n\
+default            192.168.64.1       UGScg                 en0\n\
+0/1                link#13            UCS                 utun5\n\
+128/1              link#13            UCS                 utun5\n\
+"
+    ));
+    assert!(!crate::macos_network::macos_has_underlay_default_route(
+        "Routing tables\n\
+Internet:\n\
+Destination        Gateway            Flags               Netif Expire\n\
+0/1                link#13            UCS                 utun5\n\
+128/1              link#13            UCS                 utun5\n\
+"
+    ));
 }
 
 #[test]
