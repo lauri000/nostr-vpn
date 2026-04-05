@@ -19,6 +19,15 @@ fn route_targets_detect_when_endpoint_bypass_is_required() {
 }
 
 #[test]
+fn macos_default_route_can_be_withheld_from_route_targets() {
+    let mut routes = vec!["0.0.0.0/0".to_string(), "10.55.0.0/24".to_string()];
+
+    assert!(withhold_macos_default_route(&mut routes));
+    assert_eq!(routes, vec!["10.55.0.0/24".to_string()]);
+    assert!(!withhold_macos_default_route(&mut routes));
+}
+
+#[test]
 fn tunnel_runtime_fingerprint_changes_when_route_targets_change() {
     let base = "iface|key|51820|10.44.0.1/32|peer";
     let direct_only = vec!["10.44.0.2/32".to_string()];

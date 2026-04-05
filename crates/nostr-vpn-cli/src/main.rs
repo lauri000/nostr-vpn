@@ -2856,7 +2856,7 @@ impl CliTunnelRuntime {
                 runtime_peers.as_ref(),
                 &own_local_endpoints,
             );
-            let route_targets = route_targets_for_planned_tunnel_peers(
+            let mut route_targets = route_targets_for_planned_tunnel_peers(
                 app,
                 own_pubkey,
                 peer_announcements,
@@ -2864,18 +2864,6 @@ impl CliTunnelRuntime {
                 path_book,
                 runtime_peers.as_ref(),
                 now,
-            );
-            let runtime_fingerprint = tunnel_runtime_fingerprint(&fingerprint, &route_targets);
-            if self.last_fingerprint.as_deref() == Some(runtime_fingerprint.as_str())
-                && self.is_running()
-                && !needs_endpoint_refresh
-            {
-                return Ok(());
-            }
-            #[cfg(target_os = "macos")]
-            eprintln!(
-                "tunnel: planned macOS route targets [{}]",
-                route_targets.join(", ")
             );
             #[cfg(target_os = "linux")]
             if route_targets.iter().any(|route| route == "0.0.0.0/0") {
@@ -2903,15 +2891,43 @@ impl CliTunnelRuntime {
             };
             #[cfg(target_os = "macos")]
             let endpoint_bypass_specs = if route_targets_require_endpoint_bypass(&route_targets) {
-                macos_bypass_route_specs(
+                match macos_bypass_route_specs(
                     app,
                     &peers,
                     &self.iface,
                     self.original_default_route.as_ref(),
-                )?
+                ) {
+                    Ok(specs) => specs,
+                    Err(error) => {
+                        if withhold_macos_default_route(&mut route_targets) {
+                            eprintln!(
+                                "exit-node: failed to resolve macOS endpoint bypass routes; withholding default route: {error}"
+                            );
+                            Vec::new()
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
             } else {
                 Vec::new()
             };
+            #[cfg(target_os = "macos")]
+            if !route_targets.iter().any(|route| route == "0.0.0.0/0") {
+                self.restore_macos_original_default_route();
+            }
+            let runtime_fingerprint = tunnel_runtime_fingerprint(&fingerprint, &route_targets);
+            if self.last_fingerprint.as_deref() == Some(runtime_fingerprint.as_str())
+                && self.is_running()
+                && !needs_endpoint_refresh
+            {
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "tunnel: planned macOS route targets [{}]",
+                route_targets.join(", ")
+            );
 
             self.ensure_started()?;
             let socket = self
@@ -3015,6 +3031,18 @@ impl CliTunnelRuntime {
             #[cfg(target_os = "macos")]
             {
                 self.reconcile_macos_endpoint_bypass_routes(&endpoint_bypass_specs);
+                if route_targets.iter().any(|route| route == "0.0.0.0/0")
+                    && self.endpoint_bypass_routes.len() < endpoint_bypass_specs.len()
+                    && withhold_macos_default_route(&mut route_targets)
+                {
+                    let missing = endpoint_bypass_specs
+                        .len()
+                        .saturating_sub(self.endpoint_bypass_routes.len());
+                    eprintln!(
+                        "exit-node: withholding macOS default route until {missing} endpoint bypass route(s) install successfully"
+                    );
+                    self.restore_macos_original_default_route();
+                }
                 apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
             }
             #[cfg(target_os = "linux")]
@@ -4312,6 +4340,15 @@ fn route_targets_require_endpoint_bypass(route_targets: &[String]) -> bool {
     route_targets
         .iter()
         .any(|route| !route_is_host_route(route))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn withhold_macos_default_route(route_targets: &mut Vec<String>) -> bool {
+    let had_default = route_targets.iter().any(|route| route == "0.0.0.0/0");
+    if had_default {
+        route_targets.retain(|route| route != "0.0.0.0/0");
+    }
+    had_default
 }
 
 fn normalized_peer_ipv4_routes(announcement: &PeerAnnouncement) -> Vec<String> {
