@@ -158,10 +158,13 @@ export const heroStateBadgeClass = (state: UiState) => {
   if (!state.vpnSessionControlSupported) {
     return 'muted'
   }
+  if ((!state.serviceInstalled || state.serviceDisabled) && !state.sessionActive) {
+    return 'warn'
+  }
   if (state.meshReady) {
     return 'ok'
   }
-  if (state.sessionActive || state.serviceInstalled === false || state.serviceDisabled) {
+  if (state.sessionActive) {
     return 'warn'
   }
   return 'muted'
@@ -189,8 +192,21 @@ export const heroSubtext = (state: UiState) => {
   return `${network.name} is waiting on ${remaining} more peer${remaining === 1 ? '' : 's'}.`
 }
 
-export const heroBadgeText = (state: UiState) =>
-  state.vpnSessionControlSupported ? (state.meshReady ? 'Connected' : 'Preview') : 'Preview'
+export const heroBadgeText = (state: UiState) => {
+  if (!state.vpnSessionControlSupported) {
+    return 'Preview'
+  }
+  if ((!state.serviceInstalled || state.serviceDisabled) && !state.sessionActive) {
+    return 'Service required'
+  }
+  if (state.sessionActive && state.expectedPeerCount > 0) {
+    return `Mesh ${state.connectedPeerCount}/${state.expectedPeerCount}`
+  }
+  if (state.sessionActive) {
+    return 'VPN On'
+  }
+  return 'VPN Off'
+}
 
 export const heroDetailText = (state: UiState) => (state.vpnSessionControlSupported ? state.sessionStatus : '')
 
@@ -270,6 +286,9 @@ export const filteredExitNodeCandidates = (state: UiState, query: string) => {
     )
   })
 }
+
+export const selectedExitNodeParticipant = (state: UiState) =>
+  exitNodeCandidates(state).find((participant) => participant.npub === state.exitNode)
 
 export const exitNodeAvailabilityClass = (participant: ParticipantView) => {
   if (!participant.offersExitNode) {
@@ -357,7 +376,7 @@ export const selectedExitNodeStatusText = (state: UiState) => {
     return 'Internet-bound traffic stays local; only mesh routes are used.'
   }
 
-  const selected = exitNodeCandidates(state).find((participant) => participant.npub === state.exitNode)
+  const selected = selectedExitNodeParticipant(state)
   if (!selected) {
     return 'Selected exit node is not present in the current network view.'
   }
@@ -377,6 +396,38 @@ export const selectedExitNodeStatusText = (state: UiState) => {
     default:
       return `${label} is selected; availability is still being checked.`
   }
+}
+
+export const selectedExitNodeBadgeClass = (state: UiState) => {
+  if (!state.exitNode) {
+    return 'muted'
+  }
+
+  const selected = selectedExitNodeParticipant(state)
+  if (!selected || !selected.offersExitNode) {
+    return 'bad'
+  }
+
+  switch (selected.state) {
+    case 'online':
+      return 'ok'
+    case 'pending':
+      return 'warn'
+    case 'offline':
+      return 'bad'
+    default:
+      return 'muted'
+  }
+}
+
+export const selectedExitNodeBadgeText = (state: UiState) => {
+  const selected = selectedExitNodeParticipant(state)
+  if (!selected) {
+    return 'Exit node unavailable'
+  }
+
+  const label = selected.magicDnsName || selected.magicDnsAlias || short(selected.npub, 12, 10)
+  return `Exit ${label}`
 }
 
 export const publicRelayFallbackStatusText = (state: UiState) => {

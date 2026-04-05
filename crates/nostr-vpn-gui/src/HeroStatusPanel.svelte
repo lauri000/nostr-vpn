@@ -8,6 +8,8 @@
     heroStateBadgeClass,
     heroSubtext,
     platformLabel,
+    selectedExitNodeBadgeClass,
+    selectedExitNodeBadgeText,
   } from './lib/app-view'
   import { nodeNameDnsPreview } from './lib/node-name.js'
   import type { SettingsPatch, UiState } from './lib/types'
@@ -118,9 +120,14 @@
         <span class={`badge ${state.relayConnected ? 'ok' : 'muted'}`}>
           Relays {state.relayConnected ? 'Connected' : 'Disconnected'}
         </span>
-        <span class="badge muted" data-testid="mesh-badge">
-          Mesh {state.connectedPeerCount}/{state.expectedPeerCount}
-        </span>
+        {#if state.exitNode}
+          <span
+            class={`badge ${selectedExitNodeBadgeClass(state)}`}
+            data-testid="exit-node-badge"
+          >
+            {selectedExitNodeBadgeText(state)}
+          </span>
+        {/if}
       {:else}
         <span class="badge muted">Platform {platformLabel(state.platform)}</span>
         <span class="badge muted">Config editing enabled</span>

@@ -200,6 +200,23 @@
     }`
   }
 
+  function currentServiceRepairPromptText(currentState: UiState) {
+    const appVersion = String(currentState.appVersion || '').trim()
+    const serviceVersion = String(
+      currentState.serviceBinaryVersion || currentState.daemonBinaryVersion || ''
+    ).trim()
+
+    if (
+      appVersion.length > 0 &&
+      serviceVersion.length > 0 &&
+      appVersion !== serviceVersion
+    ) {
+      return `Background service version (${serviceVersion}) does not match this app (${appVersion}). Reinstall it now so both use the same version?`
+    }
+
+    return 'Background service version does not match this app. Reinstall it now so both use the same version?'
+  }
+
   async function maybePromptForServiceRepair() {
     if (
       !state ||
@@ -223,11 +240,7 @@
 
     serviceRepairPromptInFlight = true
     try {
-      if (
-        window.confirm(
-          'Background service is out of date. Reinstall it now so this app version can control the VPN?'
-        )
-      ) {
+      if (window.confirm(currentServiceRepairPromptText(state))) {
         await onRepairSystemService(false)
       }
     } finally {

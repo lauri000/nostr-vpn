@@ -9,6 +9,8 @@ function baseState() {
     meshReady: false,
     relayConnected: false,
     sessionStatus: '',
+    connectedPeerCount: 0,
+    expectedPeerCount: 0,
   }
 }
 
@@ -35,17 +37,28 @@ test('heroStateText reports connected only when the mesh is ready', () => {
   assert.equal(heroStateText(state), 'Connected')
 })
 
-test('heroStateText reports connecting for active sessions without a ready mesh', () => {
+test('heroStateText reports mesh counts for active sessions without a ready mesh', () => {
+  const state = {
+    ...baseState(),
+    sessionActive: true,
+    connectedPeerCount: 0,
+    expectedPeerCount: 3,
+  }
+
+  assert.equal(heroStateText(state), 'Mesh 0/3')
+})
+
+test('heroStateText reports VPN off for inactive sessions without service blockers', () => {
+  assert.equal(heroStateText(baseState()), 'VPN Off')
+})
+
+test('heroStateText reports VPN on when active without configured remote peers', () => {
   const state = {
     ...baseState(),
     sessionActive: true,
   }
 
-  assert.equal(heroStateText(state), 'Connecting')
-})
-
-test('heroStateText reports disconnected for inactive sessions without service blockers', () => {
-  assert.equal(heroStateText(baseState()), 'Disconnected')
+  assert.equal(heroStateText(state), 'VPN On')
 })
 
 test('heroStatusDetailText keeps status text visible', () => {

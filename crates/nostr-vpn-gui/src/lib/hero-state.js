@@ -5,7 +5,7 @@
 /**
  * @param {UiState} state
  * @param {{ serviceInstallRecommended?: boolean, serviceEnableRecommended?: boolean }} options
- * @returns {'Service required' | 'Connected' | 'Connecting' | 'Disconnected'}
+ * @returns {'Service required' | 'Connected' | `Mesh ${number}/${number}` | 'VPN On' | 'VPN Off'}
  */
 export function heroStateText(state, options = {}) {
   const serviceInstallRecommended = options.serviceInstallRecommended ?? false
@@ -18,9 +18,14 @@ export function heroStateText(state, options = {}) {
     return 'Connected'
   }
   if (state.sessionActive) {
-    return 'Connecting'
+    const connectedPeerCount = Number(state.connectedPeerCount ?? 0)
+    const expectedPeerCount = Number(state.expectedPeerCount ?? 0)
+    if (expectedPeerCount > 0) {
+      return `Mesh ${connectedPeerCount}/${expectedPeerCount}`
+    }
+    return 'VPN On'
   }
-  return 'Disconnected'
+  return 'VPN Off'
 }
 
 /**
