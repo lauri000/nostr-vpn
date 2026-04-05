@@ -48,7 +48,7 @@ use nostr_vpn_core::join_requests::{MeshJoinRequest, publish_join_request};
 
 const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
 const NETWORK_INVITE_PREFIX: &str = "nvpn://invite/";
-const NETWORK_INVITE_VERSION: u8 = 2;
+const NETWORK_INVITE_VERSION: u8 = 3;
 const DEFAULT_STATIC_DIR: &str = "/usr/share/nostr-vpn/web";
 
 #[derive(Debug, Parser)]
@@ -389,7 +389,10 @@ async fn import_network_invite(
     update_config_and_reload(&state, |config| {
         let invite = parse_network_invite(&request.invite)?;
         apply_network_invite_to_active_network(config, &invite)?;
-        Ok(format!("Invite imported for {}.", invite.network_name()))
+        Ok(format!(
+            "Invite imported for {}.",
+            config.active_network().name
+        ))
     })
 }
 

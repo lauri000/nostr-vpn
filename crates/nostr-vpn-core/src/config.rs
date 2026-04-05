@@ -15,6 +15,19 @@ pub use crate::network_routes::{
     normalize_advertised_route, normalize_advertised_routes,
 };
 
+use crate::config_defaults::{
+    current_unix_timestamp, default_autoconnect, default_close_to_tray_on_close, default_endpoint,
+    default_lan_discovery_enabled, default_launch_on_startup, default_listen_for_join_requests,
+    default_listen_port, default_nat_discovery_timeout_secs, default_nat_enabled,
+    default_nat_stun_servers, default_network_enabled, default_network_id, default_node_id,
+    default_provide_nat_assist, default_relay_for_others, default_relays, default_tunnel_ip,
+    default_use_public_relay_fallback, generate_nostr_identity, is_true, is_zero,
+    npub_for_pubkey_hex, uses_default_network_id,
+};
+pub use crate::config_defaults::{
+    derive_network_id_from_participants, maybe_autoconfigure_node, needs_endpoint_autoconfig,
+    needs_tunnel_ip_autoconfig, normalize_nostr_pubkey, normalize_runtime_network_id,
+};
 use crate::config_magic_dns::{
     default_magic_dns_suffix, default_network_entry_id, default_network_name, default_node_name,
     default_peer_aliases, detected_hostname, normalize_network_entry_id, uniquify_magic_dns_label,
@@ -26,19 +39,6 @@ use crate::network_roster::{
     normalize_outbound_join_request, normalize_shared_roster_participants,
 };
 use crate::network_routes::is_exit_node_route;
-use crate::config_defaults::{
-    current_unix_timestamp, default_autoconnect, default_close_to_tray_on_close,
-    default_endpoint, default_launch_on_startup, default_lan_discovery_enabled,
-    default_listen_for_join_requests, default_listen_port, default_nat_discovery_timeout_secs,
-    default_nat_enabled, default_nat_stun_servers, default_network_enabled, default_network_id,
-    default_node_id, default_provide_nat_assist, default_relays, default_relay_for_others,
-    default_tunnel_ip, default_use_public_relay_fallback, generate_nostr_identity, is_true,
-    is_zero, npub_for_pubkey_hex, uses_default_network_id,
-};
-pub use crate::config_defaults::{
-    derive_network_id_from_participants, maybe_autoconfigure_node, needs_endpoint_autoconfig,
-    needs_tunnel_ip_autoconfig, normalize_nostr_pubkey, normalize_runtime_network_id,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::generate_keypair;
@@ -187,6 +187,7 @@ pub struct SharedNetworkRoster {
     pub name: String,
     pub participants: Vec<String>,
     pub admins: Vec<String>,
+    pub aliases: HashMap<String, String>,
     pub updated_at: u64,
     pub signed_by: String,
 }
@@ -515,6 +516,23 @@ impl AppConfig {
         participants.sort();
         participants.dedup();
         participants
+    }
+
+    fn all_network_member_pubkeys_hex(&self) -> Vec<String> {
+        let mut members = self
+            .networks
+            .iter()
+            .flat_map(|network| {
+                network
+                    .participants
+                    .iter()
+                    .chain(network.admins.iter())
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        members.sort();
+        members.dedup();
+        members
     }
 
     pub fn enabled_network_count(&self) -> usize {
@@ -912,12 +930,30 @@ impl AppConfig {
         admins.sort();
         admins.dedup();
 
+        let own_pubkey = self.own_nostr_pubkey_hex().ok();
+        let mut alias_keys = participants.clone();
+        alias_keys.extend(admins.iter().cloned());
+        alias_keys.sort();
+        alias_keys.dedup();
+        let aliases = alias_keys
+            .into_iter()
+            .filter_map(|member| {
+                let alias = if own_pubkey.as_deref() == Some(member.as_str()) {
+                    self.self_magic_dns_label()
+                } else {
+                    self.peer_alias(&member)
+                }?;
+                Some((member, alias))
+            })
+            .collect::<HashMap<_, _>>();
+
         Ok(SharedNetworkRoster {
             id: network.id.clone(),
             network_id: normalize_runtime_network_id(&network.network_id),
             name: network.name.clone(),
             participants,
             admins,
+            aliases,
             updated_at: network.shared_roster_updated_at,
             signed_by: network.shared_roster_signed_by.clone(),
         })
@@ -929,6 +965,7 @@ impl AppConfig {
         network_name: &str,
         participants: Vec<String>,
         admins: Vec<String>,
+        aliases: HashMap<String, String>,
         signed_at: u64,
         signed_by: &str,
     ) -> Result<bool> {
@@ -996,6 +1033,30 @@ impl AppConfig {
             std::mem::take(&mut network.inbound_join_requests),
             &network.participants,
         );
+
+        let mut allowed_members = network.participants.clone();
+        allowed_members.extend(network.admins.iter().cloned());
+        allowed_members.sort();
+        allowed_members.dedup();
+        let allowed_members = allowed_members.into_iter().collect::<HashSet<_>>();
+        for (participant, alias) in aliases {
+            let Ok(normalized_participant) = normalize_nostr_pubkey(&participant) else {
+                continue;
+            };
+            if Some(normalized_participant.as_str()) == own_pubkey.as_deref() {
+                continue;
+            }
+            if !allowed_members.contains(&normalized_participant) {
+                continue;
+            }
+            let Some(normalized_alias) = normalize_magic_dns_label(&alias) else {
+                continue;
+            };
+            self.peer_aliases.insert(
+                npub_for_pubkey_hex(&normalized_participant),
+                normalized_alias,
+            );
+        }
         self.normalize_peer_aliases();
         Ok(true)
     }
@@ -1108,7 +1169,7 @@ impl AppConfig {
             used_aliases.insert(self_alias);
         }
         let mut final_aliases = HashMap::new();
-        for participant in &self.all_participant_pubkeys_hex() {
+        for participant in &self.all_network_member_pubkeys_hex() {
             let participant_npub = npub_for_pubkey_hex(participant);
             let preferred = normalized_aliases
                 .remove(&participant_npub)
@@ -1150,8 +1211,23 @@ impl AppConfig {
 
     pub fn set_peer_alias(&mut self, participant: &str, alias: &str) -> Result<String> {
         let participant_hex = normalize_nostr_pubkey(participant)?;
+        let affected_network_ids = self
+            .networks
+            .iter()
+            .filter(|network| {
+                network
+                    .participants
+                    .iter()
+                    .any(|configured| configured == &participant_hex)
+                    || network
+                        .admins
+                        .iter()
+                        .any(|configured| configured == &participant_hex)
+            })
+            .map(|network| network.id.clone())
+            .collect::<Vec<_>>();
         if !self
-            .all_participant_pubkeys_hex()
+            .all_network_member_pubkeys_hex()
             .iter()
             .any(|configured| configured == &participant_hex)
         {
@@ -1163,6 +1239,9 @@ impl AppConfig {
         if alias.is_empty() {
             self.peer_aliases.remove(&participant_npub);
             self.normalize_peer_aliases();
+            for network_id in &affected_network_ids {
+                let _ = self.note_network_roster_local_change(network_id);
+            }
             return self
                 .peer_aliases
                 .get(&participant_npub)
@@ -1175,6 +1254,9 @@ impl AppConfig {
         self.peer_aliases
             .insert(participant_npub.clone(), normalized_alias);
         self.normalize_peer_aliases();
+        for network_id in &affected_network_ids {
+            let _ = self.note_network_roster_local_change(network_id);
+        }
         self.peer_aliases
             .get(&participant_npub)
             .cloned()

@@ -207,6 +207,7 @@ fn apply_admin_signed_shared_roster_replaces_members_from_known_admin() {
             "Home",
             vec![current_admin_hex.clone(), member_hex.clone(), own_hex],
             vec![current_admin_hex.clone(), new_admin_hex.clone()],
+            std::collections::HashMap::new(),
             1_726_000_000,
             &current_admin_hex,
         )
@@ -238,12 +239,103 @@ fn apply_admin_signed_shared_roster_ignores_unknown_signer() {
             "Home",
             vec![known_admin.public_key().to_hex()],
             vec![known_admin.public_key().to_hex()],
+            std::collections::HashMap::new(),
             1_726_000_000,
             &unknown_admin.public_key().to_hex(),
         )
         .expect("ignore unknown signer");
 
     assert!(!changed);
+}
+
+#[test]
+fn shared_network_roster_includes_network_aliases() {
+    let own = Keys::generate();
+    let peer = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+    let peer_hex = peer.public_key().to_hex();
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex.clone();
+    config.node_name = "helios-admin".to_string();
+    config.networks[0].network_id = "mesh-home".to_string();
+    config.networks[0].admins = vec![own_hex.clone()];
+    config.networks[0].participants = vec![peer_hex.clone()];
+    config.ensure_defaults();
+    config
+        .set_peer_alias(&peer_hex, "garden-node")
+        .expect("peer alias");
+
+    let roster = config
+        .shared_network_roster(&config.networks[0].id)
+        .expect("shared roster");
+
+    assert_eq!(
+        roster.aliases.get(&own_hex).map(String::as_str),
+        Some("helios-admin")
+    );
+    assert_eq!(
+        roster.aliases.get(&peer_hex).map(String::as_str),
+        Some("garden-node")
+    );
+}
+
+#[test]
+fn apply_admin_signed_shared_roster_applies_aliases_for_members() {
+    let own = Keys::generate();
+    let current_admin = Keys::generate();
+    let member = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+    let current_admin_hex = current_admin.public_key().to_hex();
+    let member_hex = member.public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex.clone();
+    config.networks[0].network_id = "mesh-home".to_string();
+    config.networks[0].admins = vec![current_admin_hex.clone()];
+    config.networks[0].participants = vec![current_admin_hex.clone()];
+    config.ensure_defaults();
+
+    let changed = config
+        .apply_admin_signed_shared_roster(
+            "mesh-home",
+            "Home",
+            vec![current_admin_hex.clone(), member_hex.clone(), own_hex],
+            vec![current_admin_hex.clone()],
+            std::collections::HashMap::from([
+                (current_admin_hex.clone(), "home-server".to_string()),
+                (member_hex.clone(), "alice-phone".to_string()),
+            ]),
+            1_726_000_000,
+            &current_admin_hex,
+        )
+        .expect("apply shared roster");
+
+    assert!(changed);
+    assert_eq!(
+        config.peer_alias(&current_admin_hex).as_deref(),
+        Some("home-server")
+    );
+    assert_eq!(
+        config.peer_alias(&member_hex).as_deref(),
+        Some("alice-phone")
+    );
+}
+
+#[test]
+fn set_peer_alias_marks_member_network_roster_changed() {
+    let peer_hex = Keys::generate().public_key().to_hex();
+    let mut config = AppConfig::generated();
+    config.networks[0].participants = vec![peer_hex.clone()];
+    config.ensure_defaults();
+    assert_eq!(config.networks[0].shared_roster_updated_at, 0);
+
+    config
+        .set_peer_alias(&peer_hex, "home-server")
+        .expect("set peer alias");
+
+    assert!(config.networks[0].shared_roster_updated_at > 0);
 }
 
 #[test]

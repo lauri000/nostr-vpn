@@ -83,10 +83,10 @@ fn active_network_invite_code_roundtrips_current_roster() {
     let parsed = parse_network_invite(&invite).expect("invite should decode");
 
     assert!(invite.starts_with(NETWORK_INVITE_PREFIX));
-    assert_eq!(parsed.network_name, "Work");
+    assert!(parsed.network_name.is_empty());
     assert_eq!(parsed.network_id, "8d4f34f5425bc50e");
     assert_eq!(parsed.admins.len(), 2);
-    assert_eq!(parsed.participants.len(), 2);
+    assert!(parsed.participants.is_empty());
     assert_eq!(parsed.relays, vec!["wss://temp.iris.to".to_string()]);
 }
 

@@ -11,8 +11,10 @@ use crate::{NETWORK_INVITE_PREFIX, NETWORK_INVITE_VERSION, to_npub};
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NetworkInvite {
     v: u8,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     network_name: String,
     network_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     inviter_npub: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     inviter_node_name: String,
@@ -23,39 +25,20 @@ pub(crate) struct NetworkInvite {
     relays: Vec<String>,
 }
 
-impl NetworkInvite {
-    pub(crate) fn network_name(&self) -> &str {
-        &self.network_name
-    }
-}
-
 pub(crate) fn active_network_invite_code(config: &AppConfig) -> Result<String> {
     let active_network = config.active_network();
     let roster = config.shared_network_roster(&active_network.id)?;
-    let own_pubkey = config.own_nostr_pubkey_hex().ok();
-    let inviter_pubkey = own_pubkey
-        .as_deref()
-        .filter(|pubkey| config.is_network_admin(&active_network.id, pubkey))
-        .map(str::to_string)
-        .or_else(|| preferred_join_request_recipient(active_network))
-        .or_else(|| active_network.admins.first().cloned())
-        .ok_or_else(|| anyhow!("active network has no admin configured"))?;
+    if roster.admins.is_empty() {
+        return Err(anyhow!("active network has no admin configured"));
+    }
     let invite = NetworkInvite {
         v: NETWORK_INVITE_VERSION,
-        network_name: active_network.name.trim().to_string(),
+        network_name: String::new(),
         network_id: roster.network_id,
-        inviter_npub: to_npub(&inviter_pubkey),
-        inviter_node_name: if own_pubkey.as_deref() == Some(inviter_pubkey.as_str()) {
-            config.node_name.trim().to_string()
-        } else {
-            config.peer_alias(&inviter_pubkey).unwrap_or_default()
-        },
+        inviter_npub: String::new(),
+        inviter_node_name: String::new(),
         admins: roster.admins.iter().map(|admin| to_npub(admin)).collect(),
-        participants: roster
-            .participants
-            .iter()
-            .map(|participant| to_npub(participant))
-            .collect(),
+        participants: Vec::new(),
         relays: normalized_invite_relays(&config.nostr.relays)?,
     };
     let encoded = URL_SAFE_NO_PAD
@@ -83,38 +66,45 @@ pub(crate) fn parse_network_invite(value: &str) -> Result<NetworkInvite> {
             .context("failed to parse network invite payload")?
     };
 
-    if invite.v != 1 && invite.v != NETWORK_INVITE_VERSION {
+    if invite.v != 1 && invite.v != 2 && invite.v != NETWORK_INVITE_VERSION {
         return Err(anyhow!(
-            "unsupported invite version {}; expected 1 or {}",
+            "unsupported invite version {}; expected 1, 2, or {}",
             invite.v,
             NETWORK_INVITE_VERSION
         ));
     }
 
     invite.network_name = invite.network_name.trim().to_string();
-    if invite.network_name.is_empty() {
-        return Err(anyhow!("invite network name is empty"));
-    }
-
     invite.network_id = invite.network_id.trim().to_string();
     if invite.network_id.is_empty() {
         return Err(anyhow!("invite network id is empty"));
     }
 
-    invite.inviter_npub = to_npub(&normalize_nostr_pubkey(&invite.inviter_npub)?);
-    invite.inviter_node_name = invite.inviter_node_name.trim().to_string();
     invite.admins = normalized_invite_pubkeys(&invite.admins)?;
-    if !invite
-        .admins
-        .iter()
-        .any(|admin| admin == &invite.inviter_npub)
-    {
+    if !invite.inviter_npub.trim().is_empty() {
+        invite.inviter_npub = to_npub(&normalize_nostr_pubkey(&invite.inviter_npub)?);
+        if !invite
+            .admins
+            .iter()
+            .any(|admin| admin == &invite.inviter_npub)
+        {
+            invite.admins.push(invite.inviter_npub.clone());
+        }
+    } else {
+        invite.inviter_npub = invite
+            .admins
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("invite must include at least one admin"))?;
+    }
+    if invite.admins.is_empty() {
         invite.admins.push(invite.inviter_npub.clone());
         invite.admins.sort();
         invite.admins.dedup();
     }
+    invite.inviter_node_name = invite.inviter_node_name.trim().to_string();
     invite.participants = normalized_invite_pubkeys(&invite.participants)?;
-    if invite.participants.is_empty() {
+    if invite.participants.is_empty() && invite.v < NETWORK_INVITE_VERSION {
         invite.participants.push(invite.inviter_npub.clone());
     }
     invite.relays = normalized_invite_relays(&invite.relays)?;
@@ -126,7 +116,16 @@ pub(crate) fn apply_network_invite_to_active_network(
     invite: &NetworkInvite,
 ) -> Result<()> {
     let normalized_invite_network_id = normalize_runtime_network_id(&invite.network_id);
-    let normalized_inviter_pubkey = normalize_nostr_pubkey(&invite.inviter_npub)?;
+    let inviter_npub = if invite.inviter_npub.trim().is_empty() {
+        invite
+            .admins
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("invite must include at least one admin"))?
+    } else {
+        invite.inviter_npub.clone()
+    };
+    let normalized_inviter_pubkey = normalize_nostr_pubkey(&inviter_npub)?;
     let own_pubkey = config.own_nostr_pubkey_hex().ok();
     let invite_admins = invite
         .admins
@@ -229,7 +228,10 @@ pub(crate) fn apply_network_invite_to_active_network(
         let _ = config.set_peer_alias(&normalized_inviter_pubkey, &invite.inviter_node_name);
     }
 
-    if should_adopt_name && let Some(network) = config.network_by_id_mut(&target_network_id) {
+    if should_adopt_name
+        && !invite.network_name.trim().is_empty()
+        && let Some(network) = config.network_by_id_mut(&target_network_id)
+    {
         network.name = invite.network_name.trim().to_string();
     }
 

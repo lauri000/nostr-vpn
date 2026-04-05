@@ -1228,7 +1228,7 @@ async fn run_command(command: Command) -> Result<()> {
             } else {
                 println!("saved {}", config_path.display());
                 println!("network_id={}", app.effective_network_id());
-                println!("invite_imported={}", invite.network_name());
+                println!("invite_imported={}", app.active_network().name);
             }
         }
         Command::AddParticipant(args) => {
@@ -4049,7 +4049,10 @@ fn discover_public_signal_endpoint(
     None
 }
 
-fn discover_public_endpoint_with_bind_fallback<F>(listen_port: u16, mut discover: F) -> Result<String>
+fn discover_public_endpoint_with_bind_fallback<F>(
+    listen_port: u16,
+    mut discover: F,
+) -> Result<String>
 where
     F: FnMut(u16) -> Result<String>,
 {
@@ -4792,6 +4795,7 @@ fn persist_shared_network_roster(
         &roster.network_name,
         roster.participants.clone(),
         roster.admins.clone(),
+        roster.aliases.clone(),
         roster.signed_at,
         sender_pubkey,
     )?;
@@ -6077,9 +6081,7 @@ pub(crate) fn daemon_control_ack_timeout(request: DaemonControlRequest) -> Durat
     Duration::from_secs(3)
 }
 
-pub(crate) fn daemon_control_session_transition_timeout(
-    request: DaemonControlRequest,
-) -> Duration {
+pub(crate) fn daemon_control_session_transition_timeout(request: DaemonControlRequest) -> Duration {
     if matches!(
         request,
         DaemonControlRequest::Pause | DaemonControlRequest::Resume

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -41,6 +41,8 @@ pub struct NetworkRoster {
     pub participants: Vec<String>,
     #[serde(default)]
     pub admins: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub aliases: HashMap<String, String>,
     pub signed_at: u64,
 }
 

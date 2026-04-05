@@ -146,10 +146,11 @@ impl NvpnBackend {
 
         let persist_outcome = self.persist_config_with_defaults()?;
         self.finish_config_mutation(persist_outcome, true, true, false)?;
+        let imported_network_name = self.config.active_network().name.clone();
         self.session_status = if self.daemon_running {
-            format!("Invite imported and applied for {}.", invite.network_name)
+            format!("Invite imported and applied for {}.", imported_network_name)
         } else {
-            format!("Invite imported for {}.", invite.network_name)
+            format!("Invite imported for {}.", imported_network_name)
         };
         if let Err(error) = self.request_network_join(&active_network_id) {
             self.session_status = format!(
