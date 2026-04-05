@@ -908,6 +908,9 @@ pub(crate) fn repair_legacy_macos_network_state(config_path: &Path) -> Result<bo
 }
 
 pub(crate) fn repair_saved_network_state(config_path: &Path) -> Result<bool> {
+    #[cfg(test)]
+    crate::TEST_REPAIR_SAVED_NETWORK_STATE_CALLS.fetch_add(1, Ordering::Relaxed);
+
     #[cfg(target_os = "macos")]
     {
         let path = daemon_network_cleanup_file_path(config_path);

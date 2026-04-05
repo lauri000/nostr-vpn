@@ -1073,7 +1073,7 @@ async fn run_command(command: Command) -> Result<()> {
                         "relays": relays,
                         "relay_for_others": app.relay_for_others,
                         "provide_nat_assist": app.provide_nat_assist,
-                        "daemon": daemon_status_json(&config_path)?,
+                        "daemon": daemon_status_json_value(&daemon),
                         "expected_peer_count": expected_peers,
                         "peer_count": peer_count,
                         "mesh_ready": mesh_ready,
@@ -5839,6 +5839,10 @@ const TEST_MACOS_EUID_SENTINEL: u32 = u32::MAX;
 static TEST_MACOS_EUID_OVERRIDE: AtomicU32 = AtomicU32::new(TEST_MACOS_EUID_SENTINEL);
 #[cfg(test)]
 static TEST_MACOS_EUID_OVERRIDE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+static TEST_REPAIR_SAVED_NETWORK_STATE_CALLS: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static TEST_REPAIR_SAVED_NETWORK_STATE_CALLS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) fn macos_euid_override_lock_for_test() -> &'static Mutex<()> {
@@ -5846,8 +5850,23 @@ pub(crate) fn macos_euid_override_lock_for_test() -> &'static Mutex<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn repair_saved_network_state_call_lock_for_test() -> &'static Mutex<()> {
+    TEST_REPAIR_SAVED_NETWORK_STATE_CALLS_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
 pub(crate) fn set_macos_euid_override_for_test(value: Option<u32>) {
     TEST_MACOS_EUID_OVERRIDE.store(value.unwrap_or(TEST_MACOS_EUID_SENTINEL), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_repair_saved_network_state_call_count_for_test() {
+    TEST_REPAIR_SAVED_NETWORK_STATE_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn repair_saved_network_state_call_count_for_test() -> u32 {
+    TEST_REPAIR_SAVED_NETWORK_STATE_CALLS.load(Ordering::Relaxed)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -6215,14 +6234,6 @@ fn daemon_status(config_path: &Path) -> Result<DaemonStatus> {
         .next();
     let running = running_pid.is_some();
 
-    if !running {
-        match repair_saved_network_state(config_path) {
-            Ok(true) => eprintln!("daemon: repaired saved network state"),
-            Ok(false) => {}
-            Err(error) => eprintln!("daemon: failed to repair saved network state: {error}"),
-        }
-    }
-
     let pid = running_pid.or(pid_from_record);
     let state = read_daemon_state(&state_file)?;
 
@@ -6247,16 +6258,15 @@ fn daemon_status(config_path: &Path) -> Result<DaemonStatus> {
     })
 }
 
-fn daemon_status_json(config_path: &Path) -> Result<serde_json::Value> {
-    let status = daemon_status(config_path)?;
-    Ok(json!({
+fn daemon_status_json_value(status: &DaemonStatus) -> serde_json::Value {
+    json!({
         "running": status.running,
         "pid": status.pid,
         "pid_file": status.pid_file,
         "log_file": status.log_file,
         "state_file": status.state_file,
         "state": visible_daemon_state_for_status(status.running, status.state.as_ref()),
-    }))
+    })
 }
 
 fn status_endpoint(app: &AppConfig, daemon: &DaemonStatus) -> String {
