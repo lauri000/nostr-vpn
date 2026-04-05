@@ -229,8 +229,8 @@ async function main() {
       DRIVER_BASE,
       sessionId,
       '[data-testid="mesh-badge"]',
-      /mesh\s*1\/1/i,
-      'mesh to reach 1/1',
+      /(connected|mesh\s*1\/1)/i,
+      'mesh badge to reach connected state',
       70_000,
     )
 

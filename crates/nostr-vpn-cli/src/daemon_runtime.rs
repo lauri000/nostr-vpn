@@ -28,6 +28,7 @@ pub(crate) fn daemon_state_file_path(config_path: &Path) -> PathBuf {
     parent.join("daemon.state.json")
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn daemon_network_cleanup_file_path(config_path: &Path) -> PathBuf {
     let parent = config_path
         .parent()
@@ -738,6 +739,7 @@ pub(crate) fn write_daemon_network_cleanup_state(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn remove_runtime_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),

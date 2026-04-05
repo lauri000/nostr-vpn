@@ -387,6 +387,29 @@ fn set_peer_alias_marks_member_network_roster_changed() {
 }
 
 #[test]
+fn set_peer_alias_bumps_shared_roster_timestamp_past_previous_value() {
+    let own = Keys::generate();
+    let peer_hex = Keys::generate().public_key().to_hex();
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own.public_key().to_hex();
+    config.networks[0].participants = vec![peer_hex.clone()];
+    config.networks[0].admins = vec![config.nostr.public_key.clone()];
+    config.ensure_defaults();
+    config.networks[0].shared_roster_updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+
+    let previous = config.networks[0].shared_roster_updated_at;
+    config
+        .set_peer_alias(&peer_hex, "home-server")
+        .expect("set peer alias");
+
+    assert!(config.networks[0].shared_roster_updated_at > previous);
+}
+
+#[test]
 fn record_inbound_join_request_ignores_mismatched_mesh_id() {
     let requester = Keys::generate().public_key().to_hex();
     let mut config = AppConfig::generated();

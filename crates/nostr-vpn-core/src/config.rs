@@ -1335,6 +1335,11 @@ impl AppConfig {
         None
     }
 
+    pub fn note_active_network_roster_local_change(&mut self) -> Result<()> {
+        let network_id = self.active_network().id.clone();
+        self.note_network_roster_local_change(&network_id)
+    }
+
     fn note_network_roster_local_change(&mut self, network_id: &str) -> Result<()> {
         let own_pubkey = self.own_nostr_pubkey_hex().ok();
         let network = self
@@ -1346,10 +1351,15 @@ impl AppConfig {
         if !network.admins.iter().any(|admin| admin == &own_pubkey) {
             return Ok(());
         }
-        network.shared_roster_updated_at = current_unix_timestamp();
+        network.shared_roster_updated_at =
+            next_shared_roster_updated_at(network.shared_roster_updated_at);
         network.shared_roster_signed_by = own_pubkey;
         Ok(())
     }
 }
 
 const MAX_SHARED_ROSTER_FUTURE_SECS: u64 = 600;
+
+fn next_shared_roster_updated_at(previous: u64) -> u64 {
+    current_unix_timestamp().max(previous.saturating_add(1))
+}

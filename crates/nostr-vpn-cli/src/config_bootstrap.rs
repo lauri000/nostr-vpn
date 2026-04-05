@@ -311,8 +311,15 @@ pub(crate) fn apply_participants_override(
 
     normalized.sort();
     normalized.dedup();
+    let pending_exit_node = normalize_nostr_pubkey(&config.exit_node).ok();
     config.ensure_defaults();
     config.active_network_mut().participants = normalized.clone();
+    if let Some(exit_node) = pending_exit_node
+        && normalized.iter().any(|participant| participant == &exit_node)
+    {
+        config.exit_node = exit_node;
+    }
+    let _ = config.note_active_network_roster_local_change();
     config.ensure_defaults();
 
     Ok(())

@@ -48,7 +48,7 @@
           {#if activeNetworkView.localIsAdmin}
             <span class="badge ok" data-testid="active-network-admin-badge">Admin</span>
           {/if}
-          <span class={`badge ${heroStateBadgeClass(state)}`}>
+          <span class={`badge ${heroStateBadgeClass(state)}`} data-testid="mesh-badge">
             {heroBadgeText(state)}
           </span>
         </div>

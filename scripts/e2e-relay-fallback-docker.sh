@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE=(docker compose -f "$ROOT_DIR/docker-compose.relay-fallback.e2e.yml")
+PROJECT_NAME="nostr-vpn-e2e-relay-fallback"
+COMPOSE=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/docker-compose.relay-fallback.e2e.yml")
 
 RELAY_URL="ws://10.203.1.2:8080"
 CONFIG_PATH="/root/.config/nvpn/config.toml"
@@ -13,6 +14,11 @@ BOB_IP="10.203.1.11"
 
 cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker network rm "${PROJECT_NAME}_e2e" >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    docker network inspect "${PROJECT_NAME}_e2e" >/dev/null 2>&1 || break
+    sleep 1
+  done
 }
 
 dump_debug() {
@@ -77,6 +83,20 @@ peer_runtime_endpoint_from_status() {
   grep -o '"runtime_endpoint":"[^"]*"' | tail -n1 | cut -d '"' -f4 || true
 }
 
+nostr_pubkey_from_config() {
+  local service="$1"
+  "${COMPOSE[@]}" exec -T "$service" sh -lc "
+    awk '
+      /^\\[nostr\\]$/ { in_nostr = 1; next }
+      /^\\[/ { in_nostr = 0 }
+      in_nostr && /^public_key[[:space:]]*=/ {
+        print \$3;
+        exit
+      }
+    ' '$CONFIG_PATH'
+  " | tr -d '\r\"'
+}
+
 wait_for_service() {
   local service="$1"
   local container_id=""
@@ -124,19 +144,21 @@ for node in node-a node-b; do
     "perl -0pi -e 's/\\[nat\\]\\nenabled = true/\\[nat\\]\\nenabled = false/' '$CONFIG_PATH'"
 done
 
-ALICE_NPUB="$("${COMPOSE[@]}" exec -T node-a sh -lc \
-  "grep -m1 '^public_key' '$CONFIG_PATH' | cut -d '\"' -f 2" | tr -d '\r')"
-BOB_NPUB="$("${COMPOSE[@]}" exec -T node-b sh -lc \
-  "grep -m1 '^public_key' '$CONFIG_PATH' | cut -d '\"' -f 2" | tr -d '\r')"
+ALICE_NPUB="$(nostr_pubkey_from_config node-a)"
+BOB_NPUB="$(nostr_pubkey_from_config node-b)"
 
 if [[ -z "$ALICE_NPUB" || -z "$BOB_NPUB" ]]; then
   echo "relay fallback docker e2e failed: unable to resolve node npubs" >&2
   exit 1
 fi
 
-"${COMPOSE[@]}" exec -T node-a nvpn set --participant "$BOB_NPUB" --relay "$RELAY_URL" >/dev/null
-"${COMPOSE[@]}" exec -T node-b nvpn set --participant "$ALICE_NPUB" --relay "$RELAY_URL" >/dev/null
+"${COMPOSE[@]}" exec -T node-a nvpn set --autoconnect false --participant "$BOB_NPUB" --relay "$RELAY_URL" >/dev/null
+"${COMPOSE[@]}" exec -T node-b nvpn set --autoconnect false --participant "$ALICE_NPUB" --relay "$RELAY_URL" >/dev/null
 
+for node in node-a node-b; do
+  "${COMPOSE[@]}" exec -T "$node" sh -lc \
+    "nvpn stop >/dev/null 2>&1 || true; rm -f /root/.config/nvpn/daemon.pid /root/.config/nvpn/daemon.state.json"
+done
 "${COMPOSE[@]}" exec -T node-a sh -lc \
   "iptables -I OUTPUT 1 -p udp -d $BOB_IP --dport 51820 -j REJECT"
 "${COMPOSE[@]}" exec -T node-b sh -lc \

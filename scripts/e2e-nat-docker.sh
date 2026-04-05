@@ -2,21 +2,31 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE=(docker compose -f "$ROOT_DIR/docker-compose.nat-e2e.yml")
+PROJECT_NAME="nostr-vpn-e2e-nat"
+COMPOSE=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/docker-compose.nat-e2e.yml")
 
-RELAY_URL="ws://10.254.241.2:8080"
-REFLECTOR_ADDR="10.254.241.3:3478"
+RELAY_URL="ws://203.0.113.2:8080"
+REFLECTOR_ADDR="203.0.113.3:3478"
 CONFIG_PATH="/root/.config/nvpn/config.toml"
 
 cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker network rm \
+    "${PROJECT_NAME}_internet" \
+    "${PROJECT_NAME}_private-b" >/dev/null 2>&1 || true
+  for network in "${PROJECT_NAME}_internet" "${PROJECT_NAME}_private-b"; do
+    for _ in $(seq 1 20); do
+      docker network inspect "$network" >/dev/null 2>&1 || break
+      sleep 1
+    done
+  done
 }
 
 dump_debug() {
   set +e
   echo "nat docker e2e failed, collecting debug output..."
   "${COMPOSE[@]}" ps || true
-  for service in relay reflector nat-a nat-b node-a node-b; do
+  for service in relay reflector nat-b node-a node-b; do
     echo "--- logs: $service ---"
     "${COMPOSE[@]}" logs --no-color --tail 120 "$service" || true
   done
@@ -90,10 +100,31 @@ ping_until_success() {
   return 1
 }
 
-"${COMPOSE[@]}" build >/dev/null
-"${COMPOSE[@]}" up -d relay reflector nat-a nat-b >/dev/null
+private_iface_for_ip() {
+  local node="$1"
+  local cidr="$2"
+  "${COMPOSE[@]}" exec -T "$node" sh -lc \
+    "ip -o -4 addr show | awk '\$4 == \"$cidr\" { print \$2; exit }'" | tr -d '\r'
+}
 
-for service in relay reflector nat-a nat-b; do
+nostr_pubkey_from_config() {
+  local node="$1"
+  "${COMPOSE[@]}" exec -T "$node" sh -lc "
+    awk '
+      /^\\[nostr\\]$/ { in_nostr = 1; next }
+      /^\\[/ { in_nostr = 0 }
+      in_nostr && /^public_key[[:space:]]*=/ {
+        print \$3;
+        exit
+      }
+    ' '$CONFIG_PATH'
+  " | tr -d '\r\"'
+}
+
+"${COMPOSE[@]}" build >/dev/null
+"${COMPOSE[@]}" up -d relay reflector nat-b >/dev/null
+
+for service in relay reflector nat-b; do
   wait_for_service "$service"
 done
 
@@ -103,19 +134,18 @@ for service in node-a node-b; do
   wait_for_service "$service"
 done
 
-"${COMPOSE[@]}" exec -T node-a sh -lc \
-  "ip route del default >/dev/null 2>&1 || true; ip route add default via 198.19.241.2 dev eth0"
+NODE_B_PRIVATE_IFACE="$(private_iface_for_ip node-b 172.30.242.3/24)"
+[[ -n "$NODE_B_PRIVATE_IFACE" ]]
+
 "${COMPOSE[@]}" exec -T node-b sh -lc \
-  "ip route del default >/dev/null 2>&1 || true; ip route add default via 198.19.242.2 dev eth0"
+  "ip route del default >/dev/null 2>&1 || true; ip route add default via 172.30.242.2 dev $NODE_B_PRIVATE_IFACE"
 
 for node in node-a node-b; do
   "${COMPOSE[@]}" exec -T "$node" nvpn init --force >/dev/null
 done
 
-ALICE_NPUB="$("${COMPOSE[@]}" exec -T node-a sh -lc \
-  "grep -m1 '^public_key' '$CONFIG_PATH' | cut -d '\"' -f 2" | tr -d '\r')"
-BOB_NPUB="$("${COMPOSE[@]}" exec -T node-b sh -lc \
-  "grep -m1 '^public_key' '$CONFIG_PATH' | cut -d '\"' -f 2" | tr -d '\r')"
+ALICE_NPUB="$(nostr_pubkey_from_config node-a)"
+BOB_NPUB="$(nostr_pubkey_from_config node-b)"
 
 if [[ -z "$ALICE_NPUB" || -z "$BOB_NPUB" ]]; then
   echo "nat docker e2e failed: unable to resolve node npubs" >&2
@@ -151,8 +181,8 @@ for _ in $(seq 1 60); do
     && grep -q '"status_source":"daemon"' <<<"$BOB_COMPACT" \
     && grep -q '"running":true' <<<"$ALICE_COMPACT" \
     && grep -q '"running":true' <<<"$BOB_COMPACT" \
-    && [[ "$ALICE_ANNOUNCED_ENDPOINT" == "10.254.241.11:51820" ]] \
-    && [[ "$BOB_ANNOUNCED_ENDPOINT" == "10.254.241.10:51820" ]] \
+    && [[ "$ALICE_ANNOUNCED_ENDPOINT" == "203.0.113.11:51820" ]] \
+    && [[ "$BOB_ANNOUNCED_ENDPOINT" == "203.0.113.10:51820" ]] \
     && [[ -n "$ALICE_ANNOUNCED_ENDPOINT" ]] \
     && [[ -n "$BOB_ANNOUNCED_ENDPOINT" ]] \
     && [[ -n "$ALICE_TUNNEL_IP" ]] \
@@ -175,11 +205,11 @@ grep -q '"running":true' <<<"$BOB_COMPACT"
 ALICE_ANNOUNCED_ENDPOINT="$(printf '%s' "$ALICE_COMPACT" | peer_announced_endpoint_from_status)"
 BOB_ANNOUNCED_ENDPOINT="$(printf '%s' "$BOB_COMPACT" | peer_announced_endpoint_from_status)"
 
-if [[ "$ALICE_ANNOUNCED_ENDPOINT" != "10.254.241.11:51820" ]]; then
+if [[ "$ALICE_ANNOUNCED_ENDPOINT" != "203.0.113.11:51820" ]]; then
   echo "nat docker e2e failed: alice did not observe bob's public endpoint announcement ('$ALICE_ANNOUNCED_ENDPOINT')" >&2
   exit 1
 fi
-if [[ "$BOB_ANNOUNCED_ENDPOINT" != "10.254.241.10:51820" ]]; then
+if [[ "$BOB_ANNOUNCED_ENDPOINT" != "203.0.113.10:51820" ]]; then
   echo "nat docker e2e failed: bob did not observe alice's public endpoint announcement ('$BOB_ANNOUNCED_ENDPOINT')" >&2
   exit 1
 fi
@@ -210,4 +240,4 @@ cat /tmp/nvpn-nat-ping-a.log
 echo "--- Ping B -> A ---"
 cat /tmp/nvpn-nat-ping-b.log
 
-echo "nat docker e2e passed: daemon-mode Nostr signaling, public endpoint discovery, boringtun tunnel handshake, and ping succeeded across separate Docker NATs"
+echo "nat docker e2e passed: daemon-mode Nostr signaling, public endpoint discovery, NAT punching from a private node to a public peer, boringtun tunnel handshake, and ping succeeded"

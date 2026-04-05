@@ -237,7 +237,7 @@ fn record_successful_runtime_paths_ignores_cross_subnet_local_runtime_endpoint()
 }
 
 #[test]
-fn runtime_peer_endpoint_refresh_waits_for_handshake() {
+fn runtime_peer_endpoint_refreshes_cross_subnet_local_drift_without_handshake() {
     let participant = "11".repeat(32);
     let announcement = PeerAnnouncement {
         node_id: "peer-a".to_string(),
@@ -272,7 +272,7 @@ fn runtime_peer_endpoint_refresh_waits_for_handshake() {
         },
     )]);
 
-    assert!(!runtime_peer_endpoints_require_refresh(
+    assert!(runtime_peer_endpoints_require_refresh(
         &planned,
         &announcements,
         Some(&runtime_peers),
@@ -546,16 +546,20 @@ fn nat_punch_targets_keep_stale_exit_peer_even_when_another_peer_is_online() {
         ),
     ]);
 
-    assert!(
+    assert_eq!(
         pending_nat_punch_targets_for_local_endpoint(
             &config,
             None,
             &announcements,
             Some(&runtime_peers),
             "198.19.241.3:51820",
-        )
-        .is_empty(),
-        "a selected exit peer on a public endpoint should not tear the tunnel down for NAT punching"
+        ),
+        vec![
+            "203.0.113.21:51820"
+                .parse::<SocketAddr>()
+                .expect("stale exit peer socket addr")
+        ],
+        "a stale selected exit peer should still receive NAT punches so it can recover direct reachability"
     );
 }
 

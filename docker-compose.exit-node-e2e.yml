@@ -6,7 +6,7 @@ services:
     command: ["nostr-vpn-relay", "--bind", "0.0.0.0:8080"]
     networks:
       internet:
-        ipv4_address: 203.0.113.2
+        ipv4_address: 198.51.100.2
 
   reflector:
     build:
@@ -15,7 +15,32 @@ services:
     command: ["nvpn-reflector", "--bind", "0.0.0.0:3478"]
     networks:
       internet:
-        ipv4_address: 203.0.113.3
+        ipv4_address: 198.51.100.3
+
+  internet-target:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      internet:
+        ipv4_address: 198.51.100.100
+
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    entrypoint: ["sleep", "infinity"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - relay
+      - reflector
+    networks:
+      internet:
+        ipv4_address: 198.51.100.10
 
   nat-b:
     build:
@@ -32,36 +57,20 @@ services:
       - -lc
       - |
         set -e
-        public_iface="$$(ip -o -4 addr show | awk '$$4 == "203.0.113.11/24" { print $$2; exit }')"
+        public_iface="$$(ip -o -4 addr show | awk '$$4 == "198.51.100.11/24" { print $$2; exit }')"
         private_iface="$$(ip -o -4 addr show | awk '$$4 == "172.30.242.2/24" { print $$2; exit }')"
         test -n "$$public_iface"
         test -n "$$private_iface"
         iptables -P FORWARD ACCEPT
         iptables -t nat -A PREROUTING -i "$$public_iface" -p udp --dport 51820 -j DNAT --to-destination 172.30.242.3:51820
-        iptables -t nat -A POSTROUTING -o "$$public_iface" -s 172.30.242.0/24 -p udp --sport 51820 -j SNAT --to-source 203.0.113.11:51820
+        iptables -t nat -A POSTROUTING -o "$$public_iface" -s 172.30.242.0/24 -p udp --sport 51820 -j SNAT --to-source 198.51.100.11:51820
         iptables -t nat -A POSTROUTING -o "$$public_iface" -s 172.30.242.0/24 -j MASQUERADE
         sleep infinity
     networks:
       private-b:
         ipv4_address: 172.30.242.2
       internet:
-        ipv4_address: 203.0.113.11
-
-  node-a:
-    build:
-      context: .
-      dockerfile: Dockerfile.e2e
-    entrypoint: ["sleep", "infinity"]
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    depends_on:
-      - relay
-      - reflector
-    networks:
-      internet:
-        ipv4_address: 203.0.113.10
+        ipv4_address: 198.51.100.11
 
   node-b:
     build:
@@ -85,7 +94,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 203.0.113.0/24
+        - subnet: 198.51.100.0/24
   private-b:
     driver: bridge
     ipam:

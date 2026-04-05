@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE=(docker compose -f "$ROOT_DIR/docker-compose.e2e.yml")
+PROJECT_NAME="nostr-vpn-e2e-roster-admin"
+COMPOSE=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/docker-compose.e2e.yml")
 
 NETWORK_ID="docker-roster-admin"
 RELAY_URL="ws://10.203.0.2:8080"
@@ -16,8 +17,29 @@ CAROL_TUNNEL_IP="10.44.0.12/32"
 
 cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker network rm "${PROJECT_NAME}_e2e" >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    docker network inspect "${PROJECT_NAME}_e2e" >/dev/null 2>&1 || break
+    sleep 1
+  done
 }
 trap cleanup EXIT
+
+wait_for_service() {
+  local service="$1"
+  local container_id=""
+  for _ in $(seq 1 30); do
+    container_id="$("${COMPOSE[@]}" ps -q "$service" 2>/dev/null || true)"
+    if [[ -n "$container_id" ]] \
+      && [[ "$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || true)" == "true" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "roster/admin docker e2e failed: service '$service' did not reach running state" >&2
+  exit 1
+}
 
 toml_array() {
   local result="["
@@ -38,7 +60,14 @@ toml_array() {
 read_npub() {
   local service="$1"
   "${COMPOSE[@]}" exec -T "$service" sh -lc \
-    "nvpn init --force >/dev/null && grep -m1 '^public_key' /root/.config/nvpn/config.toml | cut -d '\"' -f 2"
+    "nvpn init --force >/dev/null && awk '
+      /^\\[nostr\\]$/ { in_nostr = 1; next }
+      /^\\[/ { in_nostr = 0 }
+      in_nostr && /^public_key[[:space:]]*=/ {
+        print \$3;
+        exit
+      }
+    ' /root/.config/nvpn/config.toml" | tr -d '\r\"'
 }
 
 start_daemon() {
@@ -105,6 +134,26 @@ config_array_block() {
   local key="$2"
   "${COMPOSE[@]}" exec -T "$service" sh -lc \
     "perl -0ne 'if (/^${key}\\s*=\\s*(\\[[^\\]]*\\])/ms) { print \$1 }' /root/.config/nvpn/config.toml"
+}
+
+shared_roster_updated_at() {
+  local service="$1"
+  "${COMPOSE[@]}" exec -T "$service" sh -lc \
+    "perl -0ne 'print \$1 if /^shared_roster_updated_at\\s*=\\s*(\\d+)/m' /root/.config/nvpn/config.toml"
+}
+
+next_shared_roster_updated_at() {
+  local service="$1"
+  local current=""
+  local now=""
+
+  current="$(shared_roster_updated_at "$service" || true)"
+  now="$(date +%s)"
+  if [[ "$current" =~ ^[0-9]+$ && "$current" -ge "$now" ]]; then
+    printf '%s' "$((current + 1))"
+  else
+    printf '%s' "$now"
+  fi
 }
 
 wait_for_config_array_contains() {
@@ -182,7 +231,7 @@ set_membership() {
   local signer="$4"
   local inviter="$5"
   local shared_at
-  shared_at="$(date +%s)"
+  shared_at="$(next_shared_roster_updated_at "$service")"
 
   "${COMPOSE[@]}" exec -T \
     -e PARTICIPANTS_TOML="$participants_toml" \
@@ -225,7 +274,7 @@ set_peer_alias() {
   local alias="$3"
   local signer="$4"
   local shared_at
-  shared_at="$(date +%s)"
+  shared_at="$(next_shared_roster_updated_at "$service")"
 
   "${COMPOSE[@]}" exec -T \
     -e PARTICIPANT="$participant" \
@@ -283,7 +332,9 @@ cleanup
 
 "${COMPOSE[@]}" build >/dev/null
 "${COMPOSE[@]}" up -d relay node-a node-b node-c >/dev/null
-sleep 3
+for service in relay node-a node-b node-c; do
+  wait_for_service "$service"
+done
 
 ALICE_NPUB="$(read_npub node-a)"
 BOB_NPUB="$(read_npub node-b)"

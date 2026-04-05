@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE=(docker compose -f "$ROOT_DIR/docker-compose.e2e.yml")
+PROJECT_NAME="nostr-vpn-e2e-active-network"
+COMPOSE=(docker compose -p "$PROJECT_NAME" -f "$ROOT_DIR/docker-compose.e2e.yml")
 
 ACTIVE_NETWORK_ID="docker-active-home"
 INACTIVE_NETWORK_ID="docker-saved-work"
@@ -10,21 +11,60 @@ RELAY_URL="ws://10.203.0.2:8080"
 
 cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker network rm "${PROJECT_NAME}_e2e" >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    docker network inspect "${PROJECT_NAME}_e2e" >/dev/null 2>&1 || break
+    sleep 1
+  done
 }
 trap cleanup EXIT
+
+wait_for_service() {
+  local service="$1"
+  local container_id=""
+  for _ in $(seq 1 30); do
+    container_id="$("${COMPOSE[@]}" ps -q "$service" 2>/dev/null || true)"
+    if [[ -n "$container_id" ]] \
+      && [[ "$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || true)" == "true" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "active network e2e failed: service '$service' did not reach running state" >&2
+  exit 1
+}
+
+nostr_pubkey_from_config() {
+  local service="$1"
+  local config_path="${2:-/root/.config/nvpn/config.toml}"
+  "${COMPOSE[@]}" exec -T "$service" sh -lc "
+    awk '
+      /^\\[nostr\\]$/ { in_nostr = 1; next }
+      /^\\[/ { in_nostr = 0 }
+      in_nostr && /^public_key[[:space:]]*=/ {
+        print \$3;
+        exit
+      }
+    ' '$config_path'
+  " | tr -d '\r\"'
+}
 
 cleanup
 
 "${COMPOSE[@]}" build >/dev/null
 "${COMPOSE[@]}" up -d relay node-a node-b >/dev/null
-sleep 3
+for service in relay node-a node-b; do
+  wait_for_service "$service"
+done
 
-ALICE_NPUB="$("${COMPOSE[@]}" exec -T node-a sh -lc \
-  "nvpn init --force >/dev/null && grep -m1 '^public_key' /root/.config/nvpn/config.toml | cut -d '\"' -f 2")"
-BOB_NPUB="$("${COMPOSE[@]}" exec -T node-b sh -lc \
-  "nvpn init --force >/dev/null && grep -m1 '^public_key' /root/.config/nvpn/config.toml | cut -d '\"' -f 2")"
-PHANTOM_NPUB="$("${COMPOSE[@]}" exec -T node-a sh -lc \
-  "rm -f /tmp/phantom.toml && nvpn init --config /tmp/phantom.toml --force >/dev/null && grep -m1 '^public_key' /tmp/phantom.toml | cut -d '\"' -f 2")"
+"${COMPOSE[@]}" exec -T node-a nvpn init --force >/dev/null
+"${COMPOSE[@]}" exec -T node-b nvpn init --force >/dev/null
+"${COMPOSE[@]}" exec -T node-a sh -lc \
+  "rm -f /tmp/phantom.toml && nvpn init --config /tmp/phantom.toml --force >/dev/null"
+ALICE_NPUB="$(nostr_pubkey_from_config node-a)"
+BOB_NPUB="$(nostr_pubkey_from_config node-b)"
+PHANTOM_NPUB="$(nostr_pubkey_from_config node-a /tmp/phantom.toml)"
 
 if [[ -z "$ALICE_NPUB" || -z "$BOB_NPUB" || -z "$PHANTOM_NPUB" ]]; then
   echo "active network e2e failed: unable to resolve participant npubs" >&2
@@ -81,8 +121,8 @@ if [[ "$ALICE_TUNNEL_IP_BEFORE" != "$ALICE_TUNNEL_IP_AFTER" ]]; then
   exit 1
 fi
 
-"${COMPOSE[@]}" exec -T node-a sh -lc "nvpn connect > /tmp/connect.log 2>&1 &"
-"${COMPOSE[@]}" exec -T node-b sh -lc "nvpn connect > /tmp/connect.log 2>&1 &"
+"${COMPOSE[@]}" exec -d node-a sh -lc "nvpn connect > /tmp/connect.log 2>&1"
+"${COMPOSE[@]}" exec -d node-b sh -lc "nvpn connect > /tmp/connect.log 2>&1"
 
 for _ in $(seq 1 30); do
   ALICE_CONNECT_LOGS="$("${COMPOSE[@]}" exec -T node-a sh -lc 'cat /tmp/connect.log 2>/dev/null || true')"

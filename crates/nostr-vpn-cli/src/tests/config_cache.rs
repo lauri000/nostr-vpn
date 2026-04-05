@@ -66,6 +66,39 @@ fn participants_override_targets_the_active_network() {
 }
 
 #[test]
+fn participants_override_preserves_selected_exit_node_when_it_remains_a_member() {
+    let exit_peer = Keys::generate().public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    config.exit_node = exit_peer.clone();
+
+    apply_participants_override(&mut config, vec![exit_peer.clone()]).expect("apply override");
+
+    assert_eq!(config.participant_pubkeys_hex(), vec![exit_peer.clone()]);
+    assert_eq!(config.exit_node, exit_peer);
+}
+
+#[test]
+fn participants_override_marks_shared_roster_updated_for_admin_owned_network() {
+    let member = Keys::generate().public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    let own_pubkey = config
+        .own_nostr_pubkey_hex()
+        .expect("own nostr pubkey");
+    config.networks[0].admins = vec![own_pubkey.clone()];
+    config.networks[0].shared_roster_updated_at = 0;
+    config.networks[0].shared_roster_signed_by.clear();
+
+    apply_participants_override(&mut config, vec![member.clone()]).expect("apply override");
+
+    let active_network = config.active_network();
+    assert_eq!(active_network.participants, vec![member]);
+    assert!(active_network.shared_roster_updated_at > 0);
+    assert_eq!(active_network.shared_roster_signed_by, own_pubkey);
+}
+
+#[test]
 fn active_network_invite_code_roundtrips_current_roster() {
     let inviter_hex = Keys::generate().public_key().to_hex();
     let participant_hex = Keys::generate().public_key().to_hex();

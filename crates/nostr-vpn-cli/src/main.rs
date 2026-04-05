@@ -3029,9 +3029,9 @@ impl CliTunnelRuntime {
             }
 
             #[cfg(target_os = "linux")]
-            apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
-            #[cfg(target_os = "linux")]
             self.reconcile_linux_endpoint_bypass_routes(&endpoint_bypass_specs);
+            #[cfg(target_os = "linux")]
+            apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
             #[cfg(target_os = "macos")]
             {
                 self.reconcile_macos_endpoint_bypass_routes(&endpoint_bypass_specs);
@@ -3201,6 +3201,10 @@ impl CliTunnelRuntime {
         {
             self.handle.is_some()
         }
+    }
+
+    pub(crate) fn owns_interface(&self, iface: &str) -> bool {
+        self.iface == iface
     }
 
     #[cfg(target_os = "windows")]
@@ -4631,7 +4635,7 @@ fn runtime_peer_endpoints_require_refresh(
                 ) {
                     return None;
                 }
-                Some(runtime.has_handshake() || !endpoint_is_local_only(runtime_endpoint))
+                Some(true)
             })
             .unwrap_or(false)
     })
@@ -5319,7 +5323,6 @@ fn pending_nat_punch_targets_for_local_endpoints(
     runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
     own_local_endpoints: &[String],
 ) -> Vec<SocketAddr> {
-    let selected_exit_node = selected_exit_node_participant(app, own_pubkey, peer_announcements);
     let now = unix_timestamp();
     let mut targets = app
         .participant_pubkeys_hex()
@@ -5354,12 +5357,6 @@ fn pending_nat_punch_targets_for_local_endpoints(
                 &selected_endpoint,
                 own_local_endpoints,
             ) {
-                return None;
-            }
-
-            if selected_exit_node.as_deref() == Some(participant.as_str())
-                && !endpoint_is_local_only(&selected_endpoint)
-            {
                 return None;
             }
 
@@ -6041,8 +6038,8 @@ fn stop_daemon(args: StopArgs) -> Result<()> {
 }
 
 fn stop_daemon_remaining_hint(
-    config_path: &Path,
-    remaining: &[u32],
+    #[allow(unused_variables)] config_path: &Path,
+    #[allow(unused_variables)] remaining: &[u32],
     requested_control_stop: bool,
 ) -> String {
     #[cfg(target_os = "macos")]

@@ -13,6 +13,18 @@ pub(crate) fn reset_tunnel_runtime_after_macos_underlay_repair(
 ) {
 }
 
+fn prefer_nonself_tunnel_snapshot(
+    tunnel_runtime: &CliTunnelRuntime,
+    previous: &crate::diagnostics::NetworkSnapshot,
+    latest: crate::diagnostics::NetworkSnapshot,
+) -> crate::diagnostics::NetworkSnapshot {
+    let latest = crate::diagnostics::prefer_nonempty_network_snapshot(previous, latest);
+    match latest.default_interface.as_deref() {
+        Some(iface) if tunnel_runtime.owns_interface(iface) => previous.clone(),
+        _ => latest,
+    }
+}
+
 pub(crate) async fn connect_session(args: ConnectArgs) -> Result<()> {
     if args.iface.trim().is_empty() {
         return Err(anyhow!("--iface must not be empty"));
@@ -234,7 +246,8 @@ pub(crate) async fn connect_session(args: ConnectArgs) -> Result<()> {
                     };
                 #[cfg(not(target_os = "macos"))]
                 let underlay_repaired = false;
-                let latest_snapshot = crate::diagnostics::prefer_nonempty_network_snapshot(
+                let latest_snapshot = prefer_nonself_tunnel_snapshot(
+                    &tunnel_runtime,
                     &network_snapshot,
                     capture_network_snapshot(),
                 );
@@ -1038,7 +1051,8 @@ pub(crate) async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     };
                 #[cfg(not(target_os = "macos"))]
                 let underlay_repaired = false;
-                let latest_snapshot = crate::diagnostics::prefer_nonempty_network_snapshot(
+                let latest_snapshot = prefer_nonself_tunnel_snapshot(
+                    &tunnel_runtime,
                     &network_snapshot,
                     capture_network_snapshot(),
                 );
@@ -2319,4 +2333,34 @@ pub(crate) fn persist_daemon_runtime_state(
             relay_operator,
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn prefer_nonself_tunnel_snapshot_ignores_tunnel_default_interface() {
+        let tunnel_runtime = CliTunnelRuntime::new("utun100");
+        let previous = crate::diagnostics::NetworkSnapshot {
+            default_interface: Some("eth0".to_string()),
+            primary_ipv4: Some(Ipv4Addr::new(192, 168, 64, 2)),
+            primary_ipv6: None,
+            gateway_ipv4: Some(Ipv4Addr::new(192, 168, 64, 1)),
+            gateway_ipv6: None,
+        };
+        let latest = crate::diagnostics::NetworkSnapshot {
+            default_interface: Some("utun100".to_string()),
+            primary_ipv4: Some(Ipv4Addr::new(10, 44, 210, 253)),
+            primary_ipv6: None,
+            gateway_ipv4: None,
+            gateway_ipv6: None,
+        };
+
+        let preferred = prefer_nonself_tunnel_snapshot(&tunnel_runtime, &previous, latest);
+
+        assert_eq!(preferred.default_interface.as_deref(), Some("eth0"));
+        assert_eq!(preferred.primary_ipv4, Some(Ipv4Addr::new(192, 168, 64, 2)));
+    }
 }
