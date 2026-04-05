@@ -121,3 +121,17 @@ fn hello_signal_forces_targeted_private_announce_republish() {
     );
     assert!(!book.needs_send("peer-a", "fp1"));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_underlay_repair_resets_tunnel_runtime() {
+    let mut runtime = CliTunnelRuntime::new("utun4");
+    runtime.last_fingerprint = Some("fingerprint".to_string());
+    runtime.active_listen_port = Some(51820);
+
+    crate::session_runtime::reset_tunnel_runtime_after_macos_underlay_repair(&mut runtime);
+
+    assert!(runtime.last_fingerprint.is_none());
+    assert!(runtime.active_listen_port.is_none());
+    assert!(!runtime.is_running());
+}

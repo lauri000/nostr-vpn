@@ -1,5 +1,12 @@
 use super::*;
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn reset_tunnel_runtime_after_macos_underlay_repair(
+    tunnel_runtime: &mut CliTunnelRuntime,
+) {
+    tunnel_runtime.stop();
+}
+
 pub(crate) async fn connect_session(args: ConnectArgs) -> Result<()> {
     if args.iface.trim().is_empty() {
         return Err(anyhow!("--iface must not be empty"));
@@ -273,7 +280,7 @@ pub(crate) async fn connect_session(args: ConnectArgs) -> Result<()> {
                         println!("connect: network change detected; refreshing paths");
                     }
                     if underlay_repaired {
-                        tunnel_runtime.last_fingerprint = None;
+                        reset_tunnel_runtime_after_macos_underlay_repair(&mut tunnel_runtime);
                     }
                     last_nat_punch_attempt = None;
                     if let Err(error) = apply_presence_runtime_update(
@@ -1087,7 +1094,7 @@ pub(crate) async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         eprintln!("daemon: refreshing tunnel after macOS underlay repair");
                     }
                     if underlay_repaired {
-                        tunnel_runtime.last_fingerprint = None;
+                        reset_tunnel_runtime_after_macos_underlay_repair(&mut tunnel_runtime);
                     }
                     last_nat_punch_attempt = None;
                     match apply_presence_runtime_update(
