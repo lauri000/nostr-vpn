@@ -281,6 +281,50 @@ fn runtime_peer_endpoint_refresh_waits_for_handshake() {
 }
 
 #[test]
+fn runtime_peer_endpoint_refreshes_stale_public_port_without_handshake() {
+    let participant = "11".repeat(32);
+    let announcement = PeerAnnouncement {
+        node_id: "peer-a".to_string(),
+        public_key: generate_keypair().public_key,
+        endpoint: "89.27.103.157:44665".to_string(),
+        local_endpoint: Some("192.168.64.2:51820".to_string()),
+        public_endpoint: Some("89.27.103.157:44665".to_string()),
+        relay_endpoint: None,
+        relay_pubkey: None,
+        relay_expires_at: None,
+        tunnel_ip: "10.44.0.2/32".to_string(),
+        advertised_routes: vec!["0.0.0.0/0".to_string()],
+        timestamp: 10,
+    };
+    let planned = vec![PlannedTunnelPeer {
+        participant: participant.clone(),
+        endpoint: "89.27.103.157:44665".to_string(),
+        peer: TunnelPeer {
+            pubkey_hex: key_b64_to_hex(&announcement.public_key).expect("peer pubkey hex"),
+            endpoint: "89.27.103.157:44665".to_string(),
+            allowed_ips: vec!["10.44.0.2/32".to_string()],
+        },
+    }];
+    let announcements = HashMap::from([(participant, announcement)]);
+    let runtime_peers = HashMap::from([(
+        planned[0].peer.pubkey_hex.clone(),
+        WireGuardPeerStatus {
+            endpoint: Some("89.27.103.157:44157".to_string()),
+            last_handshake_sec: None,
+            last_handshake_nsec: None,
+            ..WireGuardPeerStatus::default()
+        },
+    )]);
+
+    assert!(runtime_peer_endpoints_require_refresh(
+        &planned,
+        &announcements,
+        Some(&runtime_peers),
+        &["192.168.64.2:51820".to_string()],
+    ));
+}
+
+#[test]
 fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expires() {
     let now = unix_timestamp();
     let mut config = AppConfig::generated();

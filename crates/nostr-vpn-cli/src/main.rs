@@ -4608,16 +4608,25 @@ fn runtime_peer_endpoints_require_refresh(
         };
         runtime_peers
             .get(&planned.peer.pubkey_hex)
-            .filter(|runtime| runtime.has_handshake())
-            .and_then(|runtime| runtime.endpoint.as_deref())
-            .is_some_and(|runtime_endpoint| {
-                runtime_endpoint_requires_refresh(
+            .and_then(|runtime| {
+                let runtime_endpoint = runtime.endpoint.as_deref()?;
+                if !runtime.has_handshake()
+                    && !endpoint_is_local_only(runtime_endpoint)
+                    && runtime_endpoint != planned.endpoint
+                {
+                    return Some(true);
+                }
+                if !runtime_endpoint_requires_refresh(
                     runtime_endpoint,
                     &planned.endpoint,
                     announcement,
                     own_local_endpoints,
-                )
+                ) {
+                    return None;
+                }
+                Some(runtime.has_handshake() || !endpoint_is_local_only(runtime_endpoint))
             })
+            .unwrap_or(false)
     })
 }
 
