@@ -1,0 +1,17 @@
+services:
+  web:
+    image: ${NOSTR_VPN_IMAGE:-nostr-vpn-umbrel:local}
+    restart: on-failure
+    stop_grace_period: 1m
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      HOME: /data/home
+      XDG_CONFIG_HOME: /data/config
+      NVPN_CLI_PATH: /usr/local/bin/nvpn
+      RUST_LOG: info
+    volumes:
+      - ${APP_DATA_DIR:-./.data}:/data

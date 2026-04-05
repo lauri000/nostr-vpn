@@ -52,7 +52,26 @@ start_daemon() {
 
 reload_daemon() {
   local service="$1"
-  "${COMPOSE[@]}" exec -T "$service" nvpn reload >/dev/null
+  local output=""
+
+  for _ in $(seq 1 10); do
+    if output="$("${COMPOSE[@]}" exec -T "$service" nvpn reload 2>&1)"; then
+      return 0
+    fi
+
+    if grep -q "did not acknowledge control request" <<<"$output"; then
+      sleep 1
+      continue
+    fi
+
+    echo "roster/admin docker e2e failed: daemon reload failed on $service" >&2
+    echo "$output" >&2
+    exit 1
+  done
+
+  echo "roster/admin docker e2e failed: daemon reload never acknowledged on $service" >&2
+  echo "$output" >&2
+  exit 1
 }
 
 status_connected_peer_count() {
@@ -128,6 +147,34 @@ wait_for_config_array_lacks() {
   exit 1
 }
 
+config_peer_alias() {
+  local service="$1"
+  local participant="$2"
+  "${COMPOSE[@]}" exec -T "$service" sh -lc \
+    "grep -m1 '^$participant = ' /root/.config/nvpn/config.toml | cut -d '\"' -f 2"
+}
+
+wait_for_peer_alias() {
+  local service="$1"
+  local participant="$2"
+  local expected="$3"
+  local description="$4"
+  local current=""
+
+  for _ in $(seq 1 60); do
+    current="$(config_peer_alias "$service" "$participant" || true)"
+    if [[ "$current" == "$expected" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "roster/admin docker e2e failed: $description" >&2
+  echo "expected alias '$expected' for $participant on $service, got '$current'" >&2
+  "${COMPOSE[@]}" exec -T "$service" sh -lc "sed -n '/^\\[peer_aliases\\]/,/^\\[/p' /root/.config/nvpn/config.toml" >&2 || true
+  exit 1
+}
+
 set_membership() {
   local service="$1"
   local participants_toml="$2"
@@ -168,6 +215,40 @@ perl -0pe '"'"'
   } else {
     s/^shared_roster_updated_at\s*=.*$/shared_roster_updated_at = $ENV{SHARED_AT}\nshared_roster_signed_by = "$ENV{SHARED_BY}"/m;
   }
+'"'"' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+'
+}
+
+set_peer_alias() {
+  local service="$1"
+  local participant="$2"
+  local alias="$3"
+  local signer="$4"
+  local shared_at
+  shared_at="$(date +%s)"
+
+  "${COMPOSE[@]}" exec -T \
+    -e PARTICIPANT="$participant" \
+    -e ALIAS_VALUE="$alias" \
+    -e SHARED_BY="$signer" \
+    -e SHARED_AT="$shared_at" \
+    "$service" sh -lc '
+cfg=/root/.config/nvpn/config.toml
+tmp=$(mktemp)
+perl -0pe '"'"'
+  my $participant = $ENV{PARTICIPANT};
+  my $alias = $ENV{ALIAS_VALUE};
+
+  if (/^\Q$participant\E\s*=/m) {
+    s/^\Q$participant\E\s*=.*$/$participant = "$alias"/m;
+  } elsif (/^\[peer_aliases\]\s*$/m) {
+    s/^\[peer_aliases\]\s*$/[peer_aliases]\n$participant = "$alias"/m;
+  } else {
+    $_ .= "\n[peer_aliases]\n$participant = \"$alias\"\n";
+  }
+
+  s/^shared_roster_updated_at\s*=.*$/shared_roster_updated_at = $ENV{SHARED_AT}/m;
+  s/^shared_roster_signed_by\s*=.*$/shared_roster_signed_by = "$ENV{SHARED_BY}"/m;
 '"'"' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
 '
 }
@@ -280,6 +361,12 @@ if ! ping_until_success node-c 10.44.0.10 /tmp/nvpn-roster-admin-c-to-a.log; the
   exit 1
 fi
 
+set_peer_alias node-b "$ALICE_NPUB" "founder" "$BOB_NPUB"
+reload_daemon node-b
+
+wait_for_peer_alias node-c "$ALICE_NPUB" "founder" \
+  "carol never applied bob's signed alias update for alice"
+
 set_membership node-b "$AB_PARTICIPANTS" "$AB_ADMINS" "$BOB_NPUB" "$ALICE_NPUB"
 reload_daemon node-b
 
@@ -336,6 +423,8 @@ echo "--- Carol participants line ---"
 config_array_block node-c participants
 echo "--- Carol admins line ---"
 config_array_block node-c admins
+echo "--- Carol peer aliases ---"
+"${COMPOSE[@]}" exec -T node-c sh -lc "sed -n '/^\\[peer_aliases\\]/,/^\\[/p' /root/.config/nvpn/config.toml"
 echo "--- Carol ping after first add ---"
 cat /tmp/nvpn-roster-admin-c-to-a.log
 echo "--- Carol ping after removal ---"
@@ -343,4 +432,4 @@ cat /tmp/nvpn-roster-admin-c-to-a-removed.log
 echo "--- Carol ping after rejoin ---"
 cat /tmp/nvpn-roster-admin-c-to-a-rejoined.log
 
-echo "roster/admin docker e2e passed: admin promotion propagated, a promoted admin removed and re-added a participant, the participant rejoined, and the new admin removed the old admin across peers"
+echo "roster/admin docker e2e passed: admin promotion propagated, alias changes propagated, a promoted admin removed and re-added a participant, the participant rejoined, and the new admin removed the old admin across peers"

@@ -4,6 +4,7 @@ dist/
 .codex_tmp*
 crates/nostr-vpn-gui/node_modules
 crates/nostr-vpn-gui/dist
+umbrel/.data
 crates/nostr-vpn-gui/src-tauri/target
 crates/nostr-vpn-gui/src-tauri/gen/android/key.properties
 **/*.rs.bk

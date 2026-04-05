@@ -1,0 +1,339 @@
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process'
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import os from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import process from 'node:process'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+import { normalizeTag, readWorkspaceVersionTag, splitCsv } from './local-release-lib.mjs'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const repoRoot = resolve(__dirname, '..')
+const rootCargoToml = join(repoRoot, 'Cargo.toml')
+const umbrelDir = join(repoRoot, 'umbrel')
+const baseManifestPath = join(umbrelDir, 'umbrel-app.yml')
+const baseIconPath = join(umbrelDir, 'icon.svg')
+
+function usage() {
+  console.log(`Usage: node scripts/umbrel-release.mjs [options]
+
+Generate a submission-ready Umbrel app bundle with a pinned container image.
+
+Options:
+  --image-ref <ref>       Full pinned image reference (repo:tag@sha256:...)
+  --push                  Build and push the multi-arch image before rendering
+  --image-repo <repo>     Registry repository to push (required with --push)
+  --tag <tag>             Release tag (defaults to workspace version)
+  --platforms <csv>       Target platforms (default: linux/amd64,linux/arm64)
+  --output-dir <path>     Bundle output directory (default: dist/umbrel-vX.Y.Z)
+  --dry-run               Print actions without writing a bundle
+  --help                  Show this help
+
+Examples:
+  node scripts/umbrel-release.mjs \\
+    --image-ref ghcr.io/example/nostr-vpn-umbrel:v0.3.4@sha256:...
+
+  node scripts/umbrel-release.mjs \\
+    --push \\
+    --image-repo ghcr.io/example/nostr-vpn-umbrel`)
+}
+
+function parseArgs(argv) {
+  const options = {
+    dryRun: false,
+    imageRef: null,
+    imageRepo: null,
+    outputDir: null,
+    platforms: ['linux/amd64', 'linux/arm64'],
+    push: false,
+    tag: null,
+  }
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    switch (arg) {
+      case '--help':
+      case '-h':
+        usage()
+        process.exit(0)
+      case '--dry-run':
+        options.dryRun = true
+        break
+      case '--image-ref':
+        options.imageRef = argv[++index] ?? ''
+        break
+      case '--image-repo':
+        options.imageRepo = argv[++index] ?? ''
+        break
+      case '--output-dir':
+        options.outputDir = argv[++index] ?? ''
+        break
+      case '--platforms':
+      case '--platform':
+        options.platforms = splitCsv(argv[++index] ?? '')
+        break
+      case '--push':
+        options.push = true
+        break
+      case '--tag':
+        options.tag = normalizeTag(argv[++index] ?? '')
+        break
+      default:
+        throw new Error(`Unknown argument: ${arg}`)
+    }
+  }
+
+  return options
+}
+
+function quote(arg) {
+  const value = String(arg)
+  return /[^\w./:@=-]/.test(value) ? JSON.stringify(value) : value
+}
+
+function run(command, args, { capture = false, cwd = repoRoot, dryRun = false } = {}) {
+  const rendered = [command, ...args].map(quote).join(' ')
+  console.log(`$ ${rendered}`)
+
+  if (dryRun) {
+    return ''
+  }
+
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: capture ? 'pipe' : 'inherit',
+  })
+
+  if (result.status !== 0) {
+    const stderr = capture ? result.stderr.trim() : ''
+    throw new Error(stderr || `${command} exited with status ${result.status ?? 'unknown'}`)
+  }
+
+  return capture ? result.stdout.trim() : ''
+}
+
+function commandExists(command) {
+  const result =
+    process.platform === 'win32'
+      ? spawnSync('where', [command], { stdio: 'ignore' })
+      : spawnSync('sh', ['-lc', `command -v "${command}"`], { stdio: 'ignore' })
+  return result.status === 0
+}
+
+function resolveReleaseTag(explicitTag) {
+  if (explicitTag) {
+    return normalizeTag(explicitTag)
+  }
+  return readWorkspaceVersionTag(readFileSync(rootCargoToml, 'utf8'))
+}
+
+function defaultOutputDir(tag) {
+  return join(repoRoot, 'dist', `umbrel-${normalizeTag(tag)}`)
+}
+
+export function buildPinnedImageRef(imageRepo, tag, digest) {
+  const normalizedTag = normalizeTag(tag)
+  const trimmedRepo = String(imageRepo ?? '').trim().replace(/\/$/, '')
+  if (!trimmedRepo) {
+    throw new Error('Image repository must not be empty')
+  }
+  if (!/^sha256:[0-9a-f]{64}$/.test(String(digest ?? '').trim())) {
+    throw new Error(`Invalid image digest: ${digest}`)
+  }
+  return `${trimmedRepo}:${normalizedTag}@${digest.trim()}`
+}
+
+export function validatePinnedImageRef(imageRef) {
+  const trimmed = String(imageRef ?? '').trim()
+  if (!/^.+@sha256:[0-9a-f]{64}$/.test(trimmed)) {
+    throw new Error(`Expected a pinned image reference ending with @sha256:..., got: ${imageRef}`)
+  }
+  return trimmed
+}
+
+export function extractBuildxDigest(metadataText) {
+  const metadata = JSON.parse(metadataText)
+  const candidates = [
+    metadata['containerimage.digest'],
+    metadata.containerimage?.digest,
+    metadata['containerimage.descriptor']?.digest,
+    metadata.containerimage?.descriptor?.digest,
+  ]
+
+  const digest = candidates.find((value) => /^sha256:[0-9a-f]{64}$/.test(String(value ?? '')))
+  if (!digest) {
+    throw new Error('Could not find container image digest in docker buildx metadata')
+  }
+  return digest
+}
+
+function releaseNotesUrl(tag) {
+  return `https://github.com/mmalmi/nostr-vpn/releases/tag/${normalizeTag(tag)}`
+}
+
+function renderBundleReadme({ imageRef, tag }) {
+  return `# Nostr VPN Umbrel bundle
+
+This directory is a submission-ready Umbrel app bundle for ${normalizeTag(tag)}.
+
+Pinned image:
+
+\`${imageRef}\`
+
+Files:
+
+- \`docker-compose.yml\`: Umbrel app service definition
+- \`umbrel-app.yml\`: Umbrel metadata with synced version and release notes
+- \`icon.svg\`: app icon
+- \`IMAGE.txt\`: pinned container image reference used for this bundle
+
+To validate the compose file outside Umbrel, provide an app data directory:
+
+\`\`\`sh
+APP_DATA_DIR=/tmp/nvpn-umbrel docker compose -f docker-compose.yml config
+\`\`\`
+`
+}
+
+export function renderUmbrelCompose(imageRef) {
+  const pinnedRef = validatePinnedImageRef(imageRef)
+  return `version: "3.7"
+
+services:
+  web:
+    image: ${pinnedRef}
+    restart: on-failure
+    stop_grace_period: 1m
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      HOME: /data/home
+      XDG_CONFIG_HOME: /data/config
+      NVPN_CLI_PATH: /usr/local/bin/nvpn
+      RUST_LOG: info
+    volumes:
+      - \${APP_DATA_DIR}:/data
+`
+}
+
+export function renderUmbrelManifest(templateText, { tag, releaseNotes } = {}) {
+  const normalizedTag = normalizeTag(tag)
+  let manifest = templateText.replace(/^version: .*$/m, `version: "${normalizedTag}"`)
+  if (releaseNotes) {
+    manifest = manifest.replace(/^releaseNotes: .*$/m, `releaseNotes: "${releaseNotes}"`)
+  }
+  return manifest.endsWith('\n') ? manifest : `${manifest}\n`
+}
+
+function writeBundle({ imageRef, outputDir, tag }) {
+  rmSync(outputDir, { force: true, recursive: true })
+  mkdirSync(outputDir, { recursive: true })
+
+  copyFileSync(baseIconPath, join(outputDir, 'icon.svg'))
+  writeFileSync(join(outputDir, 'README.md'), renderBundleReadme({ imageRef, tag }))
+  writeFileSync(join(outputDir, 'docker-compose.yml'), renderUmbrelCompose(imageRef))
+  writeFileSync(
+    join(outputDir, 'umbrel-app.yml'),
+    renderUmbrelManifest(readFileSync(baseManifestPath, 'utf8'), {
+      releaseNotes: releaseNotesUrl(tag),
+      tag,
+    }),
+  )
+  writeFileSync(join(outputDir, 'IMAGE.txt'), `${imageRef}\n`)
+}
+
+function buildAndPushImage({ dryRun, imageRepo, platforms, tag }) {
+  if (!imageRepo) {
+    throw new Error('--image-repo is required with --push')
+  }
+  if (!commandExists('docker')) {
+    throw new Error('Missing docker; cannot build or push Umbrel image')
+  }
+
+  const tempDir = mkdtempSync(join(os.tmpdir(), 'nostr-vpn-umbrel-'))
+  const metadataPath = join(tempDir, 'buildx-metadata.json')
+
+  try {
+    run(
+      'docker',
+      [
+        'buildx',
+        'build',
+        '--platform',
+        platforms.join(','),
+        '--file',
+        'umbrel/Dockerfile',
+        '--tag',
+        `${imageRepo}:${tag}`,
+        '--metadata-file',
+        metadataPath,
+        '--push',
+        '.',
+      ],
+      { cwd: repoRoot, dryRun },
+    )
+
+    if (dryRun) {
+      return null
+    }
+
+    const digest = extractBuildxDigest(readFileSync(metadataPath, 'utf8'))
+    return buildPinnedImageRef(imageRepo, tag, digest)
+  } finally {
+    rmSync(tempDir, { force: true, recursive: true })
+  }
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv)
+  const tag = resolveReleaseTag(options.tag)
+  const outputDir = resolve(repoRoot, options.outputDir || defaultOutputDir(tag))
+
+  let imageRef = options.imageRef ? validatePinnedImageRef(options.imageRef) : null
+  if (!imageRef && options.push) {
+    imageRef = buildAndPushImage({
+      dryRun: options.dryRun,
+      imageRepo: options.imageRepo,
+      platforms: options.platforms,
+      tag,
+    })
+  }
+
+  if (!imageRef) {
+    if (options.dryRun && options.push) {
+      console.log('Dry run: image build command rendered; bundle not written because no digest is available.')
+      return
+    }
+    throw new Error('Pass --image-ref or use --push --image-repo')
+  }
+
+  if (options.dryRun) {
+    console.log(`Would write Umbrel bundle to ${outputDir}`)
+    console.log(`Pinned image: ${imageRef}`)
+    return
+  }
+
+  writeBundle({ imageRef, outputDir, tag })
+  console.log(`Wrote Umbrel bundle to ${outputDir}`)
+  console.log(`Pinned image: ${imageRef}`)
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  })
+}

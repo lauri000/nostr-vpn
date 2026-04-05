@@ -1,0 +1,22 @@
+manifestVersion: 1
+id: nostr-vpn
+category: networking
+name: Nostr VPN
+version: "v0.3.4"
+tagline: Private mesh VPN over Nostr
+description: >-
+  Nostr VPN turns your Umbrel into a Nostr-addressable mesh node with a web UI
+  for joining trusted peers and managing encrypted overlay networking.
+developer: mmalmi and contributors
+website: https://github.com/mmalmi/nostr-vpn
+repo: https://github.com/mmalmi/nostr-vpn
+support: https://github.com/mmalmi/nostr-vpn/issues
+dependencies: []
+port: 38080
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+deterministicPassword: false
+torOnly: false
+gallery: []
+releaseNotes: ""
