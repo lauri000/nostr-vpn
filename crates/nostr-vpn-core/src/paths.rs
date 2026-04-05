@@ -419,6 +419,14 @@ fn observed_endpoint_superseded_by_announcement(
         return false;
     }
 
+    // Keep previously selected/successful observed public ports alongside
+    // later announcements from the same host. Endpoint-dependent NATs can map
+    // different destinations to different public ports, so replacing a known
+    // working observed port with the newly announced port can break reconnects.
+    if tracked.last_selected_at.is_some() || tracked.last_success_at.is_some() {
+        return false;
+    }
+
     let Some(observed_host) = endpoint_host(endpoint) else {
         return false;
     };
@@ -554,5 +562,25 @@ mod tests {
             .expect("selected endpoint");
 
         assert_eq!(selected, "198.51.100.30:40002");
+    }
+
+    #[test]
+    fn refresh_from_announcement_keeps_observed_public_port_with_recent_success() {
+        let participant = "11".repeat(32);
+        let mut paths = PeerPathBook::default();
+        let announcement = sample_peer_announcement(None);
+
+        paths.refresh_from_announcement(participant.clone(), &announcement, 100);
+        paths.note_success(participant.clone(), "203.0.113.20:33063", 100);
+        paths.note_selected(participant.clone(), "203.0.113.20:33063", 100);
+
+        let refreshed = sample_peer_announcement(None);
+        paths.refresh_from_announcement(participant.clone(), &refreshed, 101);
+
+        let selected = paths
+            .select_endpoint_for_local_endpoints(&participant, &refreshed, &[], 101, 5)
+            .expect("selected endpoint");
+
+        assert_eq!(selected, "203.0.113.20:33063");
     }
 }
