@@ -118,9 +118,9 @@ use crate::network_signaling::{
 };
 pub(crate) use crate::platform_routing::*;
 pub(crate) use crate::relay_runtime::*;
-#[cfg(any(target_os = "linux", target_os = "windows", test))]
+#[cfg(test)]
 pub(crate) use crate::service_management::parse_nonzero_pid;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) use crate::service_management::{
     linux_service_executable_path_from_unit_contents, linux_service_status_from_show_output,
     linux_service_unit_content,
@@ -5537,6 +5537,16 @@ fn route_targets_for_planned_tunnel_peers(
             .iter()
             .map(|planned| planned.peer.clone())
             .collect::<Vec<_>>(),
+    );
+
+    #[cfg(not(any(target_os = "macos", test)))]
+    let _ = (
+        app,
+        own_pubkey,
+        peer_announcements,
+        path_book,
+        runtime_peers,
+        now,
     );
 
     #[cfg(any(target_os = "macos", test))]

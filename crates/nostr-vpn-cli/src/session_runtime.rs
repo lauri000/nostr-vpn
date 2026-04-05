@@ -7,6 +7,12 @@ pub(crate) fn reset_tunnel_runtime_after_macos_underlay_repair(
     tunnel_runtime.stop();
 }
 
+#[cfg(not(any(target_os = "macos", test)))]
+pub(crate) fn reset_tunnel_runtime_after_macos_underlay_repair(
+    _tunnel_runtime: &mut CliTunnelRuntime,
+) {
+}
+
 pub(crate) async fn connect_session(args: ConnectArgs) -> Result<()> {
     if args.iface.trim().is_empty() {
         return Err(anyhow!("--iface must not be empty"));
