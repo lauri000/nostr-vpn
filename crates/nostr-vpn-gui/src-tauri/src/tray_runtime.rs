@@ -5,16 +5,17 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, anyhow};
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri::Manager;
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri::menu::{
     CheckMenuItemBuilder, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+use super::TRAY_ICON_ID;
 use super::{
     AppState, NvpnBackend, ParticipantView, TRAY_EXIT_NODE_MENU_ID_PREFIX,
-    TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_ICON_ID, TRAY_OPEN_MENU_ID, TRAY_QUIT_UI_MENU_ID,
+    TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_OPEN_MENU_ID, TRAY_QUIT_UI_MENU_ID,
     TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_THIS_DEVICE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID,
     TrayExitNodeEntry, TrayMenuItemSpec, TrayNetworkGroup, TrayRuntimeState,
 };

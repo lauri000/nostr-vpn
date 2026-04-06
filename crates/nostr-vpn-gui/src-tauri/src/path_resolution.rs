@@ -10,6 +10,8 @@ use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use tauri::Manager;
 
 #[cfg(target_os = "windows")]
 use super::legacy_config_path_from_dirs_config_dir;

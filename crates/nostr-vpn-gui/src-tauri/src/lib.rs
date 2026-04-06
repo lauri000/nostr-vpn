@@ -37,6 +37,7 @@ pub(crate) use gui_launch::{
     extract_invite_from_deep_link, gui_launch_disposition, parse_running_gui_instances,
     started_from_autostart_args,
 };
+#[allow(unused_imports)]
 pub(crate) use gui_launch::{
     GuiLaunchDisposition, PendingLaunchAction, extract_app_deep_links_from_args,
     gui_requires_service_enable, gui_requires_service_install, gui_service_enable_status_text,
@@ -86,6 +87,7 @@ pub(crate) use peer_state::{
 pub(crate) use tray_runtime::{
     build_tray_menu, current_tray_runtime_state, refresh_tray_menu, run_tray_backend_action,
 };
+#[allow(unused_imports)]
 pub(crate) use tray_runtime::{
     copy_text_to_clipboard, display_tunnel_ip, tray_exit_node_entries, tray_network_groups,
     tray_status_text,

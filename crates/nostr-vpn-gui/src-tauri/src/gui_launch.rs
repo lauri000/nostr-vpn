@@ -1,13 +1,18 @@
 use std::collections::HashSet;
 use std::env;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command as ProcessCommand;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use nostr_vpn_core::config::{normalize_advertised_route, normalize_nostr_pubkey};
 use tauri::Manager;
 
 use crate::tauri_commands::with_backend;
+use crate::tray_runtime::refresh_tray_menu;
 
 use super::{
     AUTOSTART_LAUNCH_ARG, AppState, DEBUG_AUTOMATION_DEEP_LINK_PREFIX, NETWORK_INVITE_PREFIX,
@@ -362,7 +367,7 @@ pub(crate) fn import_network_invite_from_deep_link<R: tauri::Runtime>(
 
     with_backend(state, |backend| backend.import_network_invite(&invite))
         .map_err(|error| anyhow!(error))?;
-    super::refresh_tray_menu(app);
+    refresh_tray_menu(app);
     let _ = show_main_window(app);
     Ok(true)
 }
@@ -382,7 +387,7 @@ pub(crate) fn run_debug_automation_from_deep_link<R: tauri::Runtime>(
         run_debug_automation_command(backend, &command)
     })
     .map_err(|error| anyhow!(error))?;
-    super::refresh_tray_menu(app);
+    refresh_tray_menu(app);
     let _ = show_main_window(app);
     Ok(true)
 }

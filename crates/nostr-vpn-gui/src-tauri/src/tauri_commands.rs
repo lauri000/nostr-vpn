@@ -1,3 +1,5 @@
+use crate::tray_runtime::refresh_tray_menu;
+
 use super::*;
 
 pub(crate) fn with_backend<T>(
