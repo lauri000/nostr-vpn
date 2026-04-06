@@ -63,19 +63,17 @@ pub(crate) use path_resolution::{
     resolve_backend_config_path, resolve_nvpn_cli_path, service_state_refresh_due, shorten_middle,
     validate_nvpn_binary,
 };
+#[cfg(test)]
+pub(crate) use path_resolution::{desktop_config_path_from_roots, strip_windows_verbatim_prefix};
+#[cfg(target_os = "windows")]
+pub(crate) use path_resolution::{
+    normalize_windows_elevated_args, windows_temp_config_import_path,
+};
 #[cfg(any(target_os = "windows", test))]
 pub(crate) use path_resolution::{
     requires_admin_privileges_error, windows_daemon_apply_requires_service_repair,
     windows_daemon_config_import_args, windows_elevated_config_import_args,
     windows_should_start_installed_service, windows_should_use_daemon_owned_config_apply,
-};
-#[cfg(test)]
-pub(crate) use path_resolution::{
-    desktop_config_path_from_roots, strip_windows_verbatim_prefix,
-};
-#[cfg(target_os = "windows")]
-pub(crate) use path_resolution::{
-    normalize_windows_elevated_args, windows_temp_config_import_path,
 };
 #[allow(unused_imports)]
 pub(crate) use peer_state::{
