@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "windows")]
+use crate::path_resolution::{windows_nvpn_command_failure, windows_program_data_dir};
 
 impl NvpnBackend {
     pub(crate) fn persist_config(&mut self) -> Result<PersistConfigOutcome> {

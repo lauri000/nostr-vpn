@@ -65,10 +65,13 @@ pub(crate) use path_resolution::{
 };
 #[cfg(any(target_os = "windows", test))]
 pub(crate) use path_resolution::{
-    desktop_config_path_from_roots, requires_admin_privileges_error, strip_windows_verbatim_prefix,
-    windows_daemon_apply_requires_service_repair, windows_daemon_config_import_args,
-    windows_elevated_config_import_args, windows_should_start_installed_service,
-    windows_should_use_daemon_owned_config_apply,
+    requires_admin_privileges_error, windows_daemon_apply_requires_service_repair,
+    windows_daemon_config_import_args, windows_elevated_config_import_args,
+    windows_should_start_installed_service, windows_should_use_daemon_owned_config_apply,
+};
+#[cfg(test)]
+pub(crate) use path_resolution::{
+    desktop_config_path_from_roots, strip_windows_verbatim_prefix,
 };
 #[cfg(target_os = "windows")]
 pub(crate) use path_resolution::{
@@ -97,8 +100,6 @@ pub(crate) use tray_runtime::{tray_menu_spec, tray_vpn_status_menu_text, tray_vp
 
 use std::collections::{HashMap, HashSet};
 use std::env;
-#[cfg(target_os = "windows")]
-use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
