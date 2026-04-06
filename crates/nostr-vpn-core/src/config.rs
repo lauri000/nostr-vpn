@@ -965,6 +965,7 @@ impl AppConfig {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_admin_signed_shared_roster(
         &mut self,
         network_id: &str,

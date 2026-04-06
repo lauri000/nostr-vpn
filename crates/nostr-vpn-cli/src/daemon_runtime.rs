@@ -934,10 +934,10 @@ pub(crate) fn repair_saved_network_state(config_path: &Path) -> Result<bool> {
             }
         }
 
-        if let Some(route) = state.original_default_route.as_ref() {
-            if let Err(error) = restore_macos_default_route(route) {
-                failures.push(format!("restore default route: {error}"));
-            }
+        if let Some(route) = state.original_default_route.as_ref()
+            && let Err(error) = restore_macos_default_route(route)
+        {
+            failures.push(format!("restore default route: {error}"));
         }
 
         if state.pf_was_enabled.is_some() {
@@ -969,7 +969,7 @@ pub(crate) fn repair_saved_network_state(config_path: &Path) -> Result<bool> {
         }
 
         remove_runtime_file_if_exists(&path)?;
-        return Ok(true);
+        Ok(true)
     }
 
     #[cfg(not(target_os = "macos"))]

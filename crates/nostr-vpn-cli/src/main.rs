@@ -6804,6 +6804,14 @@ fn run_checked(command: &mut ProcessCommand) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::support::{
+    build_peer_announcement, macos_default_routes_from_netstat, macos_ifconfig_has_ipv4,
+    macos_route_get_spec_from_output, nat_punch_targets, nat_punch_targets_for_local_endpoint,
+    nat_punch_targets_for_local_endpoints, pending_nat_punch_targets_for_local_endpoint,
+    pending_nat_punch_targets_for_local_endpoint_with_paths, planned_tunnel_peers,
+};
+
+#[cfg(test)]
 mod tests {
     pub(super) use support::{
         control_daemon_request_for_test, local_endpoints, sample_peer_announcement,
@@ -6818,11 +6826,3 @@ mod tests {
     mod service_cli;
     pub(crate) mod support;
 }
-
-#[cfg(test)]
-pub(crate) use tests::support::{
-    build_peer_announcement, macos_default_routes_from_netstat, macos_ifconfig_has_ipv4,
-    macos_route_get_spec_from_output, nat_punch_targets, nat_punch_targets_for_local_endpoint,
-    nat_punch_targets_for_local_endpoints, pending_nat_punch_targets_for_local_endpoint,
-    pending_nat_punch_targets_for_local_endpoint_with_paths, planned_tunnel_peers,
-};

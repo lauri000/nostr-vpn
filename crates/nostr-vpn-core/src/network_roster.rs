@@ -53,7 +53,7 @@ pub(crate) fn canonical_npub_key(value: &str) -> Option<String> {
         PublicKey::from_hex(&normalized)
             .ok()
             .and_then(|public_key| public_key.to_bech32().ok())
-            .unwrap_or_else(|| normalized),
+            .unwrap_or(normalized),
     )
 }
 
