@@ -1,17 +1,17 @@
 use crate::*;
 
-#[path = "routing_peer_paths.rs"]
-mod routing_peer_paths;
-#[path = "routing_relays.rs"]
-mod routing_relays;
 #[path = "routing_linux_helpers.rs"]
 mod routing_linux_helpers;
 #[path = "routing_macos_routes.rs"]
 mod routing_macos_routes;
+#[path = "routing_peer_paths.rs"]
+mod routing_peer_paths;
 #[path = "routing_planning.rs"]
 mod routing_planning;
 #[path = "routing_platform_helpers.rs"]
 mod routing_platform_helpers;
+#[path = "routing_relays.rs"]
+mod routing_relays;
 #[path = "routing_runtime_endpoints.rs"]
 mod routing_runtime_endpoints;
 
@@ -71,7 +71,9 @@ fn public_endpoint_discovery_bind_conflict_matches_discovery_bind_errors() {
     assert!(public_endpoint_discovery_bind_conflict(
         "Address already in use"
     ));
-    assert!(!public_endpoint_discovery_bind_conflict("timed out waiting for stun response"));
+    assert!(!public_endpoint_discovery_bind_conflict(
+        "timed out waiting for stun response"
+    ));
 }
 
 #[test]

@@ -83,9 +83,7 @@ fn participants_override_marks_shared_roster_updated_for_admin_owned_network() {
     let member = Keys::generate().public_key().to_hex();
 
     let mut config = AppConfig::generated();
-    let own_pubkey = config
-        .own_nostr_pubkey_hex()
-        .expect("own nostr pubkey");
+    let own_pubkey = config.own_nostr_pubkey_hex().expect("own nostr pubkey");
     config.networks[0].admins = vec![own_pubkey.clone()];
     config.networks[0].shared_roster_updated_at = 0;
     config.networks[0].shared_roster_signed_by.clear();

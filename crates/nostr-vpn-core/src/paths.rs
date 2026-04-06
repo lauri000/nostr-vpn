@@ -100,7 +100,8 @@ impl PeerPathBook {
 
         let before = state.endpoints.len();
         state.endpoints.retain(|endpoint, tracked| {
-            (tracked.source != PeerPathSource::Relay || announced_relay_endpoints.contains(endpoint))
+            (tracked.source != PeerPathSource::Relay
+                || announced_relay_endpoints.contains(endpoint))
                 && !observed_endpoint_superseded_by_announcement(
                     endpoint,
                     tracked,
@@ -440,12 +441,14 @@ fn observed_endpoint_superseded_by_announcement(
         return false;
     };
 
-    announced_endpoints.iter().any(|(announced_endpoint, announced_source)| {
-        !matches!(announced_source, PeerPathSource::Observed)
-            && !endpoint_is_local_only(announced_endpoint)
-            && endpoint != announced_endpoint
-            && endpoint_host(announced_endpoint).as_deref() == Some(observed_host.as_str())
-    })
+    announced_endpoints
+        .iter()
+        .any(|(announced_endpoint, announced_source)| {
+            !matches!(announced_source, PeerPathSource::Observed)
+                && !endpoint_is_local_only(announced_endpoint)
+                && endpoint != announced_endpoint
+                && endpoint_host(announced_endpoint).as_deref() == Some(observed_host.as_str())
+        })
 }
 
 fn endpoint_host(endpoint: &str) -> Option<String> {

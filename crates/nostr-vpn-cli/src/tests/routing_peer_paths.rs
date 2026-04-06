@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
-use crate::*;
 use crate::pending_nat_punch_targets_for_local_endpoint_with_paths;
+use crate::*;
 
 use nostr_vpn_core::crypto::generate_keypair;
 use nostr_vpn_core::paths::PeerPathBook;
@@ -602,9 +602,11 @@ fn pending_nat_punch_targets_prefer_recently_selected_observed_public_endpoint()
 
     assert_eq!(
         targets,
-        vec!["203.0.113.21:33063"
-            .parse::<SocketAddr>()
-            .expect("observed socket addr")]
+        vec![
+            "203.0.113.21:33063"
+                .parse::<SocketAddr>()
+                .expect("observed socket addr")
+        ]
     );
 }
 

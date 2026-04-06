@@ -315,7 +315,9 @@ pub(crate) fn apply_participants_override(
     config.ensure_defaults();
     config.active_network_mut().participants = normalized.clone();
     if let Some(exit_node) = pending_exit_node
-        && normalized.iter().any(|participant| participant == &exit_node)
+        && normalized
+            .iter()
+            .any(|participant| participant == &exit_node)
     {
         config.exit_node = exit_node;
     }

@@ -187,11 +187,7 @@ fn detect_primary_ipv4() -> Option<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("1.1.1.1:80").ok()?;
     let ip = socket.local_addr().ok()?.ip();
-    if ip.is_ipv4() {
-        Some(ip)
-    } else {
-        None
-    }
+    if ip.is_ipv4() { Some(ip) } else { None }
 }
 
 pub(crate) fn generate_nostr_identity() -> (String, String) {

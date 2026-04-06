@@ -98,8 +98,14 @@ impl NvpnBackend {
         let mut matched_network = false;
 
         for network in &self.config.networks {
-            let contains_participant = network.participants.iter().any(|configured| configured == &normalized)
-                || network.admins.iter().any(|configured| configured == &normalized);
+            let contains_participant = network
+                .participants
+                .iter()
+                .any(|configured| configured == &normalized)
+                || network
+                    .admins
+                    .iter()
+                    .any(|configured| configured == &normalized);
             if !contains_participant {
                 continue;
             }
