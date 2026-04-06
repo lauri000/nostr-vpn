@@ -1581,6 +1581,7 @@ fn parse_peer_arg(value: &str) -> Result<PeerConfig> {
 }
 
 fn runtime_effective_advertised_routes(app: &AppConfig) -> Vec<String> {
+    #[allow(unused_mut)]
     let mut routes = app.effective_advertised_routes();
     #[cfg(target_os = "macos")]
     {
@@ -2860,6 +2861,7 @@ impl CliTunnelRuntime {
                 runtime_peers.as_ref(),
                 &own_local_endpoints,
             );
+            #[allow(unused_mut)]
             let mut route_targets = route_targets_for_planned_tunnel_peers(
                 app,
                 own_pubkey,
@@ -5601,6 +5603,7 @@ fn route_targets_for_planned_tunnel_peers(
     runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
     now: u64,
 ) -> Vec<String> {
+    #[allow(unused_mut)]
     let mut route_targets = route_targets_for_tunnel_peers(
         &planned_peers
             .iter()

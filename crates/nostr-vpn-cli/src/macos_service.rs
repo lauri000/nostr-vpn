@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub(super) fn macos_service_plist_path(config_path: &Path) -> PathBuf {
     PathBuf::from(format!(
         "/Library/LaunchDaemons/{}.plist",
