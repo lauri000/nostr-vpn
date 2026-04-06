@@ -45,6 +45,7 @@ pub(crate) struct LinuxDefaultRouteSpec {
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MacosEndpointBypassRoute {
     pub(crate) target: String,

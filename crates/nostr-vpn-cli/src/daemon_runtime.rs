@@ -29,6 +29,7 @@ pub(crate) fn daemon_state_file_path(config_path: &Path) -> PathBuf {
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn daemon_network_cleanup_file_path(config_path: &Path) -> PathBuf {
     let parent = config_path
         .parent()
@@ -688,6 +689,7 @@ pub(crate) fn write_daemon_state(path: &Path, state: &DaemonRuntimeState) -> Res
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn read_daemon_network_cleanup_state(
     path: &Path,
 ) -> Result<Option<MacosNetworkCleanupState>> {
@@ -724,6 +726,7 @@ pub(crate) fn read_daemon_network_cleanup_state(
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn write_daemon_network_cleanup_state(
     path: &Path,
     state: &MacosNetworkCleanupState,
@@ -740,6 +743,7 @@ pub(crate) fn write_daemon_network_cleanup_state(
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn remove_runtime_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
