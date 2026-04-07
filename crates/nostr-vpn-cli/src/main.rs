@@ -1703,6 +1703,8 @@ struct DaemonPeerState {
     tunnel_ip: String,
     endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_endpoint: Option<String>,
     #[serde(default)]
     tx_bytes: u64,

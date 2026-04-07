@@ -38,6 +38,7 @@ pub(crate) fn build_mobile_runtime_state(
                 endpoint: runtime_status
                     .map(|status| status.endpoint.to_string())
                     .unwrap_or_else(|| announcement.endpoint.clone()),
+                relay_endpoint: announcement.relay_endpoint.clone(),
                 runtime_endpoint: runtime_status.map(|status| status.endpoint.to_string()),
                 tx_bytes: 0,
                 rx_bytes: 0,

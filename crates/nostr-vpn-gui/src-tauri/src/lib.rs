@@ -449,6 +449,7 @@ impl NvpnBackend {
                 status.reachable = None;
                 status.last_handshake_at = None;
                 status.endpoint = None;
+                status.relay_endpoint = None;
                 status.error = Some("vpn unavailable on this platform".to_string());
                 status.tx_bytes = 0;
                 status.rx_bytes = 0;
@@ -485,6 +486,7 @@ impl NvpnBackend {
                     status.reachable = None;
                     status.last_handshake_at = None;
                     status.endpoint = None;
+                    status.relay_endpoint = None;
                     status.runtime_endpoint = None;
                     status.tx_bytes = 0;
                     status.rx_bytes = 0;
@@ -609,6 +611,7 @@ impl NvpnBackend {
                 status.reachable = None;
                 status.last_handshake_at = None;
                 status.endpoint = None;
+                status.relay_endpoint = None;
                 status.runtime_endpoint = None;
                 status.tx_bytes = 0;
                 status.rx_bytes = 0;
@@ -623,6 +626,7 @@ impl NvpnBackend {
                 status.reachable = None;
                 status.last_handshake_at = None;
                 status.endpoint = None;
+                status.relay_endpoint = None;
                 status.runtime_endpoint = None;
                 status.tx_bytes = 0;
                 status.rx_bytes = 0;
@@ -637,6 +641,7 @@ impl NvpnBackend {
                 status.reachable = Some(false);
                 status.last_handshake_at = None;
                 status.endpoint = None;
+                status.relay_endpoint = None;
                 status.runtime_endpoint = None;
                 status.tx_bytes = 0;
                 status.rx_bytes = 0;
@@ -659,6 +664,7 @@ impl NvpnBackend {
             } else {
                 Some(peer.endpoint.clone())
             };
+            status.relay_endpoint = peer.relay_endpoint.clone();
             status.runtime_endpoint = peer.runtime_endpoint.clone();
             status.tx_bytes = peer.tx_bytes;
             status.rx_bytes = peer.rx_bytes;
@@ -1789,6 +1795,7 @@ mod tests {
             node_id: "peer-a".to_string(),
             tunnel_ip: "10.44.0.2/32".to_string(),
             endpoint: endpoint.to_string(),
+            relay_endpoint: None,
             runtime_endpoint: None,
             tx_bytes: 0,
             rx_bytes: 0,
@@ -3425,6 +3432,7 @@ mod tests {
         let participant = "44".repeat(32);
         let mut backend = test_backend(&participant);
         let mut peer = daemon_peer(&participant, true, Some(3), None, "203.0.113.10:51820");
+        peer.relay_endpoint = Some("198.51.100.9:45000".to_string());
         peer.runtime_endpoint = Some("198.51.100.9:45000".to_string());
         peer.tx_bytes = 4_096;
         peer.rx_bytes = 8_192;
@@ -3439,6 +3447,23 @@ mod tests {
         assert_eq!(view.runtime_endpoint, "198.51.100.9:45000");
         assert_eq!(view.tx_bytes, 4_096);
         assert_eq!(view.rx_bytes, 8_192);
+    }
+
+    #[test]
+    fn peer_status_line_does_not_treat_lan_runtime_as_relay_fallback() {
+        let participant = "55".repeat(32);
+        let mut backend = test_backend(&participant);
+        let mut peer = daemon_peer(&participant, true, Some(3), None, "203.0.113.10:51820");
+        peer.relay_endpoint = Some("198.51.100.9:45000".to_string());
+        peer.runtime_endpoint = Some("192.168.1.44:51820".to_string());
+        backend.daemon_state = Some(daemon_state_with_peer(Some(peer), true));
+        backend.session_active = true;
+        backend.refresh_peer_runtime_status();
+
+        let view = backend.participant_view(&participant, "mesh-test", None, false);
+        assert!(!view.status_text.contains("relay"));
+        assert!(!view.relay_path_active);
+        assert_eq!(view.runtime_endpoint, "192.168.1.44:51820");
     }
 
     #[test]

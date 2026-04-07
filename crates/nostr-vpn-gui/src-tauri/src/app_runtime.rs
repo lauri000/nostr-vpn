@@ -100,6 +100,8 @@ pub(crate) struct DaemonPeerState {
     pub(crate) tunnel_ip: String,
     pub(crate) endpoint: String,
     #[serde(default)]
+    pub(crate) relay_endpoint: Option<String>,
+    #[serde(default)]
     pub(crate) runtime_endpoint: Option<String>,
     #[serde(default)]
     pub(crate) tx_bytes: u64,

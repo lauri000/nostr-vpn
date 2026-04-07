@@ -354,34 +354,6 @@ fn macos_tunnel_default_route_targets_use_split_defaults() {
 }
 
 #[test]
-fn macos_direct_route_args_use_bsd_iface_form() {
-    assert_eq!(
-        crate::macos_network::macos_direct_route_args("add", "0.0.0.0/0", "utun100"),
-        vec![
-            "-q".to_string(),
-            "-n".to_string(),
-            "add".to_string(),
-            "-inet".to_string(),
-            "0.0.0.0/0".to_string(),
-            "-iface".to_string(),
-            "utun100".to_string(),
-        ]
-    );
-    assert_eq!(
-        crate::macos_network::macos_direct_route_args("delete", "203.0.113.8/32", "utun100"),
-        vec![
-            "-q".to_string(),
-            "-n".to_string(),
-            "delete".to_string(),
-            "-inet".to_string(),
-            "203.0.113.8/32".to_string(),
-            "-iface".to_string(),
-            "utun100".to_string(),
-        ]
-    );
-}
-
-#[test]
 fn macos_gateway_route_args_install_global_host_routes() {
     assert_eq!(
         crate::macos_network::macos_gateway_route_args_for_test(
