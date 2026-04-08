@@ -14,6 +14,7 @@
     serviceRepairRetryRecommended,
     serviceRepairSettled,
   } from './lib/service-repair.js'
+  import { shouldRenderServicePanel } from './lib/service-panel.js'
   import { parseAppDeepLink } from './lib/deep-link-actions.js'
   import {
     canonicalizeMeshIdInput,
@@ -1040,12 +1041,11 @@
   {#if state}
     {@const activeNetworkView = activeNetwork(state)}
 
-    {#if serviceInstallRecommended || serviceEnableRecommended || serviceRepairPromptRecommended || serviceActionInFlight}
+    {#if shouldRenderServicePanel(state, serviceActionInFlight)}
       <ServiceActionPanel
         {state}
         {serviceActionInFlight}
         {serviceActionStatus}
-        {serviceEnableRecommended}
         {serviceRepairPromptRecommended}
         {serviceRepairRetryAfterInstall}
         {serviceSetupRequired}

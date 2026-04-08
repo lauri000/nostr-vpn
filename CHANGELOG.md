@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.3.7 - 2026-04-08
+
+Changes since `v0.3.6` on 2026-04-06.
+
+### Fixed
+
+- The desktop Diagnostics section now keeps your manual open or closed state across background refreshes, while still auto-opening if new health warnings appear.
+- Background-service management controls now stay visible after initial setup, so reinstall, enable, disable, and uninstall actions remain reachable from the GUI.
+
 ## 0.3.6 - 2026-04-06
 
 Changes since `v0.3.4` on 2026-04-02.

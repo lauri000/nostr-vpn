@@ -9,6 +9,7 @@
     relayFallbackParticipants,
     relayFallbackSummaryText,
   } from './lib/app-view'
+  import { reconcileAutoOpenPanelState } from './lib/collapsible-panels.js'
   import type { NetworkView, SettingsPatch, UiState } from './lib/types'
 
   export let state: UiState
@@ -17,10 +18,29 @@
   export let onAddRelay: () => Promise<void>
   export let onRemoveRelay: (relayUrl: string) => Promise<void>
   export let onUpdateSettings: (patch: SettingsPatch) => Promise<void>
+
+  let diagnosticsOpen = false
+  let previousHealthCount: number | null = null
+
+  $: {
+    const nextHealthCount = state.health.length
+    diagnosticsOpen = reconcileAutoOpenPanelState(
+      diagnosticsOpen,
+      previousHealthCount,
+      nextHealthCount,
+    )
+    previousHealthCount = nextHealthCount
+  }
 </script>
 
 {#if state.vpnSessionControlSupported}
-  <details class="panel collapsible-panel" open={state.health.length > 0}>
+  <details
+    class="panel collapsible-panel"
+    open={diagnosticsOpen}
+    on:toggle={(event) => {
+      diagnosticsOpen = (event.currentTarget as HTMLDetailsElement).open
+    }}
+  >
     <summary class="collapsible-summary">
       <div>
         <div class="panel-kicker">Advanced</div>

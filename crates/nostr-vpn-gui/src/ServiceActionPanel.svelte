@@ -4,13 +4,13 @@
     serviceLifecycleBadgeText,
     serviceMetaText,
   } from './lib/app-view'
+  import { servicePanelActions, servicePanelKicker } from './lib/service-panel.js'
   import type { UiState } from './lib/types'
 
   export let state: UiState
   export let serviceSetupRequired = false
   export let serviceRepairPromptRecommended = false
   export let serviceRepairRetryAfterInstall = false
-  export let serviceEnableRecommended = false
   export let serviceActionInFlight = false
   export let serviceActionStatus = ''
   export let onInstallSystemService: (connectAfter?: boolean) => Promise<void>
@@ -18,6 +18,32 @@
   export let onEnableSystemService: (connectAfter?: boolean) => Promise<void>
   export let onDisableSystemService: () => Promise<void>
   export let onUninstallSystemService: () => Promise<void>
+
+  $: actions = servicePanelActions(state, {
+    serviceSetupRequired,
+    serviceRepairPromptRecommended,
+    serviceRepairRetryAfterInstall,
+  })
+
+  async function onServiceAction(key: string) {
+    if (key === 'repair') {
+      await onRepairSystemService(serviceRepairRetryAfterInstall)
+      return
+    }
+    if (key === 'enable') {
+      await onEnableSystemService()
+      return
+    }
+    if (key === 'disable') {
+      await onDisableSystemService()
+      return
+    }
+    if (key === 'uninstall') {
+      await onUninstallSystemService()
+      return
+    }
+    await onInstallSystemService(key === 'install' && serviceSetupRequired)
+  }
 </script>
 
 <section
@@ -26,7 +52,13 @@
 >
   <div class="section-title-row">
     <div>
-      <div class="panel-kicker">Action needed</div>
+      <div class="panel-kicker">
+        {servicePanelKicker({
+          serviceActionInFlight,
+          serviceRepairPromptRecommended,
+          serviceSetupRequired,
+        })}
+      </div>
       <h2>Background Service</h2>
     </div>
     <div class="section-meta">{serviceMetaText(state)}</div>
@@ -70,44 +102,15 @@
   </div>
 
   <div class="row service-actions-row">
-    <button
-      class={`btn ${serviceSetupRequired || serviceRepairPromptRecommended ? 'service-primary-btn' : ''}`}
-      data-testid="install-service-btn"
-      on:click={() =>
-        serviceRepairPromptRecommended
-          ? onRepairSystemService(serviceRepairRetryAfterInstall)
-          : serviceEnableRecommended
-            ? onEnableSystemService()
-            : onInstallSystemService(serviceSetupRequired)}
-      disabled={serviceActionInFlight}
-    >
-      {serviceRepairPromptRecommended
-        ? serviceRepairRetryAfterInstall && !state.sessionActive
-          ? 'Reinstall service and retry'
-          : 'Reinstall service'
-        : serviceEnableRecommended
-          ? 'Enable service'
-          : state.serviceInstalled
-            ? 'Reinstall service'
-            : 'Install service'}
-    </button>
-    {#if state.serviceEnablementSupported && state.serviceInstalled && !state.serviceDisabled}
+    {#each actions as action}
       <button
-        class="btn ghost"
-        data-testid="disable-service-btn"
-        on:click={onDisableSystemService}
+        class={`btn ${action.accent ? 'service-primary-btn' : 'ghost'}`}
+        data-testid={`${action.key}-service-btn`}
+        on:click={() => onServiceAction(action.key)}
         disabled={serviceActionInFlight}
       >
-        Disable service
+        {action.label}
       </button>
-    {/if}
-    <button
-      class="btn ghost"
-      data-testid="uninstall-service-btn"
-      on:click={onUninstallSystemService}
-      disabled={!state.serviceInstalled || serviceActionInFlight}
-    >
-      Uninstall
-    </button>
+    {/each}
   </div>
 </section>
