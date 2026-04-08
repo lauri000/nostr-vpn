@@ -53,6 +53,9 @@ pub(crate) struct MacosEndpointBypassRoute {
     pub(crate) interface: String,
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const MACOS_TUNNEL_MTU: &str = "1380";
+
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn linux_default_route_device_from_output(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
@@ -843,6 +846,8 @@ pub(crate) fn apply_local_interface_network(
                 .arg(&ip)
                 .arg("netmask")
                 .arg("255.255.255.0")
+                .arg("mtu")
+                .arg(MACOS_TUNNEL_MTU)
                 .arg("up"),
         )?;
         eprintln!(

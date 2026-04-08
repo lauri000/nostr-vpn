@@ -192,6 +192,11 @@ gateway: 10.10.243.254\n\
 }
 
 #[test]
+fn macos_tunnel_mtu_matches_other_desktop_tunnels() {
+    assert_eq!(MACOS_TUNNEL_MTU, "1380");
+}
+
+#[test]
 fn split_host_port_keeps_literal_host_without_port() {
     assert_eq!(
         split_host_port("relay.example.com", 443),
