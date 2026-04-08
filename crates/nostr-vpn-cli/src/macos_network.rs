@@ -350,7 +350,7 @@ pub(super) fn delete_macos_managed_route(
     if gateway.is_none()
         && let Some(iface) = interface
     {
-        return delete_macos_route_spec(target, Some(iface));
+        return delete_macos_direct_route_variants(target, iface);
     }
 
     delete_macos_route_spec(target, None)
@@ -443,9 +443,7 @@ pub(super) fn delete_macos_default_route_for_interface(iface: &str) -> Result<()
     for target in
         std::iter::once("0.0.0.0/0").chain(macos_tunnel_default_route_targets().iter().copied())
     {
-        if let Err(error) = delete_macos_route_spec(target, Some(iface))
-            && !crate::daemon_runtime::macos_route_delete_error_is_absent(&error.to_string())
-        {
+        if let Err(error) = delete_macos_direct_route_variants(target, iface) {
             failures.push(format!("remove {target} on {iface}: {error}"));
         }
     }
@@ -484,10 +482,11 @@ pub(super) fn apply_macos_route_spec(
     if let Some(gateway) = gateway {
         add.args(macos_gateway_route_args("add", target, gateway));
     } else {
-        add.arg("-n").arg("add");
-        if let Some(ifscope) = ifscope {
-            add.arg("-ifscope").arg(ifscope);
+        if let Some(iface) = ifscope {
+            let _ = delete_macos_route_spec(target, Some(iface));
+            let _ = delete_macos_route_spec(target, None);
         }
+        add.arg("-n").arg("add");
         if is_host {
             add.arg("-host").arg(target_ip);
         } else if target == "0.0.0.0/0" {
@@ -507,9 +506,6 @@ pub(super) fn apply_macos_route_spec(
                 change.args(macos_gateway_route_args("change", target, gateway));
             } else {
                 change.arg("-n").arg("change");
-                if let Some(ifscope) = ifscope {
-                    change.arg("-ifscope").arg(ifscope);
-                }
                 if is_host {
                     change.arg("-host").arg(target_ip);
                 } else if target == "0.0.0.0/0" {
@@ -544,6 +540,25 @@ fn delete_macos_route_spec(target: &str, ifscope: Option<&str>) -> Result<()> {
     }
 
     run_checked(&mut delete)
+}
+
+#[cfg(target_os = "macos")]
+fn delete_macos_direct_route_variants(target: &str, iface: &str) -> Result<()> {
+    let mut failures = Vec::new();
+
+    for attempt in [Some(iface), None] {
+        if let Err(error) = delete_macos_route_spec(target, attempt)
+            && !crate::daemon_runtime::macos_route_delete_error_is_absent(&error.to_string())
+        {
+            failures.push(error.to_string());
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(failures.join("; ")))
+    }
 }
 
 #[cfg(target_os = "macos")]
